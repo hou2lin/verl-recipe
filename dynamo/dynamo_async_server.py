@@ -333,10 +333,16 @@ class DynamoHttpServer:
         self._server_port = self._frontend_port
         if start_healthcheck:
             await self.wait_frontend_ready()
-        # v2: verify control-sidecar reachability so refit failures surface
-        # at startup instead of silently dropping weight updates mid-training.
-        # Soft-fail by default; set VERL_DYNAMO_REFIT_STRICT=1 for fail-fast.
-        await self._self_test_refit_path()
+            # v2: verify control-sidecar reachability so refit failures surface
+            # at startup instead of silently dropping weight updates mid-training.
+            # Soft-fail by default; set VERL_DYNAMO_REFIT_STRICT=1 for fail-fast.
+            # IMPORTANT: must run AFTER wait_frontend_ready so dynamo.vllm
+            # subprocesses are fully booted (their control sidecars cannot
+            # serve requests until the captured AsyncLLM is alive). In the
+            # shared-pool path, launch_servers calls wait_frontend_ready
+            # externally (start_healthcheck=False here) and runs
+            # _self_test_refit_path explicitly there.
+            await self._self_test_refit_path()
         logger.info(
             "[DynamoHttpServer] master ready: frontend=http://%s:%s",
             self._server_address,
@@ -1665,6 +1671,12 @@ class DynamoReplica(RolloutReplica):
             )
 
         await master.wait_frontend_ready.remote(expected_workers=expected_workers)
+        # v2: refit-path self-test, run here (not inside _launch_master) because
+        # the shared-pool path uses start_healthcheck=False above so the
+        # inline self-test is skipped. Must come AFTER wait_frontend_ready
+        # so all dynamo.vllm subprocesses have captured their AsyncLLM and
+        # control sidecars are serving requests.
+        await master._self_test_refit_path.remote()
         self._server_handle = master
         self._server_address = (
             f"[{fe_host}]:{fe_port}"
