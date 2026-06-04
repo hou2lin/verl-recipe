@@ -1376,9 +1376,20 @@ class DynamoHttpServer:
         sock.setsockopt(zmq.LINGER, 0)
         try:
             sock.connect(ep)
+            # Use an UNKNOWN `kind` (not an unknown method under
+            # kind=collective_rpc) so the sidecar bails at the kind-dispatch
+            # `else` branch in _handle_request and returns a structured
+            # error reply WITHOUT ever calling engine.collective_rpc.
+            #
+            # Previously we used kind="collective_rpc" + an invalid method
+            # name, which dispatched into vLLM's worker RPC queue. The
+            # AttributeError on workers got cached/queued and corrupted the
+            # NEXT real engine.collective_rpc call (sleep) — sleep silently
+            # failed, vLLM held its full 128 GiB, and the next trainer
+            # all-gather OOM'd. (Observed in B v5 smoke iter 2, job 2463154.)
             req = {
-                "kind": "collective_rpc",
-                "method": "__refit_self_test_probe__",
+                "kind": "__refit_self_test_probe__",
+                "method": None,
                 "args": (),
                 "kwargs": {},
                 "timeout": 5,
