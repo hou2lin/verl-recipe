@@ -20,11 +20,15 @@ so it lands on ``dynamo_server_*`` (created by DynamoReplica.launch_servers)
 rather than ``vllm_server_*``.
 """
 
+import logging
+import time
 from collections.abc import Generator
 from typing import Any, Optional
 
 import ray
 import torch
+
+_logger = logging.getLogger(__name__)
 
 from verl.workers.rollout.vllm_rollout.vllm_rollout import (
     ServerAdapter as _VllmServerAdapter,
@@ -76,12 +80,36 @@ class ServerAdapter(_VllmServerAdapter):
         return future if non_block else await future
 
     async def resume(self, tags: list[str]):
-        """Dynamo no-refit mode keeps rollout workers loaded; no wake_up needed."""
-        return None
+        # Was a hard-coded no-op; that's only valid when skip_refit=True. With
+        # skip_refit=False the trainer puts Dynamo to sleep at startup
+        # (ray_trainer.sleep_replicas) and never explicitly wakes it, so the
+        # first generate request hangs on a sleeping engine. DynamoHttpServer
+        # .wake_up already guards skip_refit and falls through to
+        # _engine_method_all("wake_up", ...) via the control sidecar.
+        if not self.config.free_cache_engine or self.rollout_rank != 0:
+            return None
+        if self.server_handle is None:
+            self.server_handle = ray.get_actor(self._get_control_actor_name())
+        t0 = time.perf_counter()
+        await self.server_handle.wake_up.remote(tags=tags)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _logger.info(
+            "[dynamo_rollout] resume tags=%s elapsed_ms=%.2f", tags, elapsed_ms
+        )
 
     async def release(self):
-        """Dynamo no-refit mode does not sleep rollout workers between updates."""
-        return None
+        if not self.config.free_cache_engine or self.rollout_rank != 0:
+            return None
+        if self.server_handle is None:
+            self.server_handle = ray.get_actor(self._get_control_actor_name())
+        t0 = time.perf_counter()
+        await self.server_handle.sleep.remote(level=self.sleep_level)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        _logger.info(
+            "[dynamo_rollout] release level=%s elapsed_ms=%.2f",
+            self.sleep_level,
+            elapsed_ms,
+        )
 
     @torch.no_grad()
     async def update_weights(
