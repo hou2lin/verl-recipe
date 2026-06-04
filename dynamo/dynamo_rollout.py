@@ -30,6 +30,9 @@ import torch
 
 _logger = logging.getLogger(__name__)
 
+from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+    BucketedWeightSender,
+)
 from verl.workers.rollout.vllm_rollout.vllm_rollout import (
     ServerAdapter as _VllmServerAdapter,
 )
@@ -118,25 +121,74 @@ class ServerAdapter(_VllmServerAdapter):
         global_steps: int = None,
         **kwargs,
     ):
-        """Dynamo v1: weight refit is not implemented.
+        """Push trainer-side weights through the control sidecar into each
+        dynamo.vllm subprocess's AsyncLLM, then via ZMQ IPC into each TP
+        worker's BucketedWeightReceiver.
 
-        The primary gate is ``checkpoint_engine.skip_refit`` in
-        CheckpointEngineManager, which prevents this method from ever being
-        invoked in normal e2e training. This override is defensive: it
-        ensures that if the gate is bypassed (e.g., from a non-standard
-        call site), dynamo does not fall into the parent vLLM IPC path,
-        which would attempt to call ``update_weights_from_ipc`` on a
-        DynamoHttpServer that has no such handler.
+        Mirrors ``vLLMServerAdapter.update_weights`` but routes the
+        "start receiving" RPC through Dynamo's control sidecar
+        (``DynamoHttpServer.collective_rpc`` → ZMQ REQ → control listener
+        → ``engine.collective_rpc("update_weights_from_ipc", ...)``)
+        instead of a direct Ray actor call. The bucket transfer itself
+        (``BucketedWeightSender.async_send_weights``) is identical to the
+        vLLM path and uses ``self.zmq_handle`` inherited from the parent
+        ServerAdapter, whose IPC socket path matches what
+        ``vLLMDynamoColocateWorkerExtension._get_zmq_handle`` listens on.
 
-        Mirrors NeMo-RL PR #2222 where ``DynamoVllmGeneration.update_weights_*``
-        methods assert False as a safety net while ``NEED_REFIT=False`` keeps
-        them off the hot path.
+        Replaces the v1 defensive no-op which was a known silent-failure
+        bug under skip_refit=False (NCCL broadcast happened but weights
+        were discarded — engine kept step:0 weights forever). The new path
+        is gated by skip_refit at the CheckpointEngineManager level so
+        skip_refit=True still bypasses this method entirely.
+
+        Pre-requisites verified at boot by
+        ``DynamoHttpServer._self_test_refit_path``.
         """
-        # Drain the generator so the upstream BucketedWeightSender (if any
-        # caller bypassed the gate) does not block waiting to enqueue bytes.
-        for _ in weights:
-            pass
-        return None
+        start_time = time.perf_counter()
+
+        # 1. Tell each AsyncLLM to start its BucketedWeightReceiver. Routes
+        #    through DynamoHttpServer.collective_rpc → ZMQ control sidecar
+        #    → engine.collective_rpc → each TP worker's
+        #    vLLMDynamoColocateWorkerExtension.update_weights_from_ipc.
+        future = await self._execute_method(
+            "update_weights_from_ipc",
+            non_block=True,
+            kwargs={**kwargs, "use_shm": self.use_shm},
+        )
+
+        # 2. Push bucketed weights over ZMQ IPC. self.zmq_handle is the
+        #    socket path computed in the parent vLLMServerAdapter.__init__
+        #    (ipc:///tmp/rl-colocate-zmq-replica-{R}-rank-{local}.sock).
+        #    The receiver-side path is computed in
+        #    dynamo_worker_extension._get_zmq_handle and produces the same
+        #    string via VERL_DYNAMO_RANK_OFFSET.
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        await sender.async_send_weights(weights)
+
+        # 3. Wait for the engine receivers (all TP workers) to finish
+        #    model.load_weights on the buckets we just sent.
+        if future is not None:
+            await future
+
+        # 4. Reset prefix cache — refit invalidates all KV blocks. Only
+        #    rollout_rank 0 needs to issue this (collective_rpc broadcasts).
+        if self.rollout_rank == 0:
+            await self.server_handle.clear_kv_cache.remote()
+            if global_steps is not None:
+                await self.server_handle.set_global_steps.remote(global_steps)
+
+        if self.replica_rank == 0 and self.rollout_rank == 0:
+            elapsed = time.perf_counter() - start_time
+            _logger.info(
+                "[dynamo_rollout] update_weights elapsed=%.2fs global_steps=%s",
+                elapsed,
+                global_steps,
+            )
 
 
 __all__ = ["ServerAdapter"]
