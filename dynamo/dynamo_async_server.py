@@ -333,6 +333,10 @@ class DynamoHttpServer:
         self._server_port = self._frontend_port
         if start_healthcheck:
             await self.wait_frontend_ready()
+        # v2: verify control-sidecar reachability so refit failures surface
+        # at startup instead of silently dropping weight updates mid-training.
+        # Soft-fail by default; set VERL_DYNAMO_REFIT_STRICT=1 for fail-fast.
+        await self._self_test_refit_path()
         logger.info(
             "[DynamoHttpServer] master ready: frontend=http://%s:%s",
             self._server_address,
@@ -1314,6 +1318,86 @@ class DynamoHttpServer:
             finally:
                 sock.close()
         return None
+
+    # ------------------------------------------------------------------ #
+    # refit path self-test (v2 — verifies control sidecar reachability)
+    # ------------------------------------------------------------------ #
+
+    async def _self_test_refit_path(self):
+        """Verify the control-sidecar ⇄ AsyncLLM round-trip is alive.
+
+        Refit (DynamoRollout.update_weights, v2) routes weight bytes through
+        ``collective_rpc("update_weights_from_ipc", ...)`` which depends on
+        a working REQ-REP loop to each ``_dynamo_vllm_with_control``
+        subprocess. A silent failure here (sidecar didn't start, control
+        endpoint port collision, etc.) would let ``update_weights`` appear
+        to succeed while actually losing all updates — that's the exact
+        bug B v4 had pre-fix.
+
+        This self-test sends one ``collective_rpc`` request with a
+        deliberately invalid method name. A reachable sidecar will reply
+        with a structured error response; an unreachable one will time out.
+        Either response proves the IPC path is alive.
+
+        Skipped when ``skip_refit`` is True (refit isn't used anyway) or
+        when no control endpoints are registered (slave node / pre-launch).
+        Soft-fail by default; set env ``VERL_DYNAMO_REFIT_STRICT=1`` to
+        raise on failure (recommended once v2 is the default).
+        """
+        if self._skip_refit():
+            return
+        if not self._control_endpoints:
+            return
+
+        import pickle
+
+        import zmq
+        import zmq.asyncio
+
+        strict = os.environ.get("VERL_DYNAMO_REFIT_STRICT", "0") not in (
+            "",
+            "0",
+            "false",
+            "False",
+        )
+
+        # Ping the first endpoint only — one round-trip is sufficient to
+        # prove the sidecar machinery is alive. We do not iterate all
+        # endpoints here to keep startup overhead minimal.
+        ep = self._control_endpoints[0]
+        ctx = zmq.asyncio.Context.instance()
+        sock = ctx.socket(zmq.REQ)
+        sock.setsockopt(zmq.LINGER, 0)
+        try:
+            sock.connect(ep)
+            req = {
+                "kind": "collective_rpc",
+                "method": "__refit_self_test_probe__",
+                "args": (),
+                "kwargs": {},
+                "timeout": 5,
+            }
+            await sock.send(pickle.dumps(req))
+            reply_bytes = await asyncio.wait_for(sock.recv(), timeout=10)
+            reply = pickle.loads(reply_bytes)
+            logger.info(
+                "[DynamoHttpServer] refit self-test PASSED @ %s (sidecar "
+                "responded ok=%s)",
+                ep,
+                reply.get("ok"),
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            msg = (
+                f"[DynamoHttpServer] refit self-test FAILED @ {ep}: "
+                f"{type(e).__name__}: {e} — DynamoRollout.update_weights "
+                f"will likely lose updates silently. Check that "
+                f"dynamo.vllm control sidecars started."
+            )
+            if strict:
+                raise RuntimeError(msg) from e
+            logger.warning(msg)
+        finally:
+            sock.close()
 
     # ------------------------------------------------------------------ #
     # shutdown
