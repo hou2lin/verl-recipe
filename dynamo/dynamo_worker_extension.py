@@ -39,9 +39,13 @@ _RANK_OFFSET_ENV = "VERL_DYNAMO_RANK_OFFSET"
 class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
     """vLLM worker mixin for verl × dynamo.
 
-    Identical to ``vLLMColocateWorkerExtension`` except for
-    ``_get_zmq_handle``, which uses a node-local-global rank instead of the
-    per-subprocess TP-local rank.
+    Adds two responsibilities on top of ``vLLMColocateWorkerExtension``:
+    1. ``_get_zmq_handle`` uses node-local-global rank (was per-shard TP-local).
+    2. NCCL-based per-tensor weight refit methods (``init_weight_update_group``,
+       ``update_weight``, ``destroy_weight_update_group``) — see v3 refit design
+       in reports/verl_dynamo_refit_iter_log_zh.md "Iter 4". These mirror the
+       vLLM 0.7.0 RLHF example pattern and avoid the CUDA-IPC wake_up issue
+       that hung Iter 3.
     """
 
     def _get_zmq_handle(self) -> str:
@@ -49,6 +53,81 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
         offset = int(os.environ.get(_RANK_OFFSET_ENV, "0"))
         global_rank = self.local_rank + offset
         return f"ipc:///tmp/rl-colocate-zmq-replica-{replica_rank}-rank-{global_rank}.sock"
+
+    # --------------------------------------------------------------------- #
+    # v3 refit: per-tensor NCCL broadcast (replacing v2 CUDA-IPC path)
+    # --------------------------------------------------------------------- #
+
+    def init_weight_update_group(
+        self,
+        master_address: str,
+        master_port: int,
+        rank_offset: int,
+        world_size: int,
+    ) -> None:
+        """Join the refit NCCL group via stateless_init_process_group.
+
+        Called via ``engine.collective_rpc("init_weight_update_group", ...)``
+        from the broadcaster (DynamoRollout.update_weights on rank-0 rollout
+        actor). Each TP worker computes its own group rank from its node-
+        global rank (local_rank + VERL_DYNAMO_RANK_OFFSET) plus rank_offset.
+
+        Args:
+            master_address: TCP host of the rendezvous master (rank 0).
+            master_port: TCP port of the rendezvous master.
+            rank_offset: Offset into the group (typically 1, leaving rank 0
+                for the broadcaster).
+            world_size: Total members in the group (1 + n_engine_workers).
+        """
+        from vllm.distributed.parallel_state import stateless_init_process_group
+
+        offset = int(os.environ.get(_RANK_OFFSET_ENV, "0"))
+        global_rank = self.local_rank + offset
+        my_group_rank = rank_offset + global_rank
+        self._model_update_group = stateless_init_process_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank=my_group_rank,
+            world_size=world_size,
+            device=self.device,
+        )
+
+    def update_weight(self, name: str, dtype, shape) -> None:
+        """Receive one weight tensor via NCCL broadcast and load into model.
+
+        Engine-side handler for a per-tensor refit step. Allocates a fresh
+        buffer of (dtype, shape), receives the broadcast from rank 0, calls
+        the model's standard load_weights to write into the live parameter,
+        then frees the receive buffer. Peak extra memory ≈ one tensor.
+
+        Args:
+            name: Parameter name (matches model.named_parameters()).
+            dtype: torch.dtype or its string form (e.g. "bfloat16").
+            shape: Iterable of int — tensor shape.
+        """
+        import torch
+
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.replace("torch.", ""))
+        weight = torch.empty(tuple(shape), dtype=dtype, device=self.device)
+        self._model_update_group.broadcast(
+            weight, src=0, stream=torch.cuda.current_stream()
+        )
+        self.model_runner.model.load_weights(weights=[(name, weight)])
+        del weight
+
+    def destroy_weight_update_group(self) -> None:
+        """Best-effort teardown of the refit NCCL group.
+
+        StatelessProcessGroup has no explicit destroy API; we just drop our
+        reference and let garbage collection / process exit handle the rest.
+        Idempotent — safe to call even if the group was never initialized.
+        """
+        if hasattr(self, "_model_update_group"):
+            try:
+                del self._model_update_group
+            except Exception:
+                pass
 
 
 __all__ = ["vLLMDynamoColocateWorkerExtension"]

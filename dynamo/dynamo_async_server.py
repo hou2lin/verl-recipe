@@ -1326,6 +1326,17 @@ class DynamoHttpServer:
         return None
 
     # ------------------------------------------------------------------ #
+    # v3 refit: world-size helper for NCCL group setup
+    # ------------------------------------------------------------------ #
+
+    def get_num_engine_workers(self) -> int:
+        """Total number of TP worker processes across all dynamo.vllm shards
+        on this node. Used by DynamoRollout.update_weights to compute the
+        NCCL group world_size = 1 (broadcaster) + N (engine workers)."""
+        tp = int(self.config.tensor_model_parallel_size)
+        return len(self._control_endpoints) * tp
+
+    # ------------------------------------------------------------------ #
     # refit path self-test (v2 — verifies control sidecar reachability)
     # ------------------------------------------------------------------ #
 

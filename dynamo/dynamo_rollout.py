@@ -30,9 +30,6 @@ import torch
 
 _logger = logging.getLogger(__name__)
 
-from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
-    BucketedWeightSender,
-)
 from verl.workers.rollout.vllm_rollout.vllm_rollout import (
     ServerAdapter as _VllmServerAdapter,
 )
@@ -121,74 +118,142 @@ class ServerAdapter(_VllmServerAdapter):
         global_steps: int = None,
         **kwargs,
     ):
-        """Push trainer-side weights through the control sidecar into each
-        dynamo.vllm subprocess's AsyncLLM, then via ZMQ IPC into each TP
-        worker's BucketedWeightReceiver.
+        """v3 — per-tensor NCCL P2P refit (replaces v2 CUDA-IPC path).
 
-        Mirrors ``vLLMServerAdapter.update_weights`` but routes the
-        "start receiving" RPC through Dynamo's control sidecar
-        (``DynamoHttpServer.collective_rpc`` → ZMQ REQ → control listener
-        → ``engine.collective_rpc("update_weights_from_ipc", ...)``)
-        instead of a direct Ray actor call. The bucket transfer itself
-        (``BucketedWeightSender.async_send_weights``) is identical to the
-        vLLM path and uses ``self.zmq_handle`` inherited from the parent
-        ServerAdapter, whose IPC socket path matches what
-        ``vLLMDynamoColocateWorkerExtension._get_zmq_handle`` listens on.
+        Motivation: v2 used ``update_weights_from_ipc`` on the engine side,
+        which implicitly wakes the 'weights' tag and allocates the full
+        ~63 GiB weight buffer. Concurrent with the trainer's FSDP
+        ``get_per_tensor_param`` all_gather (also ~63 GiB), this pushed
+        single-GPU memory over the edge and NCCL hung (see Iter 3 in
+        reports/verl_dynamo_refit_iter_log_zh.md).
 
-        Replaces the v1 defensive no-op which was a known silent-failure
-        bug under skip_refit=False (NCCL broadcast happened but weights
-        were discarded — engine kept step:0 weights forever). The new path
-        is gated by skip_refit at the CheckpointEngineManager level so
-        skip_refit=True still bypasses this method entirely.
+        v3 mirrors the miles team's design and the vLLM 0.7.0 RLHF
+        example: rollout rank-0 acts as broadcaster, dynamo.vllm worker
+        subprocesses join an NCCL group via ``init_weight_update_group``,
+        and each parameter is broadcast individually via
+        ``update_weight(name, dtype, shape)``. Peak engine-side memory is
+        ~one tensor (MiB–GiB scale), not the full ~63 GiB.
 
-        Pre-requisites verified at boot by
-        ``DynamoHttpServer._self_test_refit_path``.
+        Non-rank-0 rollout actors drain the incoming weights generator
+        (delivered to them by the verl framework's NCCL backend) and
+        return — only rank 0 broadcasts to the engine subprocesses.
         """
+        # Non-rank-0 just drain — only rank 0 orchestrates the refit
+        if self.rollout_rank != 0:
+            async for _ in weights:
+                pass
+            return
+
+        import socket
+
+        from vllm.distributed.parallel_state import stateless_init_process_group
+
         start_time = time.perf_counter()
 
-        # 1. Tell each AsyncLLM to start its BucketedWeightReceiver. Routes
-        #    through DynamoHttpServer.collective_rpc → ZMQ control sidecar
-        #    → engine.collective_rpc → each TP worker's
-        #    vLLMDynamoColocateWorkerExtension.update_weights_from_ipc.
-        future = await self._execute_method(
-            "update_weights_from_ipc",
+        # Ensure server_handle is cached for collective_rpc dispatch.
+        if self.server_handle is None:
+            self.server_handle = ray.get_actor(self._get_control_actor_name())
+
+        # 1. Pick rendezvous master for the refit NCCL group.
+        master_address = socket.gethostbyname(socket.gethostname())
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(("", 0))
+        master_port = s.getsockname()[1]
+        s.close()
+
+        # 2. Compute world_size: 1 broadcaster (us) + N engine workers
+        #    (sum of TP workers across all dynamo.vllm shards on this node).
+        n_engine_workers = await self.server_handle.get_num_engine_workers.remote()
+        world_size = 1 + int(n_engine_workers)
+
+        # 3. Tell engine workers to join the group (rank_offset=1 leaves
+        #    rank 0 for us). Non-blocking — we'll await after we also join.
+        init_future = await self._execute_method(
+            "init_weight_update_group",
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs={
+                "master_address": master_address,
+                "master_port": master_port,
+                "rank_offset": 1,
+                "world_size": world_size,
+            },
         )
 
-        # 2. Push bucketed weights over ZMQ IPC. self.zmq_handle is the
-        #    socket path computed in the parent vLLMServerAdapter.__init__
-        #    (ipc:///tmp/rl-colocate-zmq-replica-{R}-rank-{local}.sock).
-        #    The receiver-side path is computed in
-        #    dynamo_worker_extension._get_zmq_handle and produces the same
-        #    string via VERL_DYNAMO_RANK_OFFSET.
-        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
-        sender = BucketedWeightSender(
-            zmq_handle=self.zmq_handle,
-            bucket_size_mb=bucket_size_mb,
-            use_shm=self.use_shm,
+        # 4. We (broadcaster) join the same group on rank 0. Pick GPU 0
+        #    on this node — DynamoRollout's Ray actor process has access
+        #    to all node GPUs but only needs one for broadcast.
+        device = torch.device(f"cuda:{self.rollout_rank % 8}")
+        trainer_group = stateless_init_process_group(
+            master_address=master_address,
+            master_port=master_port,
+            rank=0,
+            world_size=world_size,
+            device=device,
         )
-        await sender.async_send_weights(weights)
 
-        # 3. Wait for the engine receivers (all TP workers) to finish
-        #    model.load_weights on the buckets we just sent.
-        if future is not None:
-            await future
+        if init_future is not None:
+            await init_future
 
-        # 4. Reset prefix cache — refit invalidates all KV blocks. Only
-        #    rollout_rank 0 needs to issue this (collective_rpc broadcasts).
-        if self.rollout_rank == 0:
-            await self.server_handle.clear_kv_cache.remote()
-            if global_steps is not None:
-                await self.server_handle.set_global_steps.remote(global_steps)
+        # 5. Per-tensor refit: signal engine workers, then broadcast.
+        #    The incoming `weights` generator yields (name, tensor) tuples
+        #    delivered by the verl framework's checkpoint_engine backend
+        #    (typically NCCL between trainer ranks 0-7 and rollout-side
+        #    actors 0-7). We just re-broadcast each tensor on OUR group
+        #    to the engine subprocesses.
+        n_tensors = 0
+        try:
+            async for name, tensor in weights:
+                # Move to GPU if needed (broadcast requires CUDA tensor).
+                if tensor.device.type != "cuda":
+                    tensor = tensor.to(device, non_blocking=True)
+                elif tensor.device != device:
+                    tensor = tensor.to(device, non_blocking=True)
 
-        if self.replica_rank == 0 and self.rollout_rank == 0:
-            elapsed = time.perf_counter() - start_time
-            _logger.info(
-                "[dynamo_rollout] update_weights elapsed=%.2fs global_steps=%s",
-                elapsed,
-                global_steps,
-            )
+                # Signal each engine worker to allocate buffer and recv
+                # via NCCL broadcast. Non-blocking so we can broadcast
+                # in parallel; we'll await the engine-side load_weights
+                # below.
+                signal_future = await self._execute_method(
+                    "update_weight",
+                    non_block=True,
+                    kwargs={
+                        "name": name,
+                        "dtype": str(tensor.dtype).replace("torch.", ""),
+                        "shape": list(tensor.shape),
+                    },
+                )
+
+                # Broadcast on our group. Engine workers recv into their
+                # newly-allocated buffer, then call model.load_weights.
+                trainer_group.broadcast(tensor, src=0)
+
+                if signal_future is not None:
+                    await signal_future
+
+                n_tensors += 1
+        finally:
+            # 6. Cleanup — best-effort; failure here doesn't void the refit.
+            try:
+                await self._execute_method("destroy_weight_update_group")
+            except Exception as e:
+                _logger.warning(
+                    "[dynamo_rollout v3] destroy_weight_update_group failed: %s", e
+                )
+
+        # 7. Reset prefix cache — refit invalidates all KV blocks.
+        await self.server_handle.clear_kv_cache.remote()
+        if global_steps is not None:
+            await self.server_handle.set_global_steps.remote(global_steps)
+
+        elapsed = time.perf_counter() - start_time
+        _logger.info(
+            "[dynamo_rollout v3 NCCL] update_weights n_tensors=%d elapsed=%.2fs "
+            "global_steps=%s world_size=%d",
+            n_tensors,
+            elapsed,
+            global_steps,
+            world_size,
+        )
 
 
 __all__ = ["ServerAdapter"]
