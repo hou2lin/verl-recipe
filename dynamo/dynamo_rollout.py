@@ -138,9 +138,12 @@ class ServerAdapter(_VllmServerAdapter):
         (delivered to them by the verl framework's NCCL backend) and
         return — only rank 0 broadcasts to the engine subprocesses.
         """
-        # Non-rank-0 just drain — only rank 0 orchestrates the refit
+        # Non-rank-0 just drain — only rank 0 orchestrates the refit.
+        # `weights` is a sync generator (Generator[(str, Tensor), None, None])
+        # delivered by the verl framework's checkpoint_engine backend, not an
+        # async one; use sync `for` not `async for`.
         if self.rollout_rank != 0:
-            async for _ in weights:
+            for _ in weights:
                 pass
             return
 
@@ -202,7 +205,7 @@ class ServerAdapter(_VllmServerAdapter):
         #    to the engine subprocesses.
         n_tensors = 0
         try:
-            async for name, tensor in weights:
+            for name, tensor in weights:
                 # Move to GPU if needed (broadcast requires CUDA tensor).
                 if tensor.device.type != "cuda":
                     tensor = tensor.to(device, non_blocking=True)
