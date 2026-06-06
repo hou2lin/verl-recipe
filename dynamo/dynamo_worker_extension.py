@@ -137,5 +137,47 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
             except Exception:
                 pass
 
+    # --------------------------------------------------------------------- #
+    # diag-only: test write-to-model-params under various engine states
+    # --------------------------------------------------------------------- #
+
+    def diag_test_load_weights_local(self, name: str, dtype_str: str, shape) -> dict:
+        """DIAG: bypass NCCL entirely, test if model.load_weights() works.
+
+        Allocate a tensor locally (no broadcast needed), then call the
+        standard model.load_weights path. Isolates the question "does
+        load_weights fault on a sleeping engine" from the question "does
+        NCCL init work on a sleeping engine".
+
+        Returns a dict with keys ok/error/elapsed_ms for the caller to
+        report. Intentionally doesn't propagate exceptions — we want clean
+        signal back, not a crashed worker.
+        """
+        import time as _time
+
+        import torch
+
+        t0 = _time.perf_counter()
+        try:
+            dtype = getattr(torch, dtype_str.replace("torch.", ""))
+            weight = torch.zeros(
+                tuple(shape), dtype=dtype, device=self.device
+            )
+            self.model_runner.model.load_weights(weights=[(name, weight)])
+            del weight
+            return {
+                "ok": True,
+                "elapsed_ms": (_time.perf_counter() - t0) * 1000,
+            }
+        except Exception as e:
+            import traceback
+
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+                "elapsed_ms": (_time.perf_counter() - t0) * 1000,
+            }
+
 
 __all__ = ["vLLMDynamoColocateWorkerExtension"]

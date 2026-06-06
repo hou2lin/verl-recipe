@@ -158,6 +158,18 @@ class ServerAdapter(_VllmServerAdapter):
         if self.server_handle is None:
             self.server_handle = ray.get_actor(self._get_control_actor_name())
 
+        # 0. Wake up the 'weights' tag BEFORE NCCL init.
+        #    diag B v3/v4 confirmed: PyNcclCommunicator init fails with
+        #    "NCCL invalid usage" on a fully-sleeping engine; this is
+        #    also why vLLM's upstream RLHF example (0.7.0 / 0.8.4)
+        #    always calls wake_up before init_weight_update_group.
+        #    Diag B v5 confirmed load_weights works under wake_up(['weights']).
+        #    Trade-off: this re-allocates ~weight_size on engine GPU,
+        #    concurrent with trainer FSDP all_gather → revisits Iter 3
+        #    memory pressure. Per-tensor refit (vs v2 bulk IPC) keeps
+        #    engine buffer peak small (~MiB-GiB per param).
+        await self.server_handle.wake_up.remote(tags=["weights"])
+
         # 1. Pick rendezvous master for the refit NCCL group.
         master_address = socket.gethostbyname(socket.gethostname())
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
