@@ -149,7 +149,8 @@ class ServerAdapter(_VllmServerAdapter):
 
         import socket
 
-        from vllm.distributed.parallel_state import stateless_init_process_group
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+        from vllm.distributed.utils import StatelessProcessGroup
 
         start_time = time.perf_counter()
 
@@ -185,14 +186,17 @@ class ServerAdapter(_VllmServerAdapter):
         # 4. We (broadcaster) join the same group on rank 0. Pick GPU 0
         #    on this node — DynamoRollout's Ray actor process has access
         #    to all node GPUs but only needs one for broadcast.
+        #    vLLM 0.18 split stateless_init_process_group into
+        #    StatelessProcessGroup (metadata TCP store) + PyNcclCommunicator
+        #    (data-plane NCCL); combine them ourselves.
         device = torch.device(f"cuda:{self.rollout_rank % 8}")
-        trainer_group = stateless_init_process_group(
-            master_address=master_address,
-            master_port=master_port,
+        broadcaster_pg = StatelessProcessGroup.create(
+            host=master_address,
+            port=master_port,
             rank=0,
             world_size=world_size,
-            device=device,
         )
+        trainer_group = PyNcclCommunicator(broadcaster_pg, device=device)
 
         if init_future is not None:
             await init_future

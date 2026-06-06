@@ -65,12 +65,17 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
         rank_offset: int,
         world_size: int,
     ) -> None:
-        """Join the refit NCCL group via stateless_init_process_group.
+        """Join the refit NCCL group via StatelessProcessGroup + PyNcclCommunicator.
 
         Called via ``engine.collective_rpc("init_weight_update_group", ...)``
         from the broadcaster (DynamoRollout.update_weights on rank-0 rollout
         actor). Each TP worker computes its own group rank from its node-
         global rank (local_rank + VERL_DYNAMO_RANK_OFFSET) plus rank_offset.
+
+        vLLM 0.18 split the old ``stateless_init_process_group`` helper into
+        two primitives: ``StatelessProcessGroup`` (metadata-only TCP store)
+        and ``PyNcclCommunicator`` (data-plane NCCL). Both must be combined.
+        See https://docs.vllm.ai/en/v0.8.4/getting_started/examples/rlhf_utils.html
 
         Args:
             master_address: TCP host of the rendezvous master (rank 0).
@@ -79,18 +84,21 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
                 for the broadcaster).
             world_size: Total members in the group (1 + n_engine_workers).
         """
-        from vllm.distributed.parallel_state import stateless_init_process_group
+        from vllm.distributed.device_communicators.pynccl import (
+            PyNcclCommunicator,
+        )
+        from vllm.distributed.utils import StatelessProcessGroup
 
         offset = int(os.environ.get(_RANK_OFFSET_ENV, "0"))
         global_rank = self.local_rank + offset
         my_group_rank = rank_offset + global_rank
-        self._model_update_group = stateless_init_process_group(
-            master_address=master_address,
-            master_port=master_port,
+        pg = StatelessProcessGroup.create(
+            host=master_address,
+            port=master_port,
             rank=my_group_rank,
             world_size=world_size,
-            device=self.device,
         )
+        self._model_update_group = PyNcclCommunicator(pg, device=self.device)
 
     def update_weight(self, name: str, dtype, shape) -> None:
         """Receive one weight tensor via NCCL broadcast and load into model.
