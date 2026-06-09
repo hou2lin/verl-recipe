@@ -1206,31 +1206,70 @@ class DynamoHttpServer:
         import zmq
         import zmq.asyncio
 
+        # v4a-6 (Iter 7.5): Iter 7.4 revealed sequential endpoint iteration
+        # deadlocks `update_weights_from_ipc`. That RPC blocks until the
+        # receiver's IPC loop returns, but the loop returns only after
+        # sender finishes; sender depends on cupy NCCL broadcast which
+        # requires ALL replicas' rollout actors to join the group. With
+        # sequential iter, only ep[0]'s workers are ever woken — the
+        # other 3 replicas' receivers never set up, cupy broadcast hangs,
+        # everything deadlocks.
+        #
+        # Fix: dispatch all sidecars CONCURRENTLY via asyncio.gather so
+        # all 4 replicas' workers fire update_weights_from_ipc together,
+        # all REP sockets bind, cupy broadcast progresses, sender unblocks.
+        method_name = method if isinstance(method, str) else method.__name__
+        req = {
+            "method": method_name,
+            "args": args,
+            "kwargs": kwargs or {},
+            "timeout": timeout,
+        }
+        recv_timeout = timeout if timeout else 600
+        print(
+            f"[v4a-6][DynamoHttpServer.collective_rpc] ENTER method={method_name} "
+            f"n_endpoints={len(self._control_endpoints)} parallel_dispatch=True",
+            flush=True,
+        )
+
         ctx = zmq.asyncio.Context.instance()
-        results: list[Any] = []
-        for ep in self._control_endpoints:
+
+        async def _call_one(idx: int, ep: str) -> Any:
             sock = ctx.socket(zmq.REQ)
             sock.setsockopt(zmq.LINGER, 0)
             try:
                 sock.connect(ep)
-                req = {
-                    "method": method if isinstance(method, str) else method.__name__,
-                    "args": args,
-                    "kwargs": kwargs or {},
-                    "timeout": timeout,
-                }
+                print(
+                    f"[v4a-6][DynamoHttpServer.collective_rpc] ep[{idx}]={ep} "
+                    f"connected, sending",
+                    flush=True,
+                )
                 await sock.send(pickle.dumps(req))
                 reply_bytes = await asyncio.wait_for(
-                    sock.recv(), timeout=timeout if timeout else 600
+                    sock.recv(), timeout=recv_timeout
                 )
                 reply = pickle.loads(reply_bytes)
+                print(
+                    f"[v4a-6][DynamoHttpServer.collective_rpc] ep[{idx}] reply "
+                    f"ok={reply.get('ok')} err={reply.get('error')}",
+                    flush=True,
+                )
                 if not reply.get("ok"):
                     raise RuntimeError(
                         f"control sidecar @ {ep} returned error: {reply.get('error')}"
                     )
-                results.append(reply.get("result"))
+                return reply.get("result")
             finally:
                 sock.close()
+
+        results = await asyncio.gather(
+            *[_call_one(i, ep) for i, ep in enumerate(self._control_endpoints)]
+        )
+        print(
+            f"[v4a-6][DynamoHttpServer.collective_rpc] EXIT method={method_name} "
+            f"all {len(results)} sidecars responded",
+            flush=True,
+        )
         return results
 
     # ------------------------------------------------------------------ #
@@ -1293,7 +1332,11 @@ class DynamoHttpServer:
     async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None):
         """Like collective_rpc but invokes a top-level AsyncLLM method
         (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
-        not a worker-extension RPC. Distinguished by message kind."""
+        not a worker-extension RPC. Distinguished by message kind.
+
+        v4a-6 (Iter 7.5): same parallel-dispatch fix as collective_rpc.
+        Sequential iter deadlocked update_weights_from_ipc and now also
+        deadlocks reset_prefix_cache post-refit."""
         if not self._control_endpoints:
             return None
 
@@ -1302,20 +1345,33 @@ class DynamoHttpServer:
         import zmq
         import zmq.asyncio
 
+        print(
+            f"[v4a-6][DynamoHttpServer._engine_method_all] ENTER method={method} "
+            f"n_endpoints={len(self._control_endpoints)} parallel_dispatch=True",
+            flush=True,
+        )
+
         ctx = zmq.asyncio.Context.instance()
-        for ep in self._control_endpoints:
+        req = {
+            "kind": "engine_method",
+            "method": method,
+            "kwargs": kwargs or {},
+        }
+
+        async def _call_one(idx: int, ep: str) -> None:
             sock = ctx.socket(zmq.REQ)
             sock.setsockopt(zmq.LINGER, 0)
             try:
                 sock.connect(ep)
-                req = {
-                    "kind": "engine_method",
-                    "method": method,
-                    "kwargs": kwargs or {},
-                }
                 await sock.send(pickle.dumps(req))
                 reply_bytes = await asyncio.wait_for(sock.recv(), timeout=120)
                 reply = pickle.loads(reply_bytes)
+                print(
+                    f"[v4a-6][DynamoHttpServer._engine_method_all] ep[{idx}] "
+                    f"method={method} reply ok={reply.get('ok')} "
+                    f"err={reply.get('error')}",
+                    flush=True,
+                )
                 if not reply.get("ok"):
                     logger.warning(
                         "[DynamoHttpServer] engine_method %s failed @ %s: %s",
@@ -1323,6 +1379,15 @@ class DynamoHttpServer:
                     )
             finally:
                 sock.close()
+
+        await asyncio.gather(
+            *[_call_one(i, ep) for i, ep in enumerate(self._control_endpoints)]
+        )
+        print(
+            f"[v4a-6][DynamoHttpServer._engine_method_all] EXIT method={method} "
+            f"all {len(self._control_endpoints)} sidecars responded",
+            flush=True,
+        )
         return None
 
     # ------------------------------------------------------------------ #

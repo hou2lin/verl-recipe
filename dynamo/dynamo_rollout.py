@@ -22,7 +22,6 @@ rather than ``vllm_server_*``.
 
 import logging
 import time
-from collections.abc import Generator
 from typing import Any, Optional
 
 import ray
@@ -64,8 +63,19 @@ class ServerAdapter(_VllmServerAdapter):
 
         Native vLLM has one named server actor per rollout replica. All logical rollout
         replicas on a node share ``dynamo_server_0_<node_rank>``.
+
+        v4a-8 (Iter 7.9): gate on GLOBAL rank (rollout_rank==0 AND
+        replica_rank==0), not just rollout_rank==0. The shared actor's
+        collective_rpc broadcasts to all 4 sidecars internally, so if
+        each replica's rank-0 fires, we get 4×4 duplicate RPCs and
+        engine workers hang on 3 spurious update_weights_from_ipc
+        invocations (no paired sender). Only the global rank-0 fires.
+        Each replica's rank-0 still fires its own BucketedWeightSender
+        (paired 1:1 with its engine workers), but only one RPC triggers
+        engine.collective_rpc("update_weights_from_ipc") across all
+        replicas via the parallel sidecar dispatch.
         """
-        if self.rollout_rank != 0:
+        if self.rollout_rank != 0 or self.replica_rank != 0:
             return None
 
         if self.server_handle is None:
@@ -111,168 +121,176 @@ class ServerAdapter(_VllmServerAdapter):
             elapsed_ms,
         )
 
-    @torch.no_grad()
-    async def update_weights(
-        self,
-        weights: Generator[tuple[str, torch.Tensor], None, None],
-        global_steps: int = None,
-        **kwargs,
-    ):
-        """v3 — per-tensor NCCL P2P refit (replaces v2 CUDA-IPC path).
-
-        Motivation: v2 used ``update_weights_from_ipc`` on the engine side,
-        which implicitly wakes the 'weights' tag and allocates the full
-        ~63 GiB weight buffer. Concurrent with the trainer's FSDP
-        ``get_per_tensor_param`` all_gather (also ~63 GiB), this pushed
-        single-GPU memory over the edge and NCCL hung (see Iter 3 in
-        reports/verl_dynamo_refit_iter_log_zh.md).
-
-        v3 mirrors the miles team's design and the vLLM 0.7.0 RLHF
-        example: rollout rank-0 acts as broadcaster, dynamo.vllm worker
-        subprocesses join an NCCL group via ``init_weight_update_group``,
-        and each parameter is broadcast individually via
-        ``update_weight(name, dtype, shape)``. Peak engine-side memory is
-        ~one tensor (MiB–GiB scale), not the full ~63 GiB.
-
-        Non-rank-0 rollout actors drain the incoming weights generator
-        (delivered to them by the verl framework's NCCL backend) and
-        return — only rank 0 broadcasts to the engine subprocesses.
-        """
-        # Non-rank-0 just drain — only rank 0 orchestrates the refit.
-        # `weights` is a sync generator (Generator[(str, Tensor), None, None])
-        # delivered by the verl framework's checkpoint_engine backend, not an
-        # async one; use sync `for` not `async for`.
-        if self.rollout_rank != 0:
-            for _ in weights:
-                pass
-            return
-
-        import socket
-
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        from vllm.distributed.utils import StatelessProcessGroup
-
-        start_time = time.perf_counter()
-
-        # Ensure server_handle is cached for collective_rpc dispatch.
-        if self.server_handle is None:
-            self.server_handle = ray.get_actor(self._get_control_actor_name())
-
-        # 0. Wake up the 'weights' tag BEFORE NCCL init.
-        #    diag B v3/v4 confirmed: PyNcclCommunicator init fails with
-        #    "NCCL invalid usage" on a fully-sleeping engine; this is
-        #    also why vLLM's upstream RLHF example (0.7.0 / 0.8.4)
-        #    always calls wake_up before init_weight_update_group.
-        #    Diag B v5 confirmed load_weights works under wake_up(['weights']).
-        #    Trade-off: this re-allocates ~weight_size on engine GPU,
-        #    concurrent with trainer FSDP all_gather → revisits Iter 3
-        #    memory pressure. Per-tensor refit (vs v2 bulk IPC) keeps
-        #    engine buffer peak small (~MiB-GiB per param).
-        await self.server_handle.wake_up.remote(tags=["weights"])
-
-        # 1. Pick rendezvous master for the refit NCCL group.
-        master_address = socket.gethostbyname(socket.gethostname())
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.bind(("", 0))
-        master_port = s.getsockname()[1]
-        s.close()
-
-        # 2. Compute world_size: 1 broadcaster (us) + N engine workers
-        #    (sum of TP workers across all dynamo.vllm shards on this node).
-        n_engine_workers = await self.server_handle.get_num_engine_workers.remote()
-        world_size = 1 + int(n_engine_workers)
-
-        # 3. Tell engine workers to join the group (rank_offset=1 leaves
-        #    rank 0 for us). Non-blocking — we'll await after we also join.
-        init_future = await self._execute_method(
-            "init_weight_update_group",
-            non_block=True,
-            kwargs={
-                "master_address": master_address,
-                "master_port": master_port,
-                "rank_offset": 1,
-                "world_size": world_size,
-            },
-        )
-
-        # 4. We (broadcaster) join the same group on rank 0. Pick GPU 0
-        #    on this node — DynamoRollout's Ray actor process has access
-        #    to all node GPUs but only needs one for broadcast.
-        #    vLLM 0.18 split stateless_init_process_group into
-        #    StatelessProcessGroup (metadata TCP store) + PyNcclCommunicator
-        #    (data-plane NCCL); combine them ourselves.
-        device = torch.device(f"cuda:{self.rollout_rank % 8}")
-        broadcaster_pg = StatelessProcessGroup.create(
-            host=master_address,
-            port=master_port,
-            rank=0,
-            world_size=world_size,
-        )
-        trainer_group = PyNcclCommunicator(broadcaster_pg, device=device)
-
-        if init_future is not None:
-            await init_future
-
-        # 5. Per-tensor refit: signal engine workers, then broadcast.
-        #    The incoming `weights` generator yields (name, tensor) tuples
-        #    delivered by the verl framework's checkpoint_engine backend
-        #    (typically NCCL between trainer ranks 0-7 and rollout-side
-        #    actors 0-7). We just re-broadcast each tensor on OUR group
-        #    to the engine subprocesses.
-        n_tensors = 0
-        try:
-            for name, tensor in weights:
-                # Move to GPU if needed (broadcast requires CUDA tensor).
-                if tensor.device.type != "cuda":
-                    tensor = tensor.to(device, non_blocking=True)
-                elif tensor.device != device:
-                    tensor = tensor.to(device, non_blocking=True)
-
-                # Signal each engine worker to allocate buffer and recv
-                # via NCCL broadcast. Non-blocking so we can broadcast
-                # in parallel; we'll await the engine-side load_weights
-                # below.
-                signal_future = await self._execute_method(
-                    "update_weight",
-                    non_block=True,
-                    kwargs={
-                        "name": name,
-                        "dtype": str(tensor.dtype).replace("torch.", ""),
-                        "shape": list(tensor.shape),
-                    },
-                )
-
-                # Broadcast on our group. Engine workers recv into their
-                # newly-allocated buffer, then call model.load_weights.
-                trainer_group.broadcast(tensor, src=0)
-
-                if signal_future is not None:
-                    await signal_future
-
-                n_tensors += 1
-        finally:
-            # 6. Cleanup — best-effort; failure here doesn't void the refit.
-            try:
-                await self._execute_method("destroy_weight_update_group")
-            except Exception as e:
-                _logger.warning(
-                    "[dynamo_rollout v3] destroy_weight_update_group failed: %s", e
-                )
-
-        # 7. Reset prefix cache — refit invalidates all KV blocks.
-        await self.server_handle.clear_kv_cache.remote()
-        if global_steps is not None:
-            await self.server_handle.set_global_steps.remote(global_steps)
-
-        elapsed = time.perf_counter() - start_time
+    # v4a-3: sleep_level=1 keeps weights resident on GPU through every
+    # sleep call (only KV cache is freed). This bypasses the
+    # vLLM-tag-tracking bug that made wake_up('weights') a silent no-op
+    # in Iter 7.0/7.1: with weights never sleeping, update_weights_from_ipc
+    # can write directly into the live weight tensors without needing
+    # any wake_up RPC through the Dynamo sidecar.
+    #
+    # History:
+    # - v1 (Sophia original): no-op drain - off-policy false positive (B v4)
+    # - v2 (4becf27): IPC path, OOM at Iter 3
+    # - v3 (bead1d1): self-built PyTorch NCCL group, blocked by NCCL
+    #   "Duplicate GPU detected" same-GPU 2-rank (Iter 4-5, spike 6.x)
+    # - v4 (design only): subprocess as direct receiver, blocked by
+    #   ray.util.collective non-actor restriction (P1.0 mini-test)
+    # - v4a (Iter 7.0): bare inherit, NCCL watchdog hang due to
+    #   implicit-wake silent no-op
+    # - v4a-2 (Iter 7.1): explicit wake_up before super(), 120s timeout
+    #   in Dynamo sidecar (engine_method ZMQ recv)
+    # - v4a-3 (Iter 7.2, current): sleep_level=1 to avoid wake entirely.
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Force sleep_level=1 regardless of VLLM_SLEEP_LEVEL env default.
+        # weights stay on GPU through every sleep; only KV is freed.
+        self.sleep_level = 1
         _logger.info(
-            "[dynamo_rollout v3 NCCL] update_weights n_tensors=%d elapsed=%.2fs "
-            "global_steps=%s world_size=%d",
-            n_tensors,
-            elapsed,
-            global_steps,
-            world_size,
+            "[dynamo_rollout v4a-3] forcing sleep_level=1 "
+            "(weights resident, avoid wake_up tag-tracking bug)"
         )
+
+    # v4a-4 (Iter 7.3 diagnostic): override update_weights to expose
+    # the silent RPC failure in the Dynamo IPC bridge. Iter 7.0-7.2 all
+    # hung with V-1.c=0 (engine.update_weights_from_ipc never observably
+    # fired in shard logs). The base v2 IPC path fires the RPC with
+    # non_block=True and then awaits sender first — if RPC errors
+    # silently, the sender hangs on ZMQ send forever and the future's
+    # error is never observed.
+    #
+    # This override:
+    #  - Adds aggressive print() statements (stdout → Ray actor log →
+    #    SLURM log, more reliable than logger.info on this code path)
+    #  - Uses asyncio.wait(FIRST_COMPLETED) to race future vs sender,
+    #    so an early RPC error surfaces within 60s instead of waiting
+    #    for NCCL watchdog 22min timeout.
+    @torch.no_grad()
+    async def update_weights(self, weights, global_steps=None, **kwargs):
+        import asyncio
+        import time as _time
+
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
+            BucketedWeightSender,
+        )
+
+        t_enter = _time.time()
+        tag = f"[v4a-4][rank={self.rollout_rank}]"
+        print(f"{tag} ENTER update_weights", flush=True)
+
+        # Fire RPC (only rank 0 actually fires per parent _execute_method gating).
+        future = await self._execute_method(
+            "update_weights_from_ipc",
+            non_block=True,
+            kwargs={**kwargs, "use_shm": self.use_shm},
+        )
+        print(
+            f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
+            f"future={'present' if future is not None else 'None (non-rank-0)'}",
+            flush=True,
+        )
+
+        # Build sender (every rank has its own zmq_handle to its paired
+        # engine worker; receiver setup on engine side is triggered by
+        # rank 0's RPC, but all ranks then send via their own pair).
+        bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes
+        sender = BucketedWeightSender(
+            zmq_handle=self.zmq_handle,
+            bucket_size_mb=bucket_size_mb,
+            use_shm=self.use_shm,
+        )
+        print(f"{tag} sender ready zmq_handle={self.zmq_handle}", flush=True)
+
+        sender_task = asyncio.create_task(sender.async_send_weights(weights))
+
+        # Race future vs sender for 60s. If future errors fast, we catch it.
+        if future is not None:
+            future_task = asyncio.ensure_future(future)
+            done, pending = await asyncio.wait(
+                {sender_task, future_task},
+                timeout=60,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            elapsed = _time.time() - t_enter
+            print(
+                f"{tag} race done={len(done)} pending={len(pending)} "
+                f"+{elapsed:.2f}s",
+                flush=True,
+            )
+            for t in done:
+                which = "future" if t is future_task else "sender"
+                if t.exception():
+                    err = t.exception()
+                    print(
+                        f"{tag} {which} ERROR: {type(err).__name__}: {err}",
+                        flush=True,
+                    )
+                    for p in pending:
+                        p.cancel()
+                    raise err
+                print(f"{tag} {which} completed OK", flush=True)
+
+            # Continue waiting for whatever is still pending
+            if pending:
+                print(f"{tag} waiting for {len(pending)} pending task(s)...", flush=True)
+                more_done, more_pending = await asyncio.wait(
+                    pending,
+                    timeout=600,
+                    return_when=asyncio.ALL_COMPLETED,
+                )
+                if more_pending:
+                    print(
+                        f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
+                        f"after 600s +{_time.time() - t_enter:.2f}s",
+                        flush=True,
+                    )
+                    for p in more_pending:
+                        p.cancel()
+                    raise RuntimeError(
+                        f"v4a-4 hung: tasks still pending after 660s total"
+                    )
+                for t in more_done:
+                    which = "future" if t is future_task else "sender"
+                    if t.exception():
+                        err = t.exception()
+                        print(
+                            f"{tag} {which} ERROR (late): "
+                            f"{type(err).__name__}: {err}",
+                            flush=True,
+                        )
+                        raise err
+                    print(f"{tag} {which} completed OK (late)", flush=True)
+        else:
+            # Non-rank-0: only sender (no future to race against).
+            await sender_task
+            print(f"{tag} sender DONE (non-rank-0) +{_time.time() - t_enter:.2f}s", flush=True)
+
+        # Cleanup — only GLOBAL rank 0 fires (one Ray actor call per
+        # cluster, not per replica). v4a-7 (Iter 7.7): wrap in timeout.
+        # v4a-8 (Iter 7.9): also gate on replica_rank==0 to avoid 4×
+        # duplicate clear_kv_cache / set_global_steps Ray calls.
+        if self.rollout_rank == 0 and self.replica_rank == 0:
+            try:
+                await asyncio.wait_for(
+                    self.server_handle.clear_kv_cache.remote(),
+                    timeout=30,
+                )
+                print(f"{tag} kv cache cleared", flush=True)
+            except asyncio.TimeoutError:
+                print(
+                    f"{tag} clear_kv_cache TIMEOUT 30s (continuing; "
+                    f"prefix cache may be stale)",
+                    flush=True,
+                )
+            if global_steps is not None:
+                try:
+                    await asyncio.wait_for(
+                        self.server_handle.set_global_steps.remote(global_steps),
+                        timeout=10,
+                    )
+                except asyncio.TimeoutError:
+                    print(f"{tag} set_global_steps TIMEOUT 10s", flush=True)
+
+        print(f"{tag} EXIT +{_time.time() - t_enter:.2f}s", flush=True)
 
 
 __all__ = ["ServerAdapter"]
