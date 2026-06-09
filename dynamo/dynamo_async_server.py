@@ -1226,11 +1226,6 @@ class DynamoHttpServer:
             "timeout": timeout,
         }
         recv_timeout = timeout if timeout else 600
-        print(
-            f"[v4a-6][DynamoHttpServer.collective_rpc] ENTER method={method_name} "
-            f"n_endpoints={len(self._control_endpoints)} parallel_dispatch=True",
-            flush=True,
-        )
 
         ctx = zmq.asyncio.Context.instance()
 
@@ -1239,21 +1234,11 @@ class DynamoHttpServer:
             sock.setsockopt(zmq.LINGER, 0)
             try:
                 sock.connect(ep)
-                print(
-                    f"[v4a-6][DynamoHttpServer.collective_rpc] ep[{idx}]={ep} "
-                    f"connected, sending",
-                    flush=True,
-                )
                 await sock.send(pickle.dumps(req))
                 reply_bytes = await asyncio.wait_for(
                     sock.recv(), timeout=recv_timeout
                 )
                 reply = pickle.loads(reply_bytes)
-                print(
-                    f"[v4a-6][DynamoHttpServer.collective_rpc] ep[{idx}] reply "
-                    f"ok={reply.get('ok')} err={reply.get('error')}",
-                    flush=True,
-                )
                 if not reply.get("ok"):
                     raise RuntimeError(
                         f"control sidecar @ {ep} returned error: {reply.get('error')}"
@@ -1264,11 +1249,6 @@ class DynamoHttpServer:
 
         results = await asyncio.gather(
             *[_call_one(i, ep) for i, ep in enumerate(self._control_endpoints)]
-        )
-        print(
-            f"[v4a-6][DynamoHttpServer.collective_rpc] EXIT method={method_name} "
-            f"all {len(results)} sidecars responded",
-            flush=True,
         )
         return results
 
@@ -1345,11 +1325,6 @@ class DynamoHttpServer:
         import zmq
         import zmq.asyncio
 
-        print(
-            f"[v4a-6][DynamoHttpServer._engine_method_all] ENTER method={method} "
-            f"n_endpoints={len(self._control_endpoints)} parallel_dispatch=True",
-            flush=True,
-        )
 
         ctx = zmq.asyncio.Context.instance()
         req = {
@@ -1366,12 +1341,6 @@ class DynamoHttpServer:
                 await sock.send(pickle.dumps(req))
                 reply_bytes = await asyncio.wait_for(sock.recv(), timeout=120)
                 reply = pickle.loads(reply_bytes)
-                print(
-                    f"[v4a-6][DynamoHttpServer._engine_method_all] ep[{idx}] "
-                    f"method={method} reply ok={reply.get('ok')} "
-                    f"err={reply.get('error')}",
-                    flush=True,
-                )
                 if not reply.get("ok"):
                     logger.warning(
                         "[DynamoHttpServer] engine_method %s failed @ %s: %s",
@@ -1382,11 +1351,6 @@ class DynamoHttpServer:
 
         await asyncio.gather(
             *[_call_one(i, ep) for i, ep in enumerate(self._control_endpoints)]
-        )
-        print(
-            f"[v4a-6][DynamoHttpServer._engine_method_all] EXIT method={method} "
-            f"all {len(self._control_endpoints)} sidecars responded",
-            flush=True,
         )
         return None
 
