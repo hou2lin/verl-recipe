@@ -124,10 +124,24 @@ async def _handle_request(req: dict) -> dict:
 
     try:
         if kind == "collective_rpc":
+            print(
+                f"[v4a-5][sidecar._handle_request] BEFORE engine.collective_rpc "
+                f"method={method}",
+                flush=True,
+            )
             result = await engine.collective_rpc(
                 method=method, timeout=timeout, args=args, kwargs=kwargs
             )
+            print(
+                f"[v4a-5][sidecar._handle_request] AFTER engine.collective_rpc "
+                f"method={method} result_type={type(result).__name__}",
+                flush=True,
+            )
         elif kind == "engine_method":
+            print(
+                f"[v4a-7][sidecar._handle_request] BEFORE engine.{method}() kwargs={list(kwargs.keys())}",
+                flush=True,
+            )
             fn = getattr(engine, method)
             ret = fn(**kwargs)
             if asyncio.iscoroutine(ret):
@@ -135,6 +149,10 @@ async def _handle_request(req: dict) -> dict:
                     ret = await asyncio.wait_for(ret, timeout=timeout)
                 else:
                     ret = await ret
+            print(
+                f"[v4a-7][sidecar._handle_request] AFTER engine.{method}() result_type={type(ret).__name__}",
+                flush=True,
+            )
             result = ret
         elif kind == "generate_direct":
             # Bypass dynamo's HTTP/frontend stack and call AsyncLLM.generate

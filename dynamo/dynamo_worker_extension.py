@@ -54,6 +54,26 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
         global_rank = self.local_rank + offset
         return f"ipc:///tmp/rl-colocate-zmq-replica-{replica_rank}-rank-{global_rank}.sock"
 
+    # v4a-5 (Iter 7.4) diagnostic: confirm update_weights_from_ipc actually
+    # fires on engine workers. V-1.c grep has shown 0 lines for the past 4
+    # iters, suggesting this method never runs. This override adds a print
+    # before delegating to the inherited implementation.
+    def update_weights_from_ipc(self, *args, **kwargs):
+        replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
+        offset = int(os.environ.get(_RANK_OFFSET_ENV, "0"))
+        try:
+            global_rank = self.local_rank + offset
+        except Exception:
+            global_rank = "?"
+        print(
+            f"[v4a-5][worker.update_weights_from_ipc] FIRING "
+            f"replica={replica_rank} local_rank={self.local_rank} "
+            f"offset={offset} global_rank={global_rank} "
+            f"zmq={self._get_zmq_handle()}",
+            flush=True,
+        )
+        return super().update_weights_from_ipc(*args, **kwargs)
+
     # --------------------------------------------------------------------- #
     # v3 refit: per-tensor NCCL broadcast (replacing v2 CUDA-IPC path)
     # --------------------------------------------------------------------- #
@@ -136,6 +156,255 @@ class vLLMDynamoColocateWorkerExtension(vLLMColocateWorkerExtension):
                 del self._model_update_group
             except Exception:
                 pass
+
+    # --------------------------------------------------------------------- #
+    # SPIKE (v4 path): join external NCCL group via torch.distributed.
+    # Validates the hypothesis that PyTorch's ProcessGroupNCCL handles
+    # same-GPU 2-rank correctly (the case that broke v3's raw
+    # PyNcclCommunicator). If this works, the next step is to skip our
+    # rollout-side actor entirely and let trainer broadcast directly into
+    # the engine subprocess workers — see
+    # reports/verl_dynamo_refit_findings_zh.md §6 path J/K.
+    # --------------------------------------------------------------------- #
+
+    def init_external_process_group(
+        self,
+        master_address: str,
+        master_port: int,
+        world_size: int,
+        rank: int | None = None,
+        rank_offset: int | None = None,
+        group_name: str = "refit_external",
+        timeout_seconds: int = 300,
+    ) -> dict:
+        """SPIKE: join an external NCCL group, separate from vLLM TP group.
+
+        Uses ``torch.distributed.ProcessGroupNCCL`` (PyTorch's NCCL wrapper)
+        with a TCPStore-based rendezvous. Crucially this does NOT touch the
+        default global process group that vLLM TP already initialized — we
+        construct a fresh ProcessGroup object.
+
+        Why this should work where v3 failed:
+            v3 used ``vllm.distributed.PyNcclCommunicator`` directly, which
+            wraps raw NCCL with minimal coordination. On the colocated
+            8-GPU H200 layout, the broadcaster (rollout Ray actor on cuda:0)
+            and the dynamo engine worker (also on cuda:0) ended up as two
+            ranks in one NCCL communicator on the same GPU — NCCL reports
+            "invalid usage" in that case (confirmed in diag B v3, see
+            reports/verl_dynamo_refit_iter_log_zh.md).
+
+            verl framework's NCCL backend, by contrast, uses
+            ``ray.util.collective`` (cupy-based wrapper with stream
+            coordination) and B v4 confirmed it works in the same colocated
+            same-GPU layout. ``torch.distributed.ProcessGroupNCCL`` provides
+            the same kind of PyTorch-level coordination layer. So this spike
+            tests whether the PyTorch wrapper, not the raw NCCL primitive,
+            is what enables same-GPU 2-rank to work.
+
+        Args:
+            master_address: TCP host of the rendezvous master (rank 0).
+            master_port: TCP port of the rendezvous master.
+            world_size: Total members in the group.
+            rank: Explicit rank for this worker. Mutually exclusive with
+                rank_offset. Use when caller knows the exact rank.
+            rank_offset: If provided, this worker's rank in the new group
+                is computed as ``rank_offset + self.rank`` (vLLM TP rank).
+                Required when calling via ``engine.collective_rpc`` because
+                that broadcasts the same kwargs to every TP worker — each
+                worker must derive its own rank from its TP rank.
+            group_name: Label for logging only.
+            timeout_seconds: Rendezvous + collective op timeout.
+
+        Returns:
+            dict with ``ok`` plus diagnostic fields (or ``error`` + traceback
+            on failure). We catch all exceptions so the worker doesn't die —
+            we want clean signal back, not a crashed worker.
+        """
+        import datetime
+        import time as _time
+        import traceback
+
+        import torch
+        import torch.distributed as dist
+
+        t0 = _time.perf_counter()
+        try:
+            # Resolve rank: explicit rank wins; otherwise rank_offset+self.rank.
+            if rank is None:
+                if rank_offset is None:
+                    return {
+                        "ok": False,
+                        "error": "ValueError: pass either rank= or rank_offset=",
+                    }
+                rank = rank_offset + self.rank
+
+            # Pin CUDA device before NCCL init — vLLM workers typically have
+            # this set already, but being explicit avoids surprises if this
+            # method is called on a "fresh" RPC stack.
+            torch.cuda.set_device(self.device)
+
+            timeout = datetime.timedelta(seconds=timeout_seconds)
+            is_master = rank == 0
+
+            # TCPStore is the rendezvous primitive. is_master means this
+            # process binds the listening socket; others connect.
+            store = dist.TCPStore(
+                host_name=master_address,
+                port=int(master_port),
+                world_size=world_size,
+                is_master=is_master,
+                timeout=timeout,
+            )
+
+            # Construct ProcessGroupNCCL directly. This does NOT touch the
+            # default global group used by vLLM TP — we hold our own
+            # ProcessGroup object, used via group= kwarg in collectives.
+            opts = dist.ProcessGroupNCCL.Options()
+            opts._timeout = timeout
+            pg = dist.ProcessGroupNCCL(store, rank, world_size, opts)
+
+            # Keep references so they don't get GC'd between RPCs.
+            self._refit_pg = pg
+            self._refit_store = store
+            self._refit_rank = rank
+            self._refit_world_size = world_size
+
+            elapsed_ms = (_time.perf_counter() - t0) * 1000
+            return {
+                "ok": True,
+                "device": str(self.device),
+                "rank": rank,
+                "tp_rank": self.rank,
+                "world_size": world_size,
+                "elapsed_ms": elapsed_ms,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+                "elapsed_ms": (_time.perf_counter() - t0) * 1000,
+            }
+
+    def receive_and_load_weights_test(
+        self,
+        name: str,
+        dtype_str: str,
+        shape,
+        do_load_weights: bool = True,
+    ) -> dict:
+        """SPIKE: receive a broadcast tensor on the refit group and load it.
+
+        Must be called after ``init_external_process_group``. Allocates a
+        buffer of (dtype, shape), receives a broadcast from rank 0 of the
+        refit group, then optionally calls ``model.load_weights`` to commit
+        the received tensor into the live parameter.
+
+        Args:
+            name: Parameter name (matches ``model.named_parameters()``).
+            dtype_str: Tensor dtype, e.g. "bfloat16" or "torch.bfloat16".
+            shape: Iterable of int — tensor shape.
+            do_load_weights: If False, skip the model.load_weights step and
+                just measure recv timing. Useful for isolating "did the
+                broadcast work" from "did load_weights work" — diag B v5
+                already proved load_weights works under sleep+wake, so the
+                spike's first concern is the NCCL broadcast step.
+
+        Returns:
+            dict with ``ok`` + timing fields, or ``error`` + traceback.
+        """
+        import time as _time
+        import traceback
+
+        import torch
+        import torch.distributed as dist
+
+        t0 = _time.perf_counter()
+        try:
+            if not hasattr(self, "_refit_pg"):
+                return {
+                    "ok": False,
+                    "error": "RuntimeError: external process group not initialized — call init_external_process_group first",
+                }
+
+            dtype = getattr(torch, dtype_str.replace("torch.", ""))
+            tensor = torch.empty(tuple(shape), dtype=dtype, device=self.device)
+
+            # PyTorch 2.10 `dist.broadcast(tensor, src=0, group=pg)` requires
+            # `pg` to be registered via `dist.new_group()`. But we hold a raw
+            # ProcessGroupNCCL (constructed directly) that's NOT registered —
+            # registering would require touching the default global group,
+            # which vLLM TP already owns. So call the ProcessGroup primitive
+            # directly, bypassing the dist module's registration check.
+            opts = dist.BroadcastOptions()
+            opts.rootRank = 0
+            work = self._refit_pg.broadcast([tensor], opts)
+            work.wait()
+            torch.cuda.synchronize()
+
+            recv_elapsed_ms = (_time.perf_counter() - t0) * 1000
+
+            load_elapsed_ms = None
+            if do_load_weights:
+                t1 = _time.perf_counter()
+                self.model_runner.model.load_weights(weights=[(name, tensor)])
+                load_elapsed_ms = (_time.perf_counter() - t1) * 1000
+
+            del tensor
+
+            return {
+                "ok": True,
+                "recv_elapsed_ms": recv_elapsed_ms,
+                "load_elapsed_ms": load_elapsed_ms,
+                "tensor_bytes": int(
+                    torch.tensor(shape).prod().item()
+                ) * (torch.finfo(dtype).bits // 8 if dtype.is_floating_point else 8),
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+                "elapsed_ms": (_time.perf_counter() - t0) * 1000,
+            }
+
+    def destroy_external_process_group(self) -> dict:
+        """SPIKE: best-effort teardown of the refit external NCCL group.
+
+        Tears down both the ProcessGroupNCCL and the TCPStore so a follow-up
+        call to init_external_process_group can rebuild from scratch.
+        Idempotent — safe to call without prior init.
+        """
+        import traceback
+
+        result = {"ok": True, "freed": []}
+        if hasattr(self, "_refit_pg"):
+            try:
+                # ProcessGroupNCCL has _shutdown / shutdown depending on
+                # version; try both, swallow attribute errors.
+                pg = self._refit_pg
+                if hasattr(pg, "shutdown"):
+                    pg.shutdown()
+                elif hasattr(pg, "_shutdown"):
+                    pg._shutdown()
+                del self._refit_pg
+                result["freed"].append("pg")
+            except Exception as e:
+                result["pg_error"] = f"{type(e).__name__}: {e}"
+                result["pg_traceback"] = traceback.format_exc()
+
+        if hasattr(self, "_refit_store"):
+            try:
+                del self._refit_store
+                result["freed"].append("store")
+            except Exception as e:
+                result["store_error"] = f"{type(e).__name__}: {e}"
+
+        for attr in ("_refit_rank", "_refit_world_size"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
+        return result
 
     # --------------------------------------------------------------------- #
     # diag-only: test write-to-model-params under various engine states
