@@ -38,13 +38,12 @@ from verl.single_controller.base.decorator import Dispatch, register
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo.utils import Role, need_reference_policy
-from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.import_utils import import_external_libs
+from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.engine_workers_tinker import TinkerActorRolloutRefWorker
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
-from verl.workers.utils.padding import no_padding_2_padding
 
 from ..config_utils import is_no_rollout_deployment
 from ..schemas import ServerCapabilities
@@ -65,6 +64,20 @@ class TinkerServerActorRolloutRefWorker(TinkerActorRolloutRefWorker):
         if self.ref is None:
             return
         self.ref.to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_actor_for_weight_sync(self):
+        """Release actor training-only memory before waking rollout weights.
+
+        The naive checkpoint engine still needs actor parameters on GPU as the
+        source of the transfer. Move only optimizer state to CPU and leave both
+        parameters and gradients untouched so a caller's gradient-accumulation
+        state is preserved. Optimizer CPU copies are non-blocking on some
+        backends, so synchronize and clear the allocator cache before vLLM
+        attempts to remap its weight allocation.
+        """
+        self.actor.to(device="cpu", model=False, optimizer=True, grad=False)
+        aggressive_empty_cache(force_sync=True)
 
 
 class NoRolloutWorker(TinkerServerActorRolloutRefWorker):
@@ -556,78 +569,6 @@ class ColocatedBackend:
             self._prepare_model_roles({ModelRole.REF}, reason="compute_ref_log_prob")
             return self.ref_policy_wg.compute_ref_log_prob(data)
 
-    def _ensure_ref_log_prob_for_kl_loss(self, data):
-        """In case KL is enabled and we do not have ref_log_prob in our input,
-        we will have to compute it here"""
-
-        if not self.use_kl_loss:
-            return
-        loss_mode = tu.get_non_tensor_data(data, "__loss_mode__", "ppo")
-        if loss_mode != "ppo" or "ref_log_prob" in data:
-            return
-        if self.ref_policy_wg is None and not self._ref_in_actor:
-            logger.error(
-                "[kl_loss] ensure ref_log_prob exit: reference policy is not initialized"
-                " and reference also not live in actor"
-            )
-            raise RuntimeError(
-                "KL loss is enabled but reference policy is not initialized; "
-                "cannot populate missing ref_log_prob before forward_backward"
-            )
-
-        self._prepare_model_roles({ModelRole.REF}, reason="kl ref_log_prob")
-
-        ref_input = data.clone()
-        tu.assign_non_tensor_data(ref_input, "compute_loss", False)
-        tu.assign_non_tensor_data(ref_input, "calculate_entropy", False)
-
-        # We currently don't support lora, but leave here for potential future expansion
-        # if self._ref_in_actor:
-        #     tu.assign_non_tensor_data(ref_input, "no_lora_adapter", True)
-        #     ref_output = self.actor_rollout_wg.compute_log_prob(ref_input)
-        ref_output = self.ref_policy_wg.compute_ref_log_prob(ref_input)
-        ref_output = self._wait_for_nonblocking_result(ref_output)
-        if ref_output is None:
-            logger.error("[kl_loss] ensure ref_log_prob exit: reference policy returned no output")
-            raise RuntimeError("Reference policy returned no output while computing ref_log_prob")
-
-        ref_log_prob = None
-        for key in ("ref_log_prob", "log_probs"):
-            if key in ref_output:
-                ref_log_prob = ref_output[key]
-                break
-
-        if ref_log_prob is None:
-            keys = list(ref_output.keys()) if hasattr(ref_output, "keys") else type(ref_output).__name__
-            logger.error("[kl_loss] ensure ref_log_prob exit: missing ref log prob key in output keys=%s", keys)
-            raise RuntimeError(
-                "Reference policy output must contain 'log_probs' or 'ref_log_prob' "
-                f"to populate KL loss input; got {keys}"
-            )
-
-        old_log_probs = data["old_log_probs"]
-        if ref_log_prob.shape != old_log_probs.shape:
-            try:
-                ref_log_prob = no_padding_2_padding(ref_log_prob, data)
-            except Exception as exc:
-                logger.exception("[kl_loss] ensure ref_log_prob exit: failed to convert ref_log_prob shape")
-                raise RuntimeError(
-                    "Reference policy returned ref_log_prob/log_probs that cannot be converted "
-                    f"to response-padded shape {tuple(old_log_probs.shape)}; got {tuple(ref_log_prob.shape)}"
-                ) from exc
-        if ref_log_prob.shape != old_log_probs.shape:
-            logger.error(
-                "[kl_loss] ensure ref_log_prob exit: invalid shape after conversion expected=%s got=%s",
-                tuple(old_log_probs.shape),
-                tuple(ref_log_prob.shape),
-            )
-            raise RuntimeError(
-                "Reference policy returned ref_log_prob/log_probs with invalid shape after conversion: "
-                f"expected {tuple(old_log_probs.shape)}, got {tuple(ref_log_prob.shape)}"
-            )
-
-        data["ref_log_prob"] = ref_log_prob
-
     def forward_backward(self, data):
         with self._engine_lock:
             profile_step = self._next_profile_step()
@@ -638,7 +579,6 @@ class ColocatedBackend:
                 should_profile,
                 self._global_profiler_settings(),
             )
-            self._ensure_ref_log_prob_for_kl_loss(data)
             self._prepare_model_roles({ModelRole.ACTOR}, reason="forward_backward")
             if should_profile:
                 self._start_profile(profile_step)
@@ -662,6 +602,8 @@ class ColocatedBackend:
         For the naive backend, checkpoint_manager.update_weights() internally
         does: resume(weights) → push FSDP params → resume(kv_cache), which
         requires replicas to be in the slept state and leaves them awake.
+        When server offload is enabled, release actor optimizer memory before
+        that sequence while keeping actor parameters and gradients resident.
 
         Raises RuntimeError in no_rollout_deployment mode (no rollout replicas to sync).
         """
@@ -669,6 +611,9 @@ class ColocatedBackend:
             if self._no_rollout_deployment:
                 raise RuntimeError("update_weights is not available in no_rollout_deployment mode")
             self._prepare_model_roles({ModelRole.ACTOR}, reason="update_weights")
+            if self._enable_offload:
+                logger.info("[engine] offloading actor optimizer before rollout weight sync")
+                self.actor_rollout_wg.prepare_actor_for_weight_sync()
             self.checkpoint_manager.update_weights()
             if self._enable_offload:
                 self._move_actor("cpu", reason="after update_weights")

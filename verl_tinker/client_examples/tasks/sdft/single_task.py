@@ -4,6 +4,8 @@ from tinker_cookbook.recipes.sdft.datasets import (
     SciKnowEvalSDFTBuilder,
 )
 
+from ..utils import model_name_slug
+
 
 async def run_sdft_single_task_test(base_url: str, model_name: str, tokenizer_name_or_path: str | None = None):
     tokenizer_name_or_path = tokenizer_name_or_path or model_name
@@ -39,13 +41,15 @@ async def run_sdft_single_task_test(base_url: str, model_name: str, tokenizer_na
         # SDFT-specific
         topk=20,
         reverse=False,
-        teacher_sync_every=None,
+        # Keep the teacher on the current rollout so this workflow can run on
+        # an actor-rollout-only server without a frozen teacher deployment.
+        teacher_sync_every=1,
         max_context_length=32768,
         # Optimizer
         num_substeps=1,
         # Logging / saving
         wandb_project="verl-tinker-ci",
-        wandb_name="sdft-sciknoweval-qwen3-1.7b",
+        wandb_name=f"sdft-sciknoweval-{model_name_slug(model_name)}",
         log_path="/tmp/tinker-sciknoweval-sdft-smoke",
         eval_every=0,
         save_every=0,

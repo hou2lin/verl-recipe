@@ -25,6 +25,7 @@ _DEFAULT_TOP_LEVEL_SECTIONS = (
     "actor_rollout_ref",
     "algorithm",
     "data",
+    "distillation",
     "trainer",
 )
 _SUPPORTED_TOP_LEVEL_SECTIONS = (
@@ -32,6 +33,7 @@ _SUPPORTED_TOP_LEVEL_SECTIONS = (
     "actor_rollout_ref",
     "algorithm",
     "data",
+    "distillation",
     "trainer",
     "global_profiler",
     "external_libs",
@@ -113,6 +115,8 @@ def process_actor_rollout_ref_config(config: DictConfig) -> DictConfig:
     user_set_actor_profiler_save_path = has_path(config, "actor_rollout_ref.actor.profiler.save_path")
     user_set_actor_profiler_all_ranks = has_path(config, "actor_rollout_ref.actor.profiler.all_ranks")
     user_set_actor_profiler_ranks = has_path(config, "actor_rollout_ref.actor.profiler.ranks")
+    user_set_actor_checkpoint_save_contents = has_path(config, "actor_rollout_ref.actor.checkpoint.save_contents")
+    user_set_actor_checkpoint_load_contents = has_path(config, "actor_rollout_ref.actor.checkpoint.load_contents")
     if auto_merge_verl_defaults:
         default_config = _load_verl_section_defaults(resolved_strategy)
         user_config = _extract_supported_config_sections(config)
@@ -128,7 +132,11 @@ def process_actor_rollout_ref_config(config: DictConfig) -> DictConfig:
         user_set_actor_profiler_save_path=user_set_actor_profiler_save_path,
         user_set_actor_profiler_all_ranks=user_set_actor_profiler_all_ranks,
         user_set_actor_profiler_ranks=user_set_actor_profiler_ranks,
+        user_set_actor_checkpoint_save_contents=user_set_actor_checkpoint_save_contents,
+        user_set_actor_checkpoint_load_contents=user_set_actor_checkpoint_load_contents,
     )
+    _normalize_actor_model_identifiers(config)
+    _normalize_teacher_model_identifiers(config)
     return config
 
 
@@ -140,6 +148,8 @@ def apply_tinker_server_overrides(
     user_set_actor_profiler_save_path: bool = False,
     user_set_actor_profiler_all_ranks: bool = False,
     user_set_actor_profiler_ranks: bool = False,
+    user_set_actor_checkpoint_save_contents: bool = False,
+    user_set_actor_checkpoint_load_contents: bool = False,
 ) -> None:
     """Apply only Tinker-server-specific config adjustments."""
 
@@ -166,7 +176,11 @@ def apply_tinker_server_overrides(
         micro_batch_key="log_prob_micro_batch_size",
         micro_batch_per_gpu_key="log_prob_micro_batch_size_per_gpu",
     )
-    _set_actor_checkpoint_contents(config)
+    _set_actor_checkpoint_contents(
+        config,
+        user_set_save_contents=user_set_actor_checkpoint_save_contents,
+        user_set_load_contents=user_set_actor_checkpoint_load_contents,
+    )
     _configure_actor_profiler_from_global_config(
         config,
         user_set_actor_profiler_enable=user_set_actor_profiler_enable,
@@ -269,13 +283,28 @@ def _apply_micro_batch_default(
         )
 
 
-def _set_actor_checkpoint_contents(config: DictConfig) -> None:
-    # The Tinker server owns checkpoint recovery and must save everything needed
-    # to recreate the complete actor after a load_state. Override both lists instead
-    # of honoring a partial Verl checkpoint configuration that cannot be resumed.
-    for key in ("save_contents", "load_contents"):
-        path = f"actor_rollout_ref.actor.checkpoint.{key}"
-        OmegaConf.update(config, path, list(_ACTOR_CHECKPOINT_CONTENTS), merge=True)
+def _set_actor_checkpoint_contents(
+    config: DictConfig,
+    *,
+    user_set_save_contents: bool,
+    user_set_load_contents: bool,
+) -> None:
+    # A complete checkpoint is the safe Tinker default. Explicit user choices
+    # are retained so callers can trade resumability for lower disk usage.
+    if not user_set_save_contents:
+        OmegaConf.update(
+            config,
+            "actor_rollout_ref.actor.checkpoint.save_contents",
+            list(_ACTOR_CHECKPOINT_CONTENTS),
+            merge=True,
+        )
+    if not user_set_load_contents:
+        OmegaConf.update(
+            config,
+            "actor_rollout_ref.actor.checkpoint.load_contents",
+            list(_ACTOR_CHECKPOINT_CONTENTS),
+            merge=True,
+        )
 
 
 def _configure_actor_profiler_from_global_config(
@@ -325,8 +354,7 @@ def _validate_config(config) -> list[str]:
     """Validate config before initialization. Returns list of error messages."""
     errors = []
 
-    if not config.get("actor_rollout_ref", {}).get("model", {}).get("path"):
-        errors.append("actor_rollout_ref.model.path is required")
+    errors.extend(_normalize_actor_model_identifiers(config))
     if "algorithm" not in config:
         errors.append("algorithm config is required")
     trainer_cfg = config.get("trainer", {})
@@ -340,6 +368,28 @@ def _validate_config(config) -> list[str]:
     if bool(config.get("critic", {}).get("enable", False)):
         errors.append("critic support has been removed from the Tinker server; set critic.enable=false")
 
+    if bool(config.get("actor_rollout_ref", {}).get("actor", {}).get("use_kl_loss", False)):
+        errors.append(
+            "actor_rollout_ref.actor.use_kl_loss must be false: "
+            "Tinker expects KL to be incorporated into client-computed advantages"
+        )
+        return errors
+
+    if bool(config.get("distillation", {}).get("enabled", False)):
+        teacher_identifier_errors = _normalize_teacher_model_identifiers(config)
+        errors.extend(teacher_identifier_errors)
+        try:
+            if not teacher_identifier_errors:
+                distillation_config = _to_verl_distillation_config(config.distillation)
+                for teacher in distillation_config.teacher_models.values():
+                    if teacher.inference.name not in {"vllm", "sglang"}:
+                        raise ValueError(
+                            f"teacher inference engine {teacher.inference.name!r} is unsupported; "
+                            "use 'vllm' or 'sglang'"
+                        )
+        except Exception as e:
+            errors.append(f"Teacher config validation: {e}")
+
     if is_no_rollout_deployment(config):
         if not is_enable_false(config, "actor_rollout_ref.ref"):
             errors.append("no_rollout_deployment does not support reference policy")
@@ -350,6 +400,61 @@ def _validate_config(config) -> list[str]:
             errors.append(f"VeRL config validation: {e}")
 
     return errors
+
+
+def _normalize_actor_model_identifiers(config: DictConfig) -> list[str]:
+    """Fill the actor's client-visible name and load path from one another."""
+    model_name = _select(config, "server.model_name")
+    model_path = _select(config, "actor_rollout_ref.model.path")
+    name_missing = _is_missing(model_name)
+    path_missing = _is_missing(model_path)
+
+    if name_missing and path_missing:
+        return ["at least one of server.model_name or actor_rollout_ref.model.path is required"]
+    if name_missing:
+        OmegaConf.update(config, "server.model_name", model_path, merge=True)
+    elif path_missing:
+        OmegaConf.update(config, "actor_rollout_ref.model.path", model_name, merge=True)
+    return []
+
+
+def _normalize_teacher_model_identifiers(config: DictConfig) -> list[str]:
+    """Fill missing teacher name/path aliases and report fully unidentified teachers."""
+    if not bool(config.get("distillation", {}).get("enabled", False)):
+        return []
+
+    errors = []
+    teacher_models = config.get("distillation", {}).get("teacher_models", {})
+    for key, teacher in teacher_models.items():
+        # VeRL merges a placeholder named ``teacher_model`` into every config
+        # and removes it when named multi-teacher entries are present.
+        if key == "teacher_model" and len(teacher_models) > 1:
+            continue
+        model_name = teacher.get("model_name")
+        model_path = teacher.get("model_path")
+        name_missing = _is_missing(model_name)
+        path_missing = _is_missing(model_path)
+        if name_missing and path_missing:
+            errors.append(f"distillation.teacher_models.{key} requires at least one of model_name or model_path")
+        elif name_missing:
+            teacher.model_name = model_path
+        elif path_missing:
+            teacher.model_path = model_name
+    return errors
+
+
+def _to_verl_distillation_config(distillation_config: DictConfig):
+    """Convert Tinker's extended teacher config to VeRL's path-only dataclass."""
+    # Resolve while the node is still attached to the root config so VeRL's
+    # cross-section interpolations (for example actor rollout lengths) retain
+    # their values in the detached copy.
+    verl_config = OmegaConf.create(OmegaConf.to_container(distillation_config, resolve=True))
+    # Tinker can optionally give each teacher its own strictly packed Ray pool;
+    # this is a server placement concern rather than part of VeRL's dataclass.
+    verl_config.pop("dedicated_resource_pools", None)
+    for teacher in verl_config.get("teacher_models", {}).values():
+        teacher.pop("model_name", None)
+    return omega_conf_to_dataclass(verl_config)
 
 
 def _validate_supported_verl_config(config: DictConfig, use_reference_policy: bool) -> None:

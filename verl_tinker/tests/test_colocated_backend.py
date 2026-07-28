@@ -430,18 +430,32 @@ class TestReplicaLifecycle:
         backend.actor_rollout_wg.to_actor.assert_any_call(device="device", model=True, optimizer=True, grad=True)
         assert backend._lifecycle.awake_roles == {ModelRole.ACTOR}
 
-    def test_update_weights_sleeps_then_updates_then_marks_awake(self):
-        """update_weights() does: sleep → update → mark awake."""
+    def test_update_weights_releases_optimizer_before_sync_then_marks_rollout_awake(self):
+        """Offload mode releases training-only memory before waking rollout weights."""
         backend = self._make_lifecycle_backend()
 
         call_order = []
         backend.checkpoint_manager.sleep_replicas.side_effect = lambda: call_order.append("sleep")
+        backend.actor_rollout_wg.prepare_actor_for_weight_sync.side_effect = lambda: call_order.append(
+            "release_optimizer"
+        )
         backend.checkpoint_manager.update_weights.side_effect = lambda: call_order.append("update")
 
         backend.update_weights()
 
-        assert call_order == ["sleep", "update"]
+        assert call_order == ["sleep", "release_optimizer", "update"]
         assert backend._lifecycle.awake_roles == {ModelRole.ROLLOUT}
+
+    def test_update_weights_keeps_optimizer_resident_when_server_offload_disabled(self):
+        backend = self._make_lifecycle_backend()
+        backend._enable_offload = False
+        backend._lifecycle.enable_offload = False
+
+        backend.update_weights()
+
+        backend.actor_rollout_wg.prepare_actor_for_weight_sync.assert_not_called()
+        backend.actor_rollout_wg.to_actor.assert_not_called()
+        backend.checkpoint_manager.update_weights.assert_called_once_with()
 
     def test_compute_log_prob_sleeps_first(self):
         """compute_log_prob() sleeps replicas before running FSDP forward."""
@@ -622,110 +636,17 @@ class TestReplicaLifecycle:
         ]
 
 
-class TestForwardBackwardRefLogProb:
-    """Regression tests for KL-enabled actor updates."""
+def test_forward_backward_does_not_compute_server_side_kl_reference_log_probs():
+    cfg = _make_config()
+    cfg.algorithm.use_kl_in_reward = True
+    backend = _make_backend(cfg)
+    backend.ref_policy_wg = MagicMock(name="ref_policy_wg")
+    data = _make_update_actor_td()
 
-    def _make_kl_backend(self):
-        cfg = _make_config()
-        cfg.actor_rollout_ref.actor.use_kl_loss = True
-        backend = _make_backend(cfg)
-        backend.ref_policy_wg = MagicMock(name="ref_policy_wg")
-        return backend
+    backend.forward_backward(data)
 
-    def test_kl_missing_ref_log_prob_computes_response_padded_ref(self):
-        backend = self._make_kl_backend()
-        data = _make_update_actor_td()
-        ref_log_probs = torch.nested.as_nested_tensor(
-            [
-                torch.tensor([-10.0, -11.0, -12.0, -13.0, -14.0]),
-                torch.tensor([-20.0, -21.0, -22.0, -23.0, -24.0]),
-            ],
-            layout=torch.jagged,
-        )
-        backend.ref_policy_wg.compute_ref_log_prob.return_value = TensorDict(
-            {"log_probs": ref_log_probs},
-            batch_size=[2],
-        )
-
-        backend.forward_backward(data)
-
-        backend.ref_policy_wg.compute_ref_log_prob.assert_called_once()
-        ref_input = backend.ref_policy_wg.compute_ref_log_prob.call_args.args[0]
-        assert tu.get_non_tensor_data(ref_input, "compute_loss", None) is False
-        assert tu.get_non_tensor_data(ref_input, "calculate_entropy", None) is False
-
-        expected = torch.tensor([[-11.0, -12.0, -13.0], [-22.0, -23.0, 0.0]])
-        forwarded = backend.actor_rollout_wg.forward_backward.call_args.args[0]
-        assert torch.equal(forwarded["ref_log_prob"], expected)
-
-    def test_kl_existing_ref_log_prob_is_not_recomputed_or_overwritten(self):
-        backend = self._make_kl_backend()
-        data = _make_update_actor_td()
-        existing = torch.full_like(data["old_log_probs"], -3.0)
-        data["ref_log_prob"] = existing
-
-        backend.forward_backward(data)
-
-        backend.ref_policy_wg.compute_ref_log_prob.assert_not_called()
-        forwarded = backend.actor_rollout_wg.forward_backward.call_args.args[0]
-        assert torch.equal(forwarded["ref_log_prob"], existing)
-
-    def test_kl_sft_loss_mode_does_not_require_ref_log_prob(self):
-        backend = self._make_kl_backend()
-        data = TensorDict(
-            {
-                "input_ids": torch.nested.as_nested_tensor(
-                    [torch.tensor([10, 11, 12])],
-                    layout=torch.jagged,
-                ),
-                "position_ids": torch.nested.as_nested_tensor(
-                    [torch.arange(3)],
-                    layout=torch.jagged,
-                ),
-                "loss_mask": torch.nested.as_nested_tensor(
-                    [torch.ones(3)],
-                    layout=torch.jagged,
-                ),
-            },
-            batch_size=[1],
-        )
-        tu.assign_non_tensor_data(data, "__loss_mode__", "sft")
-
-        backend.forward_backward(data)
-
-        backend.ref_policy_wg.compute_ref_log_prob.assert_not_called()
-        backend.actor_rollout_wg.forward_backward.assert_called_once_with(data)
-
-    def test_kl_ref_worker_can_return_already_padded_ref_log_prob(self):
-        backend = self._make_kl_backend()
-        data = _make_update_actor_td()
-        padded = torch.tensor([[-0.1, -0.2, -0.3], [-0.4, -0.5, 0.0]])
-        backend.ref_policy_wg.compute_ref_log_prob.return_value = TensorDict(
-            {"ref_log_prob": padded},
-            batch_size=[2],
-        )
-
-        backend.forward_backward(data)
-
-        forwarded = backend.actor_rollout_wg.forward_backward.call_args.args[0]
-        assert torch.equal(forwarded["ref_log_prob"], padded)
-
-    def test_kl_missing_reference_policy_raises_clear_error(self):
-        backend = self._make_kl_backend()
-        backend.ref_policy_wg = None
-
-        with pytest.raises(RuntimeError, match="KL loss is enabled but reference policy is not initialized"):
-            backend.forward_backward(_make_update_actor_td())
-
-    def test_kl_invalid_ref_output_raises_clear_error(self):
-        backend = self._make_kl_backend()
-        backend.ref_policy_wg.compute_ref_log_prob.return_value = TensorDict(
-            {"values": torch.zeros(2, 3)},
-            batch_size=[2],
-        )
-
-        with pytest.raises(RuntimeError, match="must contain 'log_probs' or 'ref_log_prob'"):
-            backend.forward_backward(_make_update_actor_td())
+    backend.ref_policy_wg.compute_ref_log_prob.assert_not_called()
+    backend.actor_rollout_wg.forward_backward.assert_called_once_with(data)
 
 
 class TestSynchronousEngineLock:
@@ -879,3 +800,14 @@ class TestNoRolloutDeployment:
 
         worker.actor.to.assert_called_once_with(device="device", model=True, optimizer=True, grad=True)
         worker.ref.to.assert_called_once_with(device="device", model=True, optimizer=False, grad=False)
+
+    def test_tinker_worker_prepares_actor_for_weight_sync(self):
+        worker = object.__new__(TinkerServerActorRolloutRefWorker)
+        worker.actor = MagicMock()
+
+        with patch(f"{_BACKEND_MODULE}.aggressive_empty_cache") as mock_empty_cache:
+            worker.prepare_actor_for_weight_sync()
+
+        worker.actor.optimizer_zero_grad.assert_not_called()
+        worker.actor.to.assert_called_once_with(device="cpu", model=False, optimizer=True, grad=False)
+        mock_empty_cache.assert_called_once_with(force_sync=True)

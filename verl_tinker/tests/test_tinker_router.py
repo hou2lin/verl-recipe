@@ -16,12 +16,13 @@ import asyncio
 import threading
 from http import HTTPStatus
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
 from omegaconf import OmegaConf
 from verl_tinker.config_utils import _validate_config
+from verl_tinker.model_resource_manager import ModelResourceManager
 from verl_tinker.tinker_router import (
     TINKER_COOKBOOK_COMPAT_LORA_RANK,
     FifoReadWriteGate,
@@ -41,11 +42,31 @@ def _router_class():
 
 
 def _init_future_tracking(server):
+    if not hasattr(server, "_status"):
+        server._status = ServerStatus.INITIALIZED
     server._futures = {}
     server._pending = {}
     server._errors = {}
     server._request_status = {}
     server._retrieved_request_status_archive = {}
+
+
+def _init_model_resource_manager(server, actor_model="actor", actor_identifiers=None, teacher_models=()):
+    server._model_resource_manager = ModelResourceManager(
+        actor_model_identifiers=actor_identifiers or (actor_model,),
+        teacher_models=teacher_models,
+    )
+
+
+def _sample_request(sampling_session_id: str, *, prompt_logprobs: bool, topk_prompt_logprobs: int = 0):
+    return SimpleNamespace(
+        sampling_session_id=sampling_session_id,
+        prompt=SimpleNamespace(to_ints=lambda: [1, 2]),
+        sampling_params=SimpleNamespace(max_tokens=1, temperature=1, top_p=1, top_k=-1, stop=None, seed=None),
+        num_samples=1,
+        prompt_logprobs=prompt_logprobs,
+        topk_prompt_logprobs=topk_prompt_logprobs,
+    )
 
 
 def test_critic_routes_are_not_registered():
@@ -54,6 +75,94 @@ def test_critic_routes_are_not_registered():
     assert "/api/v1/compute_values" not in paths
     assert "/api/v1/compute_advantages" not in paths
     assert "/api/v1/update_critic" not in paths
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status",
+    [ServerStatus.INITIALIZING, ServerStatus.ERROR, ServerStatus.SHUTTING_DOWN, ServerStatus.SHUTDOWN_COMPLETE],
+)
+async def test_normal_endpoints_require_fully_initialized_server(status):
+    server = object.__new__(_router_class())
+    server._status = status
+    _init_model_resource_manager(server)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await server.get_sampler("missing")
+
+    assert exc_info.value.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert status.value in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_get_sampler_uses_tracker_without_actor_engine():
+    server = object.__new__(_router_class())
+    server._status = ServerStatus.INITIALIZED
+    _init_model_resource_manager(server)
+    server._model_resource_manager.register_actor_sampler("actor", base_model="actor", actor_id=0)
+
+    assert await server.get_sampler("actor") == {
+        "sampler_id": "actor",
+        "base_model": "actor",
+        "model_path": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_session_allocates_distinct_sdk_namespaces():
+    server = object.__new__(_router_class())
+    server._status = ServerStatus.INITIALIZED
+    _init_model_resource_manager(server)
+
+    first = await server.create_session()
+    second = await server.create_session()
+
+    assert first["session_id"] == "verl-tinker-session:0"
+    assert second["session_id"] == "verl-tinker-session:1"
+    assert await server.list_sessions() == {"sessions": ["verl-tinker-session:0", "verl-tinker-session:1"]}
+
+
+@pytest.mark.asyncio
+async def test_create_model_links_logical_model_to_originating_session():
+    server = object.__new__(_router_class())
+    server._status = ServerStatus.INITIALIZED
+    server._model_to_base_model = {}
+    server._model_metadata = {}
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    session_id = server._model_resource_manager.create_session()
+
+    response = await server.create_model(
+        SimpleNamespace(
+            session_id=session_id,
+            model_seq_id=0,
+            base_model="actor",
+            lora_config=None,
+        )
+    )
+
+    model_id = response["model_id"]
+    assert model_id == f"{session_id}:train:0"
+    assert server._model_resource_manager.session_id_for_model(model_id) == session_id
+    assert (await server.get_session(session_id))["training_run_ids"] == [model_id]
+
+
+@pytest.mark.asyncio
+async def test_get_session_returns_only_currently_valid_samplers():
+    server = object.__new__(_router_class())
+    server._status = ServerStatus.INITIALIZED
+    _init_model_resource_manager(server)
+    session_id = server._model_resource_manager.create_session()
+    stale_sampler_id = server._model_resource_manager.sampler_id(session_id, 0)
+    current_sampler_id = server._model_resource_manager.sampler_id(session_id, 1)
+    server._model_resource_manager.register_actor_sampler(stale_sampler_id, base_model="actor", actor_id=0)
+    server._model_resource_manager.actor_updated()
+    server._model_resource_manager.rollout_synchronized()
+    server._model_resource_manager.register_actor_sampler(current_sampler_id, base_model="actor", actor_id=1)
+
+    response = await server.get_session(session_id)
+
+    assert response["sampler_ids"] == [current_sampler_id]
 
 
 def test_no_rollout_config_requires_backend_runtime_sections():
@@ -91,7 +200,6 @@ def test_create_model_metadata_is_full_model_training_even_with_lora_request():
     ("server_config", "expected_model_name"),
     [
         ({"model_name": "configured-model"}, "configured-model"),
-        ({}, "/models/original-model"),
     ],
 )
 async def test_get_info_always_uses_configured_model_for_model_and_tokenizer(server_config, expected_model_name):
@@ -108,11 +216,460 @@ async def test_get_info_always_uses_configured_model_for_model_and_tokenizer(ser
     server._shutdown_started = False
     server._model_to_base_model = {"verl-remote-actor-model": "client-requested-model"}
 
-    response = await server.get_info(SimpleNamespace())
+    response = await server.get_info(SimpleNamespace(model_id="session:train:0"))
 
     assert response["model_data"]["model_name"] == expected_model_name
     assert response["model_data"]["tokenizer_id"] == expected_model_name
     assert response["model_name"] == expected_model_name
+
+
+@pytest.mark.asyncio
+async def test_create_sampling_session_routes_exact_teacher_model_to_unique_sampler():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = SimpleNamespace(
+        config=OmegaConf.create({"server": {}, "actor_rollout_ref": {"model": {"path": "actor"}}})
+    )
+    server._teacher_backend = SimpleNamespace(
+        resolve=lambda *values: "teacher" if "teacher-model" in values else None,
+        get_model_path=lambda key: "teacher-model",
+    )
+    _init_model_resource_manager(server, teacher_models=(("teacher-model", "teacher-model"),))
+    session_id = server._model_resource_manager.create_session()
+
+    response = await server.create_sampling_session(
+        SimpleNamespace(
+            session_id=session_id,
+            sampling_session_seq_id=3,
+            base_model="teacher-model",
+            model_path=None,
+        )
+    )
+
+    sampler_id = response.sampling_session_id
+    assert sampler_id == f"{session_id}:sample:3"
+    binding = server._model_resource_manager.get_sampler(sampler_id)
+    assert binding.teacher_model_path == "teacher-model"
+    assert binding.base_model == "teacher-model"
+    assert binding.model_path == "teacher-model"
+
+
+@pytest.mark.asyncio
+async def test_create_sampling_session_does_not_use_teacher_alias_when_model_path_is_unknown():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = SimpleNamespace(
+        config=OmegaConf.create({"server": {}, "actor_rollout_ref": {"model": {"path": "actor"}}})
+    )
+    aliases = {"teacher-name": "teacher"}
+    server._teacher_backend = SimpleNamespace(
+        resolve=lambda *values: next((aliases[value] for value in values if value in aliases), None),
+        get_model_path=lambda key: "/models/teacher",
+    )
+    _init_model_resource_manager(server, teacher_models=(("teacher-name", "/models/teacher"),))
+    session_id = server._model_resource_manager.create_session()
+
+    with pytest.raises(HTTPException) as exc_info:
+        await server.create_sampling_session(
+            SimpleNamespace(
+                session_id=session_id,
+                sampling_session_seq_id=4,
+                base_model="teacher-name",
+                model_path="tinker://teacher/checkpoint",
+            )
+        )
+
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
+    assert "Sampler checkpoint base_model" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_asample_routes_teacher_sampler_to_teacher_client():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+
+    class TeacherClient:
+        def __init__(self):
+            self.calls = []
+
+        async def generate(self, request_id, *, prompt_ids, sampling_params):
+            self.calls.append((prompt_ids, sampling_params))
+            return SimpleNamespace(
+                token_ids=[3],
+                log_probs=[-0.2],
+                stop_reason="stop",
+                extra_fields={},
+            )
+
+    teacher_client = TeacherClient()
+    server._teacher_backend = SimpleNamespace(
+        get_client=lambda key: teacher_client,
+    )
+    _init_model_resource_manager(server)
+    server._model_resource_manager.register_teacher_sampler(
+        "teacher-sampler",
+        teacher_model_path="teacher-model",
+        base_model="teacher-model",
+    )
+    req = SimpleNamespace(
+        sampling_session_id="teacher-sampler",
+        prompt=SimpleNamespace(to_ints=lambda: [1, 2]),
+        sampling_params=SimpleNamespace(max_tokens=1, temperature=1, top_p=1, top_k=-1, stop=None, seed=None),
+        num_samples=1,
+        prompt_logprobs=False,
+        topk_prompt_logprobs=0,
+    )
+
+    response = await server.asample(req)
+    await asyncio.gather(*server._pending.values())
+
+    assert teacher_client.calls[0][0] == [1, 2]
+    assert server._futures[response["request_id"]]["sequences"][0]["tokens"] == [3]
+
+
+@pytest.mark.asyncio
+async def test_asample_falls_back_to_actor_for_scalar_prompt_logprobs(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    server._model_resource_manager.configure_resources(rollout_enabled=False, reference_enabled=False)
+    server._model_resource_manager.register_actor_sampler("training", base_model="actor", actor_id=0)
+    prompt_logprobs = AsyncMock(return_value={"type": "sample", "prompt_logprobs": [None, -0.5]})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample_prompt_logprobs", prompt_logprobs)
+
+    response = await server.asample(_sample_request("training", prompt_logprobs=True))
+    await asyncio.gather(*server._pending.values())
+
+    assert server._futures[response["request_id"]]["prompt_logprobs"] == [None, -0.5]
+    prompt_logprobs.assert_awaited_once_with(server._engine, ANY, reference=False)
+
+
+@pytest.mark.asyncio
+async def test_asample_falls_back_to_reference_for_initial_weights(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    server._model_resource_manager.register_actor_sampler("initial", base_model="actor", actor_id=0)
+    server._model_resource_manager.actor_updated()
+    server._model_resource_manager.rollout_synchronized()
+    server._model_resource_manager.configure_resources(rollout_enabled=True, reference_enabled=True)
+    prompt_logprobs = AsyncMock(return_value={"type": "sample", "prompt_logprobs": [None, -0.7]})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample_prompt_logprobs", prompt_logprobs)
+
+    response = await server.asample(_sample_request("initial", prompt_logprobs=True))
+    await asyncio.gather(*server._pending.values())
+
+    assert server._futures[response["request_id"]]["prompt_logprobs"] == [None, -0.7]
+    prompt_logprobs.assert_awaited_once_with(server._engine, ANY, reference=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prompt_logprobs", "topk_prompt_logprobs"),
+    [(False, 0), (True, 2)],
+)
+async def test_asample_rejects_generation_and_topk_when_only_reference_matches(
+    prompt_logprobs,
+    topk_prompt_logprobs,
+):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    server._model_resource_manager.register_actor_sampler("initial", base_model="actor", actor_id=0)
+    server._model_resource_manager.actor_updated()
+    server._model_resource_manager.rollout_synchronized()
+    server._model_resource_manager.configure_resources(rollout_enabled=True, reference_enabled=True)
+
+    response = await server.asample(
+        _sample_request(
+            "initial",
+            prompt_logprobs=prompt_logprobs,
+            topk_prompt_logprobs=topk_prompt_logprobs,
+        )
+    )
+    await asyncio.gather(*server._pending.values())
+
+    request_id = response["request_id"]
+    assert server._request_status[request_id] is RequestStatus.ERROR
+    assert "409" in server._errors[request_id]
+
+
+@pytest.mark.asyncio
+async def test_asample_rejects_unknown_non_actor_sampler():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._teacher_backend = None
+    _init_model_resource_manager(server)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await server.asample(SimpleNamespace(sampling_session_id="unknown"))
+
+    assert exc_info.value.status_code == HTTPStatus.NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_asample_without_session_resolves_direct_actor(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    sample = AsyncMock(return_value={"type": "sample", "sequences": []})
+    monkeypatch.setitem(server.asample.__globals__, "tinker_sample", sample)
+
+    response = await server.asample(
+        SimpleNamespace(
+            sampling_session_id=None,
+            base_model="actor",
+            model_path=None,
+        )
+    )
+    await asyncio.gather(*server._pending.values())
+
+    assert server._futures[response["request_id"]] == {"type": "sample", "sequences": []}
+    sample.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_asample_without_session_rejects_unknown_direct_model():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._teacher_backend = None
+    _init_model_resource_manager(server)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await server.asample(
+            SimpleNamespace(
+                sampling_session_id=None,
+                base_model="unknown",
+                model_path=None,
+            )
+        )
+
+    assert exc_info.value.status_code == HTTPStatus.BAD_REQUEST
+
+
+@pytest.mark.asyncio
+async def test_asample_rejects_actor_sampler_after_rollout_diverges():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    server._teacher_backend = None
+    server._op_gate = FifoReadWriteGate()
+    _init_future_tracking(server)
+    _init_model_resource_manager(server)
+    server._model_resource_manager.register_actor_sampler(
+        "actor-sampler",
+        base_model="actor",
+        actor_id=0,
+    )
+    server._model_resource_manager.actor_updated()
+    server._model_resource_manager.rollout_synchronized()
+
+    response = await server.asample(SimpleNamespace(sampling_session_id="actor-sampler"))
+    await asyncio.gather(*server._pending.values())
+
+    request_id = response["request_id"]
+    assert server._request_status[request_id] is RequestStatus.ERROR
+    assert "409" in server._errors[request_id]
+    assert "cannot be served" in server._errors[request_id]
+
+
+@pytest.mark.asyncio
+async def test_named_sampler_save_binds_path_to_current_rollout(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    _init_model_resource_manager(server)
+    server._model_resource_manager.actor_updated()
+    saved_path = "tinker://verl-tinker/weights/saved"
+    update_weights = AsyncMock(
+        return_value={
+            "type": "save_weights_for_sampler",
+            "path": saved_path,
+            "sampling_session_id": None,
+        }
+    )
+    monkeypatch.setitem(
+        server._run_save_weights_for_sampler.__globals__,
+        "tinker_save_weights_for_sampler",
+        update_weights,
+    )
+
+    result = await server._run_save_weights_for_sampler(SimpleNamespace(path="saved", sampling_session_seq_id=None))
+    session_id = server._model_resource_manager.create_session()
+    response = await server.create_sampling_session(
+        SimpleNamespace(
+            session_id=session_id,
+            sampling_session_seq_id=7,
+            base_model="actor",
+            model_path=saved_path,
+        )
+    )
+
+    assert result["path"] == saved_path
+    assert server._model_resource_manager.rollout_id == 1
+    binding = server._model_resource_manager.get_sampler(response.sampling_session_id)
+    assert binding.model_path == saved_path
+    assert binding.actor_id == 1
+
+
+@pytest.mark.asyncio
+async def test_create_sampling_session_accepts_actor_name_or_load_path():
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._teacher_backend = None
+    _init_model_resource_manager(
+        server,
+        actor_model="client-name",
+        actor_identifiers=("client-name", "/models/actor"),
+    )
+    session_id = server._model_resource_manager.create_session()
+
+    for sequence_id, base_model in enumerate(("client-name", "/models/actor")):
+        response = await server.create_sampling_session(
+            SimpleNamespace(
+                session_id=session_id,
+                sampling_session_seq_id=sequence_id,
+                base_model=base_model,
+                model_path=None,
+            )
+        )
+        binding = server._model_resource_manager.get_sampler(response.sampling_session_id)
+        assert binding.base_model == "client-name"
+
+
+@pytest.mark.asyncio
+async def test_unnamed_sampler_saves_return_distinct_sampler_ids(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    _init_model_resource_manager(server)
+    update_weights = AsyncMock(
+        side_effect=[
+            {"type": "save_weights_for_sampler", "path": None, "sampling_session_id": "legacy"},
+            {"type": "save_weights_for_sampler", "path": None, "sampling_session_id": "legacy"},
+        ]
+    )
+    monkeypatch.setitem(
+        server._run_save_weights_for_sampler.__globals__,
+        "tinker_save_weights_for_sampler",
+        update_weights,
+    )
+    session_id = server._model_resource_manager.create_session()
+    model_id = server._model_resource_manager.register_model(session_id, 0)
+
+    first = await server._run_save_weights_for_sampler(
+        SimpleNamespace(model_id=model_id, path=None, sampling_session_seq_id=2)
+    )
+    second = await server._run_save_weights_for_sampler(
+        SimpleNamespace(model_id=model_id, path=None, sampling_session_seq_id=3)
+    )
+
+    assert first["sampling_session_id"] == f"{session_id}:sample:2"
+    assert second["sampling_session_id"] == f"{session_id}:sample:3"
+    assert first["sampling_session_id"] != second["sampling_session_id"]
+    assert server._model_resource_manager.get_sampler(first["sampling_session_id"]).actor_id == 0
+
+
+@pytest.mark.asyncio
+async def test_load_skips_engine_when_checkpoint_actor_is_already_loaded(tmp_path, monkeypatch):
+    server = object.__new__(_router_class())
+    _init_model_resource_manager(server)
+    uri = "tinker://verl-tinker/state/already-loaded"
+    local_dir = tmp_path / "already-loaded"
+    local_dir.mkdir()
+    server._checkpoint_root = str(tmp_path)
+    server._saved_state_paths = {uri: str(local_dir)}
+    server._model_resource_manager.state_saved(uri)
+    engine_load = AsyncMock()
+    monkeypatch.setitem(server._run_load_state.__globals__, "load_state", engine_load)
+
+    result = await server._run_load_state({"path": uri, "optimizer": True})
+
+    assert result == {"type": "load_weights", "path": uri}
+    engine_load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_load_failure_marks_actor_unknown_without_shutting_down(tmp_path, monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    _init_model_resource_manager(server)
+    uri = "tinker://verl-tinker/state/broken"
+    local_dir = tmp_path / "broken"
+    local_dir.mkdir()
+    server._checkpoint_root = str(tmp_path)
+    server._saved_state_paths = {uri: str(local_dir)}
+    monkeypatch.setitem(
+        server._run_load_state.__globals__,
+        "load_state",
+        AsyncMock(side_effect=RuntimeError("load exploded")),
+    )
+
+    with pytest.raises(RuntimeError, match="load exploded"):
+        await server._run_load_state({"path": uri, "optimizer": True})
+
+    assert server._model_resource_manager.actor_id == 1
+    assert server._model_resource_manager.rollout_id == 0
+    assert server._status is ServerStatus.INITIALIZED
+    assert server._shutdown_started is False
+
+
+@pytest.mark.asyncio
+async def test_rollout_sync_failure_marks_rollout_unknown_without_shutting_down(monkeypatch):
+    server = object.__new__(_router_class())
+    server._shutdown_started = False
+    server._status = ServerStatus.INITIALIZED
+    server._engine = MagicMock()
+    _init_model_resource_manager(server)
+    session_id = server._model_resource_manager.create_session()
+    model_id = server._model_resource_manager.register_model(session_id, 0)
+    monkeypatch.setitem(
+        server._run_save_weights_for_sampler.__globals__,
+        "tinker_save_weights_for_sampler",
+        AsyncMock(side_effect=RuntimeError("sync exploded")),
+    )
+
+    with pytest.raises(RuntimeError, match="sync exploded"):
+        await server._run_save_weights_for_sampler(
+            SimpleNamespace(model_id=model_id, path=None, sampling_session_seq_id=9)
+        )
+
+    assert server._model_resource_manager.rollout_id is None
+    assert server._status is ServerStatus.INITIALIZED
+    assert server._shutdown_started is False
 
 
 def test_weights_info_metadata_uses_cookbook_lora_compat_shape():
