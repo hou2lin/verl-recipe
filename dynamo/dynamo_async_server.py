@@ -260,6 +260,38 @@ class DynamoHttpServer:
         """Ask Dynamo to return top-level nvext.completion_token_ids."""
         return self._dynamo_cfg_bool("request_completion_token_ids", False)
 
+    def _enable_flexkv(self) -> bool:
+        """Enable FlexKV CPU-tier KV cache with Dynamo KV-router awareness."""
+        return self._dynamo_cfg_bool("enable_flexkv", False)
+
+    def _flexkv_env_vars(self) -> dict[str, str]:
+        """Forward FlexKV env vars into every dynamo.vllm subprocess.
+
+        ``DYNAMO_USE_FLEXKV=1`` activates ``KVEventCollector`` inside
+        ``FlexKVSchedulerConnector``, which re-publishes FlexKV CPU-cache
+        hits as vLLM ``BlockStored`` events through the ZMQ KV-events
+        channel so the Dynamo KV router can route future requests to
+        workers that already hold those KV blocks in CPU memory.
+
+        All ``FLEXKV_*`` vars present in the trainer environment are
+        forwarded unchanged so users can configure them in the SLURM
+        script or container env without touching recipe code.
+        """
+        env: dict[str, str] = {"DYNAMO_USE_FLEXKV": "1"}
+        for key in (
+            "FLEXKV_SERVER_RECV_PORT",
+            "FLEXKV_CPU_CACHE_GB",
+            "FLEXKV_ENABLE_METRICS",
+            "FLEXKV_MASTER_HOST",
+            "FLEXKV_MASTER_PORTS",
+            "FLEXKV_CPU_LAYOUT",
+            "FLEXKV_CONFIG_PATH",
+        ):
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+        return env
+
     def _dynamo_env_vars(self) -> dict[str, str]:
         """Common env vars for all dynamo subprocesses on this node.
 
@@ -594,6 +626,8 @@ class DynamoHttpServer:
 
             env = os.environ.copy()
             env.update(self._dynamo_env_vars())
+            if self._enable_flexkv():
+                env.update(self._flexkv_env_vars())
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
             env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
@@ -853,6 +887,11 @@ class DynamoHttpServer:
             executor_backend = "uni" if tp == 1 else "mp"
         cmd += ["--distributed-executor-backend", str(executor_backend)]
         cmd += ["--kv-events-config", kv_events_config_json]
+        if self._enable_flexkv():
+            cmd += [
+                "--kv-transfer-config",
+                '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}',
+            ]
         # Pass through extra args from rollout.engine_kwargs.dynamo.extra_args.
         extra = self._dynamo_cfg().get("extra_args") or []
         if isinstance(extra, list):
