@@ -1822,7 +1822,8 @@ class DynamoHttpServer:
     async def clear_kv_cache(self):
         if not self._control_endpoints:
             return
-        await self._engine_method_all("reset_prefix_cache")
+        kwargs = {"reset_connector": True} if self._enable_flexkv() else None
+        await self._engine_method_all("reset_prefix_cache", kwargs=kwargs)
 
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
