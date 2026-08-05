@@ -21,8 +21,10 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from omegaconf import OmegaConf
+from pydantic import TypeAdapter, ValidationError
 from verl_tinker.config_utils import _validate_config
 from verl_tinker.model_resource_manager import ModelResourceManager
+from verl_tinker.schemas import TinkerLossFnType
 from verl_tinker.tinker_router import (
     TINKER_COOKBOOK_COMPAT_LORA_RANK,
     FifoReadWriteGate,
@@ -75,6 +77,17 @@ def test_critic_routes_are_not_registered():
     assert "/api/v1/compute_values" not in paths
     assert "/api/v1/compute_advantages" not in paths
     assert "/api/v1/update_critic" not in paths
+
+
+def test_tinker_loss_schema_accepts_native_modes_and_custom_from_config_only():
+    adapter = TypeAdapter(TinkerLossFnType)
+    supported = ("cross_entropy", "importance_sampling", "ppo", "cispo", "dro", "custom_from_config")
+
+    assert tuple(adapter.validate_python(name) for name in supported) == supported
+    loss_schema = app.openapi()["components"]["schemas"]["TinkerForwardBackwardInput"]["properties"]["loss_fn"]
+    assert tuple(loss_schema["enum"]) == supported
+    with pytest.raises(ValidationError):
+        adapter.validate_python("custom")
 
 
 @pytest.mark.asyncio
@@ -165,20 +178,18 @@ async def test_get_session_returns_only_currently_valid_samplers():
     assert response["sampler_ids"] == [current_sampler_id]
 
 
-def test_no_rollout_config_requires_backend_runtime_sections():
+def test_no_rollout_config_requires_trainer_runtime_fields():
     config = OmegaConf.create(
         {
             "actor_rollout_ref": {"model": {"path": "/models/qwen"}},
         }
     )
 
-    with patch("verl_tinker.config_utils._validate_supported_verl_config") as mock_validate:
+    with patch("verl_tinker.config_utils._validate_supported_verl_config"):
         errors = _validate_config(config)
 
-    assert "algorithm config is required" in errors
     assert "trainer.nnodes is required" in errors
     assert "trainer.n_gpus_per_node is required" in errors
-    mock_validate.assert_not_called()
 
 
 def test_create_model_metadata_is_full_model_training_even_with_lora_request():

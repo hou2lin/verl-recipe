@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from fastapi import HTTPException
 from tensordict import TensorDict
 from tinker import AdamParams, SampleResponse
 from verl_tinker.tinker_ops import (
@@ -84,8 +85,10 @@ class _ForwardBackwardEngine:
 
     def __init__(self, result_td):
         self.result_td = result_td
+        self.calls = 0
 
     def forward_backward(self, _data):
+        self.calls += 1
         return self.result_td
 
 
@@ -129,7 +132,9 @@ async def _to_thread_inline(func, /, *args, **kwargs):
 @pytest.mark.asyncio
 async def test_forward_backward_returns_verl_model_logprobs_for_cross_entropy(monkeypatch):
     monkeypatch.setattr("verl_tinker.tinker_ops.asyncio.to_thread", _to_thread_inline)
-    monkeypatch.setattr("verl_tinker.tinker_ops._datums_to_sft_td", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        "verl_tinker.tinker_ops._datums_to_sft_td", lambda *args, **kwargs: TensorDict({}, batch_size=[])
+    )
     log_probs = torch.nested.as_nested_tensor(
         [torch.tensor([-1.0, -2.0, -3.0]), torch.tensor([-4.0, -5.0, -6.0, -7.0])],
         layout=torch.jagged,
@@ -147,13 +152,15 @@ async def test_forward_backward_returns_verl_model_logprobs_for_cross_entropy(mo
         {"logprobs": {"data": [-1.0, -2.0], "dtype": "float32", "shape": [2]}},
         {"logprobs": {"data": [-4.0, -5.0, -6.0], "dtype": "float32", "shape": [3]}},
     ]
-    assert result["metrics"]["loss:mean"] == 4.25
+    assert result["metrics"]["loss:sum"] == 4.25
 
 
 @pytest.mark.asyncio
 async def test_forward_backward_zero_fills_missing_cross_entropy_model_logprobs(monkeypatch):
     monkeypatch.setattr("verl_tinker.tinker_ops.asyncio.to_thread", _to_thread_inline)
-    monkeypatch.setattr("verl_tinker.tinker_ops._datums_to_sft_td", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        "verl_tinker.tinker_ops._datums_to_sft_td", lambda *args, **kwargs: TensorDict({}, batch_size=[])
+    )
     result_td = TensorDict({}, batch_size=[])
     result_td.set_non_tensor("metrics", {"loss": 4.25})
 
@@ -166,7 +173,18 @@ async def test_forward_backward_zero_fills_missing_cross_entropy_model_logprobs(
     assert result["loss_fn_outputs"] == [
         {"logprobs": {"data": [0.0, 0.0], "dtype": "float32", "shape": [2]}},
     ]
-    assert result["metrics"]["loss:mean"] == 4.25
+    assert result["metrics"]["loss:sum"] == 4.25
+
+
+@pytest.mark.asyncio
+async def test_forward_backward_rejects_invalid_loss_config_before_engine():
+    engine = _ForwardBackwardEngine(TensorDict({}, batch_size=[]))
+
+    with pytest.raises(HTTPException, match="does not accept") as exc_info:
+        await forward_backward(engine, [], "importance_sampling", {"beta": 0.1})
+
+    assert exc_info.value.status_code == 422
+    assert engine.calls == 0
 
 
 @pytest.mark.asyncio

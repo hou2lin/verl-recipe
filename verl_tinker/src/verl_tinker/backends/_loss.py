@@ -20,14 +20,21 @@ binds this branching loss to its actor worker group via ``set_loss_fn``
 once at init.
 """
 
-from functools import partial
+from copy import deepcopy
+from dataclasses import replace
 
 from omegaconf import DictConfig
 
 from verl.utils.config import omega_conf_to_dataclass
-from verl.workers.utils.losses import ppo_loss, sft_loss
+from verl.workers.utils.losses import ppo_loss
 
 __all__ = ["is_ref_in_actor", "make_branching_loss"]
+
+# VERL clamps PPO's log-ratio to 20 before exponentiating, so the largest
+# ratio that can reach the dual-clip branch is exp(20) ~= 4.85e8. Tinker PPO
+# has no third/dual clip; a finite value above that bound disables it while
+# satisfying VERL's ``clip_ratio_c > 1`` validation.
+_TINKER_PPO_DUAL_CLIP_C = 1e9
 
 
 def is_ref_in_actor(config: DictConfig) -> bool:
@@ -43,7 +50,7 @@ def is_ref_in_actor(config: DictConfig) -> bool:
 
 
 def make_branching_loss(config: DictConfig):
-    """Return a single loss callable that picks ppo_loss / sft_loss /
+    """Return a single loss callable that picks PPO / weighted CE /
     top-K weighted-CE at call time based on the TD's ``__loss_mode__``
     non-tensor field, and handles verl's dual-call invocation
     convention.
@@ -64,20 +71,17 @@ def make_branching_loss(config: DictConfig):
           → must return a dict of ``(1, total_nnz)`` tensors that the
           engine stashes into ``model_output``.
 
-    ``ppo_loss`` / ``sft_loss`` only implement (a). The top-K branch
-    implements both (a) and (b). When the engine *would* try to call
-    ppo/sft as a logit processor (it won't, because their TDs leave
-    ``distillation_use_topk=False``), we return ``{}`` as a defensive
-    no-op."""
+    PPO and weighted CE only implement (a). The top-K branch implements
+    both (a) and (b)."""
     import torch
     import torch.nn.functional as F
 
     from verl.trainer.ppo.core_algos import agg_loss
     from verl.utils import tensordict_utils as tu
+    from verl.utils.dataset.dataset_utils import DatasetPadMode
     from verl.utils.metric import AggregationType, Metric
 
-    # ``sft_loss`` doesn't actually read ``config`` (it's accepted for
-    # signature compat); ``ppo_loss`` reads ``clip_ratio /
+    # ``ppo_loss`` reads ``clip_ratio /
     # loss_agg_mode / policy_loss / use_kl_loss / global_batch_info /
     # loss_scale_factor`` — all of which are top-level fields on
     # ActorConfig populated by ``omega_conf_to_dataclass``. Don't force
@@ -88,8 +92,71 @@ def make_branching_loss(config: DictConfig):
     # ActorRolloutRefWorker makes at engine_workers.py:545) skips
     # validation.
     actor_cfg = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
-    ppo = partial(ppo_loss, config=actor_cfg)
-    sft = partial(sft_loss, config=actor_cfg)
+
+    def actor_config_for(spec: dict):
+        """Build an isolated request config; ppo_loss mutates global_batch_info."""
+        loss_name = spec["name"]
+        if loss_name == "custom_from_config":
+            # Preserve every startup setting while isolating mutable fields that
+            # verl updates during ppo_loss (notably global_batch_info).
+            return deepcopy(actor_cfg)
+
+        loss_mode = {
+            "ppo": "vanilla",
+            # Tinker's ``logprobs`` are behavior/rollout-policy log probs and
+            # are translated to ``old_log_probs``. That is already VERL's
+            # bypass-mode input contract, so compute token-TIS in the loss.
+            "importance_sampling": "bypass_mode",
+        }.get(loss_name, loss_name)
+        rollout_correction = replace(actor_cfg.policy_loss.rollout_correction)
+        if loss_name == "importance_sampling":
+            rollout_correction = replace(
+                rollout_correction,
+                rollout_is="token",
+                rollout_is_threshold=2.0,
+                rollout_is_batch_normalize=False,
+                rollout_rs=None,
+                rollout_rs_threshold=None,
+                bypass_mode=True,
+                loss_type="reinforce",
+            )
+        policy_loss = replace(
+            actor_cfg.policy_loss,
+            loss_mode=loss_mode,
+            dro_beta=spec.get("dro_beta", actor_cfg.policy_loss.dro_beta),
+            rollout_correction=rollout_correction,
+        )
+        overrides = {
+            "policy_loss": policy_loss,
+            "loss_agg_mode": "token-sum",
+            "entropy_coeff": 0.0,
+            "use_kl_loss": False,
+            "global_batch_info": {},
+        }
+        if loss_name in {"ppo", "cispo"}:
+            overrides["clip_ratio_low"] = spec["clip_ratio_low"]
+            overrides["clip_ratio_high"] = spec["clip_ratio_high"]
+        if loss_name == "ppo":
+            overrides["clip_ratio_c"] = _TINKER_PPO_DUAL_CLIP_C
+        return replace(actor_cfg, **overrides)
+
+    def sft_final_loss(model_output, data, dp_group=None):
+        """Tinker weighted cross entropy uses a global token-sum reduction."""
+        pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        log_prob = model_output["log_probs"]
+        if pad_mode == DatasetPadMode.NO_PADDING:
+            loss_mat = -log_prob.values()
+            loss_mask = torch.roll(data["loss_mask"].values(), shifts=-1, dims=0)
+        else:
+            loss_mat = -log_prob
+            loss_mask = data["response_mask"]
+        loss = agg_loss(
+            loss_mat=loss_mat.unsqueeze(0) if loss_mat.ndim == 1 else loss_mat,
+            loss_mask=loss_mask.unsqueeze(0) if loss_mask.ndim == 1 else loss_mask,
+            loss_agg_mode="token-sum",
+            dp_size=data["dp_size"],
+        )
+        return loss, {"loss": Metric(value=loss, aggregation=AggregationType.SUM)}
 
     def topk_logit_processor(student_logits, data):
         """In-forward logit processor for top-K weighted CE.
@@ -131,19 +198,15 @@ def make_branching_loss(config: DictConfig):
         # the predicted-next-token positions.
         loss_flat = distillation_losses.values()
         mask_flat = torch.roll(loss_mask.values(), shifts=-1, dims=0)
-        # token-mean aggregation, matching sft_loss's default. agg_loss
-        # provides cross-DP normalisation via ``batch_num_tokens``.
-        batch_num_tokens = data["batch_num_tokens"]
         dp_size = data["dp_size"]
-        # Reuse agg_loss for consistency with other loss paths' DP scaling.
         loss = agg_loss(
             loss_mat=loss_flat.unsqueeze(0),
             loss_mask=mask_flat.unsqueeze(0),
-            loss_agg_mode="token-mean",
+            loss_agg_mode="token-sum",
             dp_size=dp_size,
-            batch_num_tokens=batch_num_tokens,
         )
         metrics = {
+            "loss": Metric(value=loss, aggregation=AggregationType.SUM),
             "distillation/loss": Metric(value=loss, aggregation=AggregationType.SUM),
         }
         return loss, metrics
@@ -167,9 +230,17 @@ def make_branching_loss(config: DictConfig):
 
         # (a) Final-loss invocation.
         if mode == "sft":
-            return sft(model_output=model_output, data=data, dp_group=dp_group)
+            return sft_final_loss(model_output=model_output, data=data, dp_group=dp_group)
         if mode == "topk_distill":
             return topk_final_loss(model_output, data, dp_group=dp_group)
-        return ppo(model_output=model_output, data=data, dp_group=dp_group)
+        # This metadata is created by tinker_ops after request validation. Its
+        # absence is an internal server-plumbing bug, not invalid client input.
+        spec = tu.get_non_tensor_data(data=data, key="__tinker_loss_spec__", default=None)
+        if spec is None:
+            raise RuntimeError("Internal RL TensorDict is missing normalized __tinker_loss_spec__ metadata")
+        request_cfg = actor_config_for(spec)
+        loss, metrics = ppo_loss(config=request_cfg, model_output=model_output, data=data, dp_group=dp_group)
+        metrics["loss"] = Metric(value=loss, aggregation=AggregationType.SUM)
+        return loss, metrics
 
     return branching_loss
