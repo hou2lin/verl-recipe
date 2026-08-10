@@ -640,8 +640,28 @@ class DynamoHttpServer:
                 # to restore CUDA_VISIBLE_DEVICES for its subprocesses (vLLM
                 # EngineCore blanks the variable, so it can't be inherited).
                 flexkv_port_base = env.get("FLEXKV_SERVER_RECV_PORT", "ipc:///tmp/flexkv_server")
-                env["FLEXKV_SERVER_RECV_PORT"] = f"{flexkv_port_base}_{spec.label}_g{worker_cvd}"
-                env["FLEXKV_ORIGINAL_CUDA_VISIBLE_DEVICES"] = worker_cvd
+                if env.get("FLEXKV_SHARED_CPU_CACHE", "0") == "1":
+                    # Shared pool: every shard joins ONE KVServer over one socket.
+                    # instance_num>1 flips KVManager into server_client_mode;
+                    # dp_client 0 (shard 0) spawns the server, others connect.
+                    # Device ids flatten to instance_id*gpus_per_node+local_rank.
+                    env["FLEXKV_INSTANCE_NUM"] = str(len(worker_specs))
+                    env["FLEXKV_INSTANCE_ID"] = str(spec_idx)
+                    env["FLEXKV_SERVER_RECV_PORT"] = flexkv_port_base
+                    # The single server owns the whole pool: scale the per-shard
+                    # cache budget by shard count so totals match private mode.
+                    per_shard_gb = float(env.get("FLEXKV_CPU_CACHE_GB", "96"))
+                    env["FLEXKV_CPU_CACHE_GB"] = str(int(per_shard_gb * len(worker_specs)))
+                else:
+                    env["FLEXKV_SERVER_RECV_PORT"] = f"{flexkv_port_base}_{spec.label}_g{worker_cvd}"
+                # The TransferManager DMAs on behalf of every shard in shared
+                # mode, so the (single) server process must see every node GPU;
+                # private per-shard servers keep the shard-local view.
+                env["FLEXKV_ORIGINAL_CUDA_VISIBLE_DEVICES"] = (
+                    self._cuda_visible_devices
+                    if env.get("FLEXKV_SHARED_CPU_CACHE", "0") == "1"
+                    else worker_cvd
+                )
                 # Dynamo always launches shards with a restricted
                 # CUDA_VISIBLE_DEVICES, so FlexKV must preserve (not drop) the
                 # mapping when spawning its TransferManager subprocesses.
@@ -652,6 +672,19 @@ class DynamoHttpServer:
                 # client in the container is routed through it, failing with
                 # CUDA_ERROR_NO_DEVICE on all other GPUs.
                 env.setdefault("FLEXKV_ENABLE_MPS", "0")
+                # FlexKV metrics servers default to fixed ports 8080/8081;
+                # same-container shards collide, so offset per shard.
+                env["FLEXKV_PY_METRICS_PORT"] = str(int(env.get("FLEXKV_PY_METRICS_PORT", "8080")) + spec_idx * 2)
+                env["FLEXKV_CPP_METRICS_PORT"] = str(int(env.get("FLEXKV_CPP_METRICS_PORT", "8081")) + spec_idx * 2)
+                # The FlexKV adapter writes its per-request Phase-1 trace to the
+                # file in FLEXKV_PHASE1_REQUEST_TRACE_PATH; the launcher only
+                # exports ..._DIR (the directory phase1_summarize_run scans), so
+                # derive a per-shard file path or the trace is silently dropped.
+                trace_dir = env.get("FLEXKV_PHASE1_REQUEST_TRACE_DIR")
+                if trace_dir and not env.get("FLEXKV_PHASE1_REQUEST_TRACE_PATH"):
+                    env["FLEXKV_PHASE1_REQUEST_TRACE_PATH"] = os.path.join(
+                        trace_dir, f"requests_{spec.label}.jsonl"
+                    )
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
             env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
@@ -1500,6 +1533,7 @@ class DynamoHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
+            extra_fields={"dynamo_response_id": data.get("id")},
         )
 
     def _log_engine_data_token_ids_status(self, choice: dict[str, Any], response: dict[str, Any]):
@@ -1533,6 +1567,7 @@ class DynamoHttpServer:
         token_ids: Optional[list[int]] = None,
         log_probs: Optional[list[float]] = None,
         stop_reason: Optional[str] = None,
+        extra_fields: Optional[dict] = None,
     ):
         """Build a verl TokenOutput while preserving AgentLoop shape invariants."""
         from verl.workers.rollout.replica import TokenOutput
@@ -1547,7 +1582,7 @@ class DynamoHttpServer:
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
-            extra_fields={"global_steps": self.global_steps or 0},
+            extra_fields={"global_steps": self.global_steps or 0, **(extra_fields or {})},
         )
 
     def _fallback_token_ids(self) -> list[int]:
