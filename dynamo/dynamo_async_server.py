@@ -286,6 +286,9 @@ class DynamoHttpServer:
             "FLEXKV_MASTER_PORTS",
             "FLEXKV_CPU_LAYOUT",
             "FLEXKV_CONFIG_PATH",
+            "FLEXKV_PRESERVE_CUDA_VISIBLE_DEVICES",
+            "FLEXKV_SYNC_GET",
+            "FLEXKV_ENABLE_MPS",
         ):
             value = os.environ.get(key)
             if value is not None:
@@ -628,6 +631,27 @@ class DynamoHttpServer:
             env.update(self._dynamo_env_vars())
             if self._enable_flexkv():
                 env.update(self._flexkv_env_vars())
+                # FlexKV binds server_recv_port (and the derived
+                # "<port>_gpu_register") as ZMQ IPC sockets. Shards on the same
+                # node sharing the default path crosstalk during GPU
+                # registration and hang, so give each shard its own socket.
+                # The trailing "_g<ids>" encodes the shard's physical GPUs:
+                # with FLEXKV_PRESERVE_CUDA_VISIBLE_DEVICES=1 FlexKV parses it
+                # to restore CUDA_VISIBLE_DEVICES for its subprocesses (vLLM
+                # EngineCore blanks the variable, so it can't be inherited).
+                flexkv_port_base = env.get("FLEXKV_SERVER_RECV_PORT", "ipc:///tmp/flexkv_server")
+                env["FLEXKV_SERVER_RECV_PORT"] = f"{flexkv_port_base}_{spec.label}_g{worker_cvd}"
+                env["FLEXKV_ORIGINAL_CUDA_VISIBLE_DEVICES"] = worker_cvd
+                # Dynamo always launches shards with a restricted
+                # CUDA_VISIBLE_DEVICES, so FlexKV must preserve (not drop) the
+                # mapping when spawning its TransferManager subprocesses.
+                env["FLEXKV_PRESERVE_CUDA_VISIBLE_DEVICES"] = "1"
+                # FlexKV starts an MPS control daemon by default. With many
+                # single-GPU shards per node the first shard's daemon inherits
+                # its restricted CUDA_VISIBLE_DEVICES and every later CUDA
+                # client in the container is routed through it, failing with
+                # CUDA_ERROR_NO_DEVICE on all other GPUs.
+                env.setdefault("FLEXKV_ENABLE_MPS", "0")
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
             env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
