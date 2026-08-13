@@ -1,0 +1,113 @@
+--- a/components/src/dynamo/thunderagent_router/__main__.py
++++ b/components/src/dynamo/thunderagent_router/__main__.py
+@@ -158,6 +158,8 @@
+             estimated_prompt_tokens=estimated_prompt_tokens,
+         )
+         worker_pin = decision.assigned_worker_hint
++        if isinstance(token_ids, list) and token_ids:
++            self._scheduler.record_prompt_tokens(program_id, token_ids)
+ 
+         preprocessed = _wrap_preprocessed_request(request)
+         if decision.priority_jump != 0.0:
+--- a/components/src/dynamo/thunderagent_router/router.py
++++ b/components/src/dynamo/thunderagent_router/router.py
+@@ -66,6 +66,12 @@
+         self._lock = asyncio.Lock()
+         self._scheduler_task: Optional[asyncio.Task] = None
+         self._stat_forced_resumes = 0
++        # Victim-pinning toward FlexKV (L2 design D2/D3). Prompt tokens are
++        # cached per program so a pause can pin the victim's CPU radix path
++        # by content; endpoints are discovered from the FlexKV IPC sockets.
++        self._pin_enabled = os.environ.get("THUNDERAGENT_FLEXKV_PIN", "0") == "1"
++        self._prompt_tokens: dict = {}
++        self._pin_endpoints: Optional[list] = None
+ 
+     def start(self) -> None:
+         if self._scheduler_task is not None:
+@@ -193,6 +199,69 @@
+             program.token_total,
+         )
+         return program.waiting, True
++
++    def record_prompt_tokens(self, program_id: str, token_ids: list) -> None:
++        """Remember the latest prompt so a pause can pin it by content."""
++        if self._pin_enabled:
++            self._prompt_tokens[program_id] = token_ids
++
++    def _fire_pin(self, program_id: str, unpin: bool) -> None:
++        if not self._pin_enabled:
++            return
++        tokens = None
++        if not unpin:
++            tokens = self._prompt_tokens.get(program_id)
++            if tokens is None:
++                return
++        try:
++            loop = asyncio.get_event_loop()
++            loop.run_in_executor(None, self._send_pin, program_id, tokens, unpin)
++        except Exception:
++            logger.exception("flexkv pin dispatch failed (non-fatal)")
++
++    def _send_pin(self, program_id: str, tokens, unpin: bool) -> None:
++        # Executor thread: blocking IPC is fine here. Broadcast to every
++        # FlexKV server on this node; non-owning servers simply match nothing.
++        try:
++            import glob as _glob
++
++            import zmq as _zmq
++
++            from flexkv.server.request import PinRequest, UnpinRequest
++
++            if self._pin_endpoints is None:
++                self._pin_endpoints = sorted({
++                    "ipc://" + p
++                    for p in _glob.glob("/tmp/flexkv_server*")
++                    if "gpu_register" not in p
++                })
++            if not self._pin_endpoints:
++                return
++            ctx = _zmq.Context(1)
++            try:
++                for endpoint in self._pin_endpoints:
++                    sock = ctx.socket(_zmq.PUSH)
++                    sock.setsockopt(_zmq.LINGER, 500)
++                    sock.connect(endpoint)
++                    if unpin:
++                        request = UnpinRequest(dp_client_id=-1, pin_id=program_id)
++                    else:
++                        request = PinRequest(
++                            dp_client_id=-1, token_ids=tokens, pin_id=program_id
++                        )
++                    sock.send_pyobj(request)
++                    sock.close()
++            finally:
++                ctx.term()
++            logger.info(
++                "pin.%s program=%s endpoints=%d tokens=%s",
++                "unpin" if unpin else "request",
++                program_id,
++                len(self._pin_endpoints),
++                "-" if tokens is None else len(tokens),
++            )
++        except Exception:
++            logger.exception("flexkv pin send failed (non-fatal)")
+ 
+     def record_output_tokens(self, program_id: str, delta_tokens: int) -> None:
+         # No-await fast path on the streaming chunk loop. Safe because the
+@@ -423,6 +492,7 @@
+         else:
+             program.waiting.clear()
+         self._table.paused[program_id] = None
++        self._fire_pin(program_id, unpin=False)
+         logger.debug("Paused program %s (tokens=%d)", program_id, program.token_total)
+         return True
+ 
+@@ -438,6 +508,8 @@
+             if program is None:
+                 return False
+             program.lifecycle = ProgramLifecycle.TERMINATED
++            self._prompt_tokens.pop(program_id, None)
++            self._fire_pin(program_id, unpin=True)
+             if program.waiting is not None:
+                 program.waiting.set()  # unblock any coroutine paused on this program
+                 program.waiting = None

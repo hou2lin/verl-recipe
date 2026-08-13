@@ -1,0 +1,112 @@
+--- a/flexkv/server/request.py
++++ b/flexkv/server/request.py
+@@ -145,3 +145,25 @@
+ @dataclass
+ class CheckRunningRequest:
+     dp_client_id: int
++
++@dataclass
++class PinRequest:
++    """Pin the CPU radix path matching token_ids against eviction.
++
++    Victim-pinning (ThunderAgent L2 design): sent by the TA router when it
++    pauses a program so the write-behind CPU copy survives until resume.
++    Fire-and-forget (no response), like PutRequest.
++    """
++    dp_client_id: int
++    token_ids: "np.ndarray"
++    pin_id: str
++    task_id: int = -1
++    namespace: "Optional[List[str]]" = None
++
++
++@dataclass
++class UnpinRequest:
++    """Release a pin created by PinRequest. Idempotent."""
++    dp_client_id: int
++    pin_id: str
++    task_id: int = -1
+--- a/flexkv/server/server.py
++++ b/flexkv/server/server.py
+@@ -26,6 +26,8 @@
+     RegisterTPClientRequest,
+     IsReadyRequest,
+     PutRequest,
++    PinRequest,
++    UnpinRequest,
+     GetRequest,
+     PutMatchRequest,
+     GetMatchRequest,
+@@ -196,6 +198,8 @@
+             PutRequest: self._handle_put_request,
+             GetMatchRequest: self._handle_get_match_request,
+             PutMatchRequest: self._handle_put_match_request,
++            PinRequest: self._handle_pin_request,
++            UnpinRequest: self._handle_unpin_request,
+             PrefetchRequest: self._handle_prefetch_request,
+             WaitRequest: self._handle_wait_request,
+             LaunchTaskRequest: self._handle_launch_task_request,
+@@ -453,7 +457,63 @@
+                             task_id=req_id, mask=mask)
+         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+         result_zmq.send_pyobj(response)
++
++    def _handle_pin_request(self, req: PinRequest) -> None:
++        """Pin the CPU radix path matching token_ids (victim-pinning, L2 design).
++
++        Locks the deepest matched node; ancestors become un-evictable because
++        eviction only consumes leaves. Fire-and-forget: failures degrade to
++        today's unprotected behavior and are logged, never raised.
++        """
++        self.kv_task_engine._update_tasks(timeout=0)
++        if not hasattr(self, "_pin_table"):
++            self._pin_table = {}
++        try:
++            import numpy as _np
++            from flexkv.common.block import SequenceMeta
++            engine = self.kv_task_engine.cache_engine.cpu_cache_engine
++            if engine is None:
++                raise ValueError("no cpu_cache_engine")
++            tokens_per_block = getattr(engine, "tokens_per_block", None) or \
++                self.kv_task_engine.cache_engine.tokens_per_block
++            token_ids = _np.asarray(req.token_ids, dtype=_np.int64)
++            aligned = (len(token_ids) // tokens_per_block) * tokens_per_block
++            if aligned <= 0:
++                raise ValueError(f"nothing to pin (len {len(token_ids)})")
++            meta = SequenceMeta(token_ids=token_ids[:aligned],
++                                tokens_per_block=tokens_per_block)
++            result = engine.match(meta)
++            node = getattr(result, "last_node", None)
++            if node is None:
++                raise ValueError(f"match result {type(result).__name__} has no last_node")
++            prev = self._pin_table.pop(req.pin_id, None)
++            if prev is not None:
++                engine.unlock(prev)
++            engine.lock_node(node)
++            self._pin_table[req.pin_id] = node
++            flexkv_logger.info(
++                f"[PIN] pinned pin_id={req.pin_id} matched_blocks="
++                f"{getattr(result, 'last_node_matched_length', -1)} "
++                f"pinned_total={len(self._pin_table)}"
++            )
++        except Exception as e:
++            flexkv_logger.warning(f"[PIN] pin pin_id={req.pin_id} failed: {e}")
+ 
++    def _handle_unpin_request(self, req: UnpinRequest) -> None:
++        """Release a pin. Idempotent; unknown pin ids are a no-op."""
++        if not hasattr(self, "_pin_table"):
++            self._pin_table = {}
++        node = self._pin_table.pop(req.pin_id, None)
++        if node is None:
++            return
++        try:
++            self.kv_task_engine.cache_engine.cpu_cache_engine.unlock(node)
++            flexkv_logger.info(
++                f"[PIN] unpinned pin_id={req.pin_id} pinned_total={len(self._pin_table)}"
++            )
++        except Exception as e:
++            flexkv_logger.warning(f"[PIN] unpin pin_id={req.pin_id} failed: {e}")
++
+     def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
+         """Handle Prefetch request"""
+         task_id = self.kv_task_engine.prefetch_async(
