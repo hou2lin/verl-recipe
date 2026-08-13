@@ -58,6 +58,99 @@ if not logger.handlers:
 # can rendezvous on the same AsyncLLM instance.
 _engine_holder: dict[str, Any] = {"engine": None, "vllm_config": None}
 
+# MDC runtime_data key for the FlexKV host tier. The ThunderAgent router's
+# WorkerCapacityProvider adds `host_total_tokens` to the program-retention
+# budget (same contract as `sglang_hicache_capacity`).
+FLEXKV_CAPACITY_RUNTIME_KEY = "flexkv_capacity"
+
+
+def _flexkv_kv_bytes_per_token(vllm_config: Any) -> Optional[int]:
+    """Model-total KV bytes per token (all layers, all KV heads, K+V).
+
+    The CPU tier holds the full-model KV for a token (98,304 B for
+    Qwen3-Coder-30B-A3B), not the per-TP-rank slice, so compute from the HF
+    config rather than the parallel-sharded view. `FLEXKV_KV_BYTES_PER_TOKEN`
+    overrides when set (models whose layout this formula does not cover).
+    """
+    override = os.environ.get("FLEXKV_KV_BYTES_PER_TOKEN")
+    if override:
+        return int(override)
+    try:
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+        num_layers = int(hf_config.num_hidden_layers)
+        num_kv_heads = int(model_config.get_total_num_kv_heads())
+        head_size = int(model_config.get_head_size())
+        cache_dtype = str(getattr(vllm_config.cache_config, "cache_dtype", "auto"))
+        dtype_bytes = 1 if "fp8" in cache_dtype.lower() else 2
+        return num_layers * 2 * num_kv_heads * head_size * dtype_bytes
+    except Exception:
+        logger.exception(
+            "could not derive KV bytes/token from vllm_config; set "
+            "FLEXKV_KV_BYTES_PER_TOKEN to publish FlexKV capacity"
+        )
+        return None
+
+
+def _install_flexkv_capacity_publisher():
+    """Wrap ``dynamo.vllm.main.register_model`` to publish the FlexKV CPU
+    tier into MDC runtime_data.
+
+    SGLang+HiCache workers already publish `host_total_tokens` so the
+    ThunderAgent router pauses later when spilled KV is recoverable; the
+    vLLM+FlexKV path publishes nothing, leaving the router's ledger blind to
+    the CPU pool. This shim injects the equivalent record at the moment the
+    runtime_config is final (register_model call), gated on the same env the
+    launcher already exports for FlexKV arms.
+
+    NOTE: publishing capacity is only safe together with victim pinning on
+    the consumer side (see dynamo/flexkv_l2_design.md §2) — the router-side
+    consumption of this key ships in the same phase as the pin protocol.
+    """
+    if os.environ.get("DYNAMO_USE_FLEXKV") != "1":
+        return
+    try:
+        cpu_cache_gb = float(os.environ.get("FLEXKV_CPU_CACHE_GB", "0") or 0)
+    except ValueError:
+        cpu_cache_gb = 0.0
+    if cpu_cache_gb <= 0:
+        logger.info("FlexKV enabled but FLEXKV_CPU_CACHE_GB unset; not publishing capacity")
+        return
+
+    import json
+
+    import dynamo.vllm.main as dyn_main
+
+    original_register = dyn_main.register_model
+
+    async def patched_register(*args, **kwargs):
+        runtime_config = kwargs.get("runtime_config")
+        if runtime_config is None:
+            logger.warning(
+                "register_model called without runtime_config kwarg; "
+                "FlexKV capacity not published"
+            )
+            return await original_register(*args, **kwargs)
+
+        bytes_per_token = _flexkv_kv_bytes_per_token(_engine_holder.get("vllm_config"))
+        if bytes_per_token and bytes_per_token > 0:
+            host_total_tokens = int(cpu_cache_gb * (1 << 30) / bytes_per_token)
+            payload = {
+                "host_total_tokens": host_total_tokens,
+                "cpu_cache_gb": cpu_cache_gb,
+                "kv_bytes_per_token": bytes_per_token,
+            }
+            try:
+                runtime_config.set_engine_specific(
+                    FLEXKV_CAPACITY_RUNTIME_KEY, json.dumps(payload)
+                )
+                logger.info("published FlexKV capacity runtime metadata: %s", payload)
+            except Exception:
+                logger.exception("failed to publish FlexKV capacity; continuing without it")
+        return await original_register(*args, **kwargs)
+
+    dyn_main.register_model = patched_register
+
 
 def _install_engine_capture():
     """Wrap ``dynamo.vllm.main.setup_vllm_engine`` so we get the AsyncLLM."""
@@ -271,6 +364,7 @@ async def _amain():
     import dynamo.vllm.main as dyn_main
 
     _install_engine_capture()
+    _install_flexkv_capacity_publisher()
 
     control_ep = os.environ.get("VERL_DYNAMO_CONTROL_ZMQ")
     if control_ep:
