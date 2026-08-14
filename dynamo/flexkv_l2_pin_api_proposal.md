@@ -47,15 +47,20 @@ Two paths; Phase 1 uses (a):
 
 - **(a) Single-node pragmatic (Phase 1)**: the ThunderAgent router process and
   the FlexKV KVServer(s) share a container in this deployment. The router
-  holds a `flexkv.server.client` connection per worker socket
-  (`FLEXKV_SERVER_RECV_PORT` env, per-shard suffixed) and issues
-  PIN/UNPIN directly over IPC. Zero new transport.
+  broadcasts PIN/UNPIN over the servers' IPC sockets. Zero new transport.
+  **Measured constraint (pinsmk1-8, 2026-08-14): this path only exists in
+  shared mode** (`FLEXKV_INSTANCE_NUM>1`) — in private per-shard mode
+  KVManager runs embedded in the EngineCore process with **no KVServer
+  process and no IPC channel at all** (only the gpu_register socket exists).
+  Private mode therefore requires path (b); (a) validates the mechanism on
+  shared-mode arms.
 - **(b) Multi-node proper (graduation)**: the worker extension
   (`dynamo_worker_extension.py`) exposes `pin_sessions/unpin_sessions`
   RPCs (reachable via each shard's control ZMQ, whose endpoint the recipe
   already knows how to publish through MDC runtime_data — same seam as R1);
   the router resolves the victim's pinned worker and calls through. This is
-  R2 in the design doc.
+  R2 in the design doc — **required for private per-shard mode** (see the
+  measured constraint above), not merely for multi-node.
 
 ## 3. Router hooks (D2/D3)
 

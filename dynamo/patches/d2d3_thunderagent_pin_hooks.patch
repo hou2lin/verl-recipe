@@ -1,11 +1,13 @@
 --- a/components/src/dynamo/thunderagent_router/__main__.py
 +++ b/components/src/dynamo/thunderagent_router/__main__.py
-@@ -158,6 +158,8 @@
+@@ -158,6 +158,10 @@
              estimated_prompt_tokens=estimated_prompt_tokens,
          )
          worker_pin = decision.assigned_worker_hint
-+        if isinstance(token_ids, list) and token_ids:
++        try:
 +            self._scheduler.record_prompt_tokens(program_id, token_ids)
++        except Exception:  # never let telemetry break the request path
++            logger.exception("record_prompt_tokens failed (non-fatal)")
  
          preprocessed = _wrap_preprocessed_request(request)
          if decision.priority_jump != 0.0:
@@ -24,15 +26,50 @@
  
      def start(self) -> None:
          if self._scheduler_task is not None:
-@@ -193,6 +199,69 @@
+@@ -75,6 +81,10 @@
+                 "ThunderAgent STICKY-ONLY mode: capacity admission and "
+                 "pause/demote/resume disabled; per-program pin retained"
+             )
++        logger.info(
++            "ThunderAgent flexkv-pin=%s (THUNDERAGENT_FLEXKV_PIN)",
++            "on" if self._pin_enabled else "off",
++        )
+         self._scheduler_task = asyncio.create_task(self._scheduler_loop())
+         logger.info(
+             "ThunderAgent scheduler started (interval=%ss, pause=%.2f, soft=%.2f)",
+@@ -193,7 +203,98 @@
              program.token_total,
          )
          return program.waiting, True
 +
-+    def record_prompt_tokens(self, program_id: str, token_ids: list) -> None:
-+        """Remember the latest prompt so a pause can pin it by content."""
-+        if self._pin_enabled:
-+            self._prompt_tokens[program_id] = token_ids
++    def record_prompt_tokens(self, program_id: str, token_ids) -> None:
++        """Remember the latest prompt so a pause can pin it by content.
++
++        token_ids may be any int sequence (the Rust binding hands back
++        non-list sequences); coerce here, once, off the hot path's
++        critical structures.
++        """
++        if not self._pin_enabled:
++            return
++        try:
++            tokens = [int(t) for t in token_ids]
++        except TypeError:
++            if not getattr(self, "_record_type_warned", False):
++                self._record_type_warned = True
++                logger.warning(
++                    "record_prompt_tokens: unusable token_ids type %s",
++                    type(token_ids).__name__,
++                )
++            return
++        if not tokens:
++            return
++        self._prompt_tokens[program_id] = tokens
++        if not getattr(self, "_record_logged", False):
++            self._record_logged = True
++            logger.info(
++                "pin.record first prompt cached: program=%s n_tokens=%d src_type=%s",
++                program_id, len(tokens), type(token_ids).__name__,
++            )
 +
 +    def _fire_pin(self, program_id: str, unpin: bool) -> None:
 +        if not self._pin_enabled:
@@ -40,6 +77,10 @@
 +        tokens = None
 +        if not unpin:
 +            tokens = self._prompt_tokens.get(program_id)
++            logger.info(
++                "pin.fire program=%s cached=%s dict_size=%d",
++                program_id, tokens is not None, len(self._prompt_tokens),
++            )
 +            if tokens is None:
 +                return
 +        try:
@@ -47,7 +88,7 @@
 +            loop.run_in_executor(None, self._send_pin, program_id, tokens, unpin)
 +        except Exception:
 +            logger.exception("flexkv pin dispatch failed (non-fatal)")
-+
+ 
 +    def _send_pin(self, program_id: str, tokens, unpin: bool) -> None:
 +        # Executor thread: blocking IPC is fine here. Broadcast to every
 +        # FlexKV server on this node; non-owning servers simply match nothing.
@@ -91,10 +132,11 @@
 +            )
 +        except Exception:
 +            logger.exception("flexkv pin send failed (non-fatal)")
- 
++
      def record_output_tokens(self, program_id: str, delta_tokens: int) -> None:
          # No-await fast path on the streaming chunk loop. Safe because the
-@@ -423,6 +492,7 @@
+         # event loop is single-task; the scheduler tick tolerates a stale
+@@ -423,6 +524,7 @@
          else:
              program.waiting.clear()
          self._table.paused[program_id] = None
@@ -102,7 +144,7 @@
          logger.debug("Paused program %s (tokens=%d)", program_id, program.token_total)
          return True
  
-@@ -438,6 +508,8 @@
+@@ -438,6 +540,8 @@
              if program is None:
                  return False
              program.lifecycle = ProgramLifecycle.TERMINATED
