@@ -156,19 +156,25 @@ per-shard asymmetry when transfers pile up).
 ## 5. Phasing and validation gates
 
 ```
-Phase 1 (minimal loop):  R1 + D1  →  F1 + F2  →  D2 + D3 + R2  →  R4
-  GATE: rerun mem-util 0.25 ±FlexKV (C256, r16, timeout 7200)
+Phase 1 (minimal loop, DONE 2026-08-14 mechanism-level):
+  R1 + D1(staged) + F1 + D2/D3 via direct IPC — shared mode only
+  (private mode has no KVServer process; see proposal §2)
+  GATE (running): 0.25 shared ±pin (k8pin25sp/k8pin25s, C256, r16)
         pass = pin hit rate 16% → ~100%
-               AND 0.25+FlexKV wall << 6h33m (recompute share of the
-               pause/resume cycle replaced by DMA)
+               AND wall clearly below the no-pin shared baseline
 
-Phase 2:  D4 + F3 + F4 (invalidation merged with rl_kv_clear)
+Phase 2 (next):  D4 dual ledger + F3 pinned quota + F4 invalidation
+  (merged with rl_kv_clear; interface review is the entry ticket)
   GATE: long-trajectory probe (max_model_len 131072, max_turns 100,
-        8×8 rollouts, C32, ±FlexKV) — pause's native regime
+        8×8 rollouts, C32, ±pin) — pause's native regime
 
-Phase 3:  D5 + resume prefetch + DMA pacing
+Phase 3:  D5 CPU-aware victim + resume prefetch + DMA pacing
   GATE: batch-resume stress (many victims resumed same tick), no GET bubbles /
         per-shard asymmetry regression
+
+Deferred (graduation, de-prioritized 2026-08-14): R2 worker-extension RPC —
+  required only to bring pinning to private per-shard topology / multi-node.
+  All Phase 2/3 development and validation proceed on shared-mode arms.
 ```
 
 ## 6. Risks / open questions
