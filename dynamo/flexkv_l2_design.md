@@ -1,6 +1,6 @@
 # ThunderAgent × FlexKV L2: Victim Pinning Design
 
-Status: **draft — implementation tracking document**
+Status: **Phase-1 gate closed 2026-08-15 (mechanism pass, redirect to §3.6) — Phase 2 active**
 Branch: `feat/thunderagent-flexkv-l2`
 Owners: hou2lin
 Last updated: 2026-08-13
@@ -229,5 +229,19 @@ Deferred (graduation, de-prioritized 2026-08-14): R2 worker-extension RPC —
 | 0.25 TA+FlexKV    | 6h55m | 38.1% | 3 | ×4.9 | 3.99M (0.9%) |
 | 0.25 sticky       | 14h03m | 6.1% | 263 | ×93.9 | — |
 
-Full data: `results/phase1/` bundles (k8mu*/k8smu*), PHASE_B_REPORT.md Phase G/H
-sections, and the interactive summary (`phase1_visual_summary.html`, §🔧).
+Phase-1 gate arms (0.25 shared, C256, r16; measured 2026-08-14..15):
+
+| arm | wall | GPU hit | reprocess | needs-L2 catch | FlexKV hit (trace) |
+|---|---|---|---|---|---|
+| k8pin25sr2 (shared, no pin) | 6h46m | 35.8% | ×5.2 | 3.2% | 11.40M |
+| k8pin25sp (shared, **pin**) | 6h36m | 37.0% | ×4.7 | **4.8%** | 13.33M |
+
+Gate verdict: mechanism **pass** (1,697/1,697 pins locked, lifecycle exact),
+direction **pass** (+50% relative catch, +65% big hits), wall **not significant**
+(−2.5%, within ±8% variance) — consistent with the §3.6 finding that pause
+victims are ~8% of context loss. Phase 2 (active-set pinning, Gate A
+catch > 50%) is the continuation.
+
+Full data: `results/phase1/` bundles (k8mu*/k8smu*/k8pin*), PHASE_B_REPORT.md
+Phase G/H/I sections, and the interactive summary
+(`phase1_visual_summary.html`, §🔧).
