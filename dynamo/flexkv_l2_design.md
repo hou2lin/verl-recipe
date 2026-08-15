@@ -122,6 +122,30 @@ already fully resident in the pinned region restores at DMA cost
 Batch-resume needs DMA pacing (the sticky+fkv arms showed GET bubbles and
 per-shard asymmetry when transfers pile up).
 
+### 3.6 Active-set pinning (Phase-2 redirect, from the Phase-1 gate data)
+
+The Phase-1 gate arms falsified the design's implicit assumption. Formal-metric
+comparison at pool ratio 0.25 (shared topology, C256, r16):
+
+| "needs-L2" requests (prompt ≥4k, GPU match < 50%) | +pin | no-pin |
+|---|---|---|
+| count | 21,115 | 21,594 |
+| caught by CPU tier | 1,006 (**4.8%**) | 551 (2.6%) |
+
+Victim pinning works (relative catch rate +85%, big hits +65%) but **pause
+victims are only ~8% of context loss** (1,697 pins vs 21k reconstruction
+events): the dominant loss channel at deep pool starvation is ordinary
+inter-turn eviction of ACTIVE trajectories, whose write-behind copies die in
+the CPU pool's minute-scale LRU turnover just like victims did.
+
+**Redirect: protect the whole active set, not just pause victims.** The pin
+trigger moves from `_pause_acting_locked` to admission/each-turn PUT (pin the
+trajectory's path on every completed turn; unpin unchanged at `end_program`).
+The active set's context (~3.3M tokens at 0.25/C256) exceeds the CPU pool
+(~2M node-wide), so the quota ledger (F3/D4) is promoted from safety feature
+to core mechanism: it decides *who* gets protection (candidate policy:
+deepest-context first — the c² recompute gradient).
+
 ## 4. Work breakdown
 
 ### FlexKV (prerequisite capabilities)
@@ -163,10 +187,13 @@ Phase 1 (minimal loop, DONE 2026-08-14 mechanism-level):
         pass = pin hit rate 16% → ~100%
                AND wall clearly below the no-pin shared baseline
 
-Phase 2 (next):  D4 dual ledger + F3 pinned quota + F4 invalidation
-  (merged with rl_kv_clear; interface review is the entry ticket)
-  GATE: long-trajectory probe (max_model_len 131072, max_turns 100,
-        8×8 rollouts, C32, ±pin) — pause's native regime
+Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
+  each-turn PUT) + F3 quota as the protection selector + D4 dual ledger +
+  F4 invalidation (merged with rl_kv_clear; interface review is the ticket)
+  GATE A: rerun 0.25 shared ±active-pin — needs-L2 catch rate 4.8% → >50%
+          AND wall clearly below the no-pin shared baseline
+  GATE B: long-trajectory probe (max_model_len 131072, max_turns 100,
+          8×8 rollouts, C32, ±pin) — pause's native regime
 
 Phase 3:  D5 CPU-aware victim + resume prefetch + DMA pacing
   GATE: batch-resume stress (many victims resumed same tick), no GET bubbles /
