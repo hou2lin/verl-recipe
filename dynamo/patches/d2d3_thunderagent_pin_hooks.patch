@@ -13,7 +13,7 @@
          if decision.priority_jump != 0.0:
 --- a/components/src/dynamo/thunderagent_router/router.py
 +++ b/components/src/dynamo/thunderagent_router/router.py
-@@ -66,6 +66,12 @@
+@@ -66,6 +66,16 @@
          self._lock = asyncio.Lock()
          self._scheduler_task: Optional[asyncio.Task] = None
          self._stat_forced_resumes = 0
@@ -21,12 +21,16 @@
 +        # cached per program so a pause can pin the victim's CPU radix path
 +        # by content; endpoints are discovered from the FlexKV IPC sockets.
 +        self._pin_enabled = os.environ.get("THUNDERAGENT_FLEXKV_PIN", "0") == "1"
++        # active mode pins every program on each completed turn (rolling
++        # protection of the whole active set); victim mode pins only on
++        # pause (Phase-1 behavior). See flexkv_l2_design.md section 3.6.
++        self._pin_mode = os.environ.get("THUNDERAGENT_FLEXKV_PIN_MODE", "victim")
 +        self._prompt_tokens: dict = {}
 +        self._pin_endpoints: Optional[list] = None
  
      def start(self) -> None:
          if self._scheduler_task is not None:
-@@ -75,6 +81,10 @@
+@@ -75,6 +85,10 @@
                  "ThunderAgent STICKY-ONLY mode: capacity admission and "
                  "pause/demote/resume disabled; per-program pin retained"
              )
@@ -37,11 +41,10 @@
          self._scheduler_task = asyncio.create_task(self._scheduler_loop())
          logger.info(
              "ThunderAgent scheduler started (interval=%ss, pause=%.2f, soft=%.2f)",
-@@ -193,7 +203,98 @@
-             program.token_total,
+@@ -194,6 +208,97 @@
          )
          return program.waiting, True
-+
+ 
 +    def record_prompt_tokens(self, program_id: str, token_ids) -> None:
 +        """Remember the latest prompt so a pause can pin it by content.
 +
@@ -88,7 +91,7 @@
 +            loop.run_in_executor(None, self._send_pin, program_id, tokens, unpin)
 +        except Exception:
 +            logger.exception("flexkv pin dispatch failed (non-fatal)")
- 
++
 +    def _send_pin(self, program_id: str, tokens, unpin: bool) -> None:
 +        # Executor thread: blocking IPC is fine here. Broadcast to every
 +        # FlexKV server on this node; non-owning servers simply match nothing.
@@ -136,7 +139,19 @@
      def record_output_tokens(self, program_id: str, delta_tokens: int) -> None:
          # No-await fast path on the streaming chunk loop. Safe because the
          # event loop is single-task; the scheduler tick tolerates a stale
-@@ -423,6 +524,7 @@
+@@ -215,6 +320,11 @@
+             )
+             if program is None:
+                 return
++            if self._pin_mode == "active":
++                # Rolling active-set protection: re-pin this program's
++                # latest path each turn (idempotent server-side; the
++                # quota selector decides who actually stays pinned).
++                self._fire_pin(program_id, unpin=False)
+             if program.marked_for_pause:
+                 program.marked_for_pause = False
+                 do_pause = True
+@@ -423,6 +533,7 @@
          else:
              program.waiting.clear()
          self._table.paused[program_id] = None
@@ -144,7 +159,7 @@
          logger.debug("Paused program %s (tokens=%d)", program_id, program.token_total)
          return True
  
-@@ -438,6 +540,8 @@
+@@ -438,6 +549,8 @@
              if program is None:
                  return False
              program.lifecycle = ProgramLifecycle.TERMINATED

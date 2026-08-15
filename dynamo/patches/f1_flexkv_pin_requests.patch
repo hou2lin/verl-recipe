@@ -46,7 +46,7 @@
              PrefetchRequest: self._handle_prefetch_request,
              WaitRequest: self._handle_wait_request,
              LaunchTaskRequest: self._handle_launch_task_request,
-@@ -453,7 +457,63 @@
+@@ -453,7 +457,97 @@
                              task_id=req_id, mask=mask)
          result_zmq = self.client_manager.get_zmq(req.dp_client_id)
          result_zmq.send_pyobj(response)
@@ -60,7 +60,16 @@
 +        """
 +        self.kv_task_engine._update_tasks(timeout=0)
 +        if not hasattr(self, "_pin_table"):
-+            self._pin_table = {}
++            self._pin_table = {}   # pin_id -> (node, blocks)
++            try:
++                ratio = float(os.environ.get("FLEXKV_PINNED_QUOTA_RATIO", "0.5"))
++            except ValueError:
++                ratio = 0.5
++            total_cpu_blocks = getattr(
++                getattr(self.kv_task_engine.cache_engine, "cache_config", None),
++                "num_cpu_blocks", 0) or 0
++            self._pin_quota_blocks = int(total_cpu_blocks * ratio) if total_cpu_blocks else 0
++            self._pinned_blocks_total = 0
 +        try:
 +            import numpy as _np
 +            from flexkv.common.block import SequenceMeta
@@ -79,15 +88,37 @@
 +            node = getattr(result, "last_node", None)
 +            if node is None:
 +                raise ValueError(f"match result {type(result).__name__} has no last_node")
++            blocks = max(int(aligned / tokens_per_block), 1)
 +            prev = self._pin_table.pop(req.pin_id, None)
 +            if prev is not None:
-+                engine.unlock(prev)
++                engine.unlock(prev[0])
++                self._pinned_blocks_total -= prev[1]
++            # Quota selector (deepest-context-first): evict shallower pins to
++            # make room; reject if this pin is shallower than everything held.
++            while (self._pin_quota_blocks
++                   and self._pinned_blocks_total + blocks > self._pin_quota_blocks
++                   and self._pin_table):
++                shallow_id = min(self._pin_table, key=lambda k: self._pin_table[k][1])
++                if self._pin_table[shallow_id][1] >= blocks:
++                    break
++                s_node, s_blocks = self._pin_table.pop(shallow_id)
++                engine.unlock(s_node)
++                self._pinned_blocks_total -= s_blocks
++                flexkv_logger.info(f"[PIN] displaced pin_id={shallow_id} blocks={s_blocks}")
++            if (self._pin_quota_blocks
++                    and self._pinned_blocks_total + blocks > self._pin_quota_blocks):
++                flexkv_logger.info(
++                    f"[PIN] rejected pin_id={req.pin_id} blocks={blocks} "
++                    f"(quota {self._pinned_blocks_total}/{self._pin_quota_blocks})"
++                )
++                return
 +            engine.lock_node(node)
-+            self._pin_table[req.pin_id] = node
++            self._pin_table[req.pin_id] = (node, blocks)
++            self._pinned_blocks_total += blocks
 +            flexkv_logger.info(
-+                f"[PIN] pinned pin_id={req.pin_id} matched_blocks="
-+                f"{getattr(result, 'last_node_matched_length', -1)} "
-+                f"pinned_total={len(self._pin_table)}"
++                f"[PIN] pinned pin_id={req.pin_id} blocks={blocks} "
++                f"pinned_total={len(self._pin_table)} "
++                f"pinned_blocks={self._pinned_blocks_total}/{self._pin_quota_blocks}"
 +            )
 +        except Exception as e:
 +            flexkv_logger.warning(f"[PIN] pin pin_id={req.pin_id} failed: {e}")
@@ -95,12 +126,15 @@
 +    def _handle_unpin_request(self, req: UnpinRequest) -> None:
 +        """Release a pin. Idempotent; unknown pin ids are a no-op."""
 +        if not hasattr(self, "_pin_table"):
-+            self._pin_table = {}
-+        node = self._pin_table.pop(req.pin_id, None)
-+        if node is None:
++            return
++        entry = self._pin_table.pop(req.pin_id, None)
++        if entry is None:
 +            return
 +        try:
++            node, blocks = entry
 +            self.kv_task_engine.cache_engine.cpu_cache_engine.unlock(node)
++            self._pinned_blocks_total = max(
++                0, getattr(self, "_pinned_blocks_total", 0) - blocks)
 +            flexkv_logger.info(
 +                f"[PIN] unpinned pin_id={req.pin_id} pinned_total={len(self._pin_table)}"
 +            )
