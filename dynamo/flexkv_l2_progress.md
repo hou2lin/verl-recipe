@@ -24,7 +24,7 @@ evening — two arms running.**
 | item | status | evidence |
 |---|---|---|
 | R1 publish FlexKV capacity → MDC | ✅ done | 8 unit tests; live log `host_total_tokens=1048576 kv_bytes_per_token=98304` (matches capacity audit) twice on-machine |
-| D1 router ledger credits host tokens | ✅ staged, **never activated** | patch in `patches/`; gated by `DYN_THUNDERAGENT_FLEXKV_L2` (kept off — activation is bound to a working pin story per design §2) |
+| D1 router ledger credits host tokens | ✅ staged, **never activated** → 🔥 **activation unblocked, promoted** | patch in `patches/`; gated by `DYN_THUNDERAGENT_FLEXKV_L2` (kept off — activation is bound to a working pin story per design §2). **2026-08-16: precondition met** — Gate A proved the pin story works. D1 is the missing link for the 0.25 starvation regime: admission accounts GPU-only capacity → running ≈ 5; crediting host tokens lifts running, converting saved recompute from idle FLOPs into throughput. Plan: **Gate A′ admission-relaxation arm** (0.25 + `DYN_THUNDERAGENT_FLEXKV_L2=1` + active pin, expanded pool) right after Gate B. Risk to measure: full credit widens admission ~9× — if L2 catch can't absorb the extra eviction storm, wall may regress; may need a partial-credit ratio knob |
 | F1 Pin/Unpin messages + KVServer handlers | ✅ done (shared mode) | pinsmk8: 341/341 pinned, unpin balanced |
 | D2/D3 router hooks (victim mode) | ✅ done | Phase-1 gate arms |
 | Phase-1 gate (0.25 shared ±pin) | ✅ closed | catch 3.2→4.8%, wall 6h46m→6h36m (±variance); pause victims are only ~8% of context loss → §3.6 redirect |
@@ -39,7 +39,7 @@ evening — two arms running.**
 | Gate A run 2 (shm 384Gi, pool 336GB ≈ 3.5M tok, quota 0.9) | ✅ | GPU hit **44.6%**, reprocess **×3.6**, FlexKV hit **17.81M**, catch **7.2%** — wall 6h50m (unchanged) |
 | D4 dual ledger (router-side) | ⏳ not started | server-side quota currently carries the selector role |
 | F2 put_sync forced spill | ⏳ deferred | revival candidate (Phase-1 analysis: PUT-lands-late gap), pending Gate B |
-| F4 invalidation merged with rl_kv_clear | 🚧 blocked | needs interface review with the rl_kv_clear owner (proposal §5 is the agenda) |
+| F4 invalidation merged with rl_kv_clear | 💤 deferred until training | not needed on the current gate line: all gate experiments are rollout-only (`PHASE1_STEPS=0`), weights never update, so `rl_kv_clear` never fires and pinned KV never goes stale. Becomes a **correctness requirement** (stale-weight KV hits = wrong outputs) the moment multi-step RL runs — mandatory before any PR. Interface review folds into PR prep (proposal §5 is the agenda) |
 
 ### Gate A verdict (2026-08-16) — the structural finding
 
