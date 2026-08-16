@@ -4,8 +4,8 @@ Companion to `flexkv_l2_design.md` (the plan) — this file records where we
 actually are. Update on every gate decision or item status change.
 
 **Current position (2026-08-16): Phase 2 mechanism complete; Gate A closed
-with a structural finding; Gate B (long-trajectory probe) is the next and
-decisive step.**
+with a structural finding; Gate B (long-trajectory probe) launched 08-16
+evening — two arms running.**
 
 ## Phase status at a glance
 
@@ -13,7 +13,7 @@ decisive step.**
 |---|---|---|
 | Phase 1 — victim pinning minimal loop | ✅ **CLOSED** (2026-08-15) | Mechanism pass (1,697/1,697 pins), direction pass (+50% catch), wall not significant → redirected to §3.6 |
 | Phase 2 — active-set pinning + quota | 🔶 **Mechanism DONE, Gate A closed with structural finding** (2026-08-16) | All mechanism metrics improve monotonically; wall is insensitive because recompute is off the critical path in the starvation regime — see "Gate A verdict" below |
-| Gate B — long-trajectory probe | ⏳ **NEXT (decisive)** | max_model_len 131072, max_turns 100, 8×8, C32, ±pin |
+| Gate B — long-trajectory probe | 🚀 **LAUNCHED 2026-08-16** (decisive) | max_model_len 131072 (4k prompt + 124k response), max_turns 100, p32×r2 = 64 traj, C32, mem-util 0.68, shared FlexKV 336 GB; arms: `k8gbo` (no pin) → `k8gbp` (active pin, quota 0.9); pod-side sequential chain (survives local cert expiry) |
 | Phase 3 — CPU-aware victim / prefetch / DMA pacing | ⏳ not started | — |
 | R2 — private-mode / multi-node channel | 💤 deferred (user decision 2026-08-15) | — |
 
@@ -79,3 +79,4 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
 | 08-14 | 8 smoke iterations → end-to-end pin confirmed (shared mode); Phase-1 gate arms launched |
 | 08-15 | Phase-1 gate closed; §3.6 redirect; active-set + quota implemented and smoked |
 | 08-16 | Gate A both runs closed; structural finding recorded; Gate B is next |
+| 08-16 (evening) | Gate B launched: `k8gbo`/`k8gbp` two-arm pod-side chain (131k ctx, 100 turns, 64 traj, C32) |
