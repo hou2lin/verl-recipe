@@ -3,10 +3,12 @@
 Companion to `flexkv_l2_design.md` (the plan) — this file records where we
 actually are. Update on every gate decision or item status change.
 
-**Current position (2026-08-16 late evening): three-arm chain running —
-Gate A′ (`k8ad1`, D1 admission-relaxation) first, then Gate B both arms
-(`k8gbo`/`k8gbp`). Gate B had a false start (launcher OOM, fixed); user
-re-prioritized A′ ahead of B.**
+**Current position (2026-08-16 late evening): three-arm chain on its third
+launch (18:37Z) — Gate A′ (`k8ad1`, D1 admission-relaxation) first, then Gate
+B both arms (`k8gbo`/`k8gbp`). Launch 1 died on launcher OOM (batched-tokens
+coupling); launch 2 died on an upstream FlexKV KVServer pre-start race (fixed
+in the F1 patch). Launch-2 side effect: both Gate B arms completed full
+rollouts with FlexKV silently no-op — preserved as bare-131k reference data.**
 
 ## Phase status at a glance
 
@@ -77,6 +79,14 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
   env-decoupled (`PHASE1_MAX_NUM_BATCHED_TOKENS`), long-context arms pin 32768
 - preflight kill is now a retry loop (6×5s) — kill -9 → GPU memory release
   takes seconds; the old single-shot check false-FATALed the next arm
+- **upstream KVServer pre-start race** (latent, bites shared mode): strict
+  first-message state machine crashes on early `IsReadyRequest` polls; ~10
+  prior arms won the coin flip, then two launches in a row lost it. Fixed in
+  the F1 patch (pre-start polls answered `is_ready=False`). Two failure
+  shapes from one bug: engine shards hang → 1800s frontend timeout (k8ad1),
+  or connector fail-opens → whole arm runs with FlexKV silently disabled
+  (k8gbo/k8gbp). The launcher's join-rate≥0 validation (exit 8) is what
+  caught the silent shape — keep it
 
 ## Timeline
 
@@ -89,3 +99,4 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
 | 08-16 (evening) | Gate B launched: `k8gbo`/`k8gbp` two-arm pod-side chain (131k ctx, 100 turns, 64 traj, C32) |
 | 08-16 (evening) | Gate B false start: `max_num_batched_tokens`=tok OOM at weight transfer; launcher env-decoupled, preflight kill-loop hardened |
 | 08-16 (late) | Re-prioritized per user: **Gate A′ first** — 3-arm chain `k8ad1` → `k8gbo` → `k8gbp` launched 15:41Z; D1 activated for the first time (`DYN_THUNDERAGENT_FLEXKV_L2=1`) |
+| 08-16 (night) | Chain launch 2 all-failed on the upstream KVServer pre-start race (k8ad1: shards hung 1800s; k8gbo/k8gbp: FlexKV silent no-op, full bare rollouts preserved as 131k reference — 2,744 turns in ~50 min). Race fixed in F1 patch; chain launch 3 at 18:37Z |

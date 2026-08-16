@@ -153,7 +153,7 @@ deepest-context first — the c² recompute gradient).
 
 | id | item | notes |
 |---|---|---|
-| F1 | `pin(session)/unpin(session)` API + IPC messages | needs block→session ownership index; tag on the existing PUT path |
+| F1 | `pin(session)/unpin(session)` API + IPC messages | needs block→session ownership index; tag on the existing PUT path. Patch also fixes an **upstream KVServer pre-start race**: readiness polls (`IsReadyRequest`) arriving before the `StartRequest` crashed the server (strict first-message state machine) — shared multi-client mode makes this a coin flip per launch; now answered with `is_ready=False` |
 | F2 | `put_sync(session)` forced spill | idempotent via block-hash dedup |
 | F3 | pinned quota partition + `pinned_bytes/sessions` metrics | see §3.3 |
 | F4 | reset covers pinned region | **coordinate with `feat/rl_kv_clear_multishard` first** |

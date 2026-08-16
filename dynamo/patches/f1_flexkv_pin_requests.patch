@@ -1,6 +1,8 @@
+diff --git a/flexkv/server/request.py b/flexkv/server/request.py
+index 8508aa6..c31d4f3 100644
 --- a/flexkv/server/request.py
 +++ b/flexkv/server/request.py
-@@ -145,3 +145,25 @@
+@@ -140,3 +140,25 @@ class ShutdownRequest:
  @dataclass
  class CheckRunningRequest:
      dp_client_id: int
@@ -9,8 +11,8 @@
 +class PinRequest:
 +    """Pin the CPU radix path matching token_ids against eviction.
 +
-+    Victim-pinning (ThunderAgent L2 design): sent by the TA router when it
-+    pauses a program so the write-behind CPU copy survives until resume.
++    Victim/active-set pinning (ThunderAgent L2 design): sent by the TA router
++    so the write-behind CPU copy survives until it is read back.
 +    Fire-and-forget (no response), like PutRequest.
 +    """
 +    dp_client_id: int
@@ -26,9 +28,11 @@
 +    dp_client_id: int
 +    pin_id: str
 +    task_id: int = -1
+diff --git a/flexkv/server/server.py b/flexkv/server/server.py
+index 34987e2..768bb70 100644
 --- a/flexkv/server/server.py
 +++ b/flexkv/server/server.py
-@@ -26,6 +26,8 @@
+@@ -26,6 +26,8 @@ from flexkv.server.request import (
      RegisterTPClientRequest,
      IsReadyRequest,
      PutRequest,
@@ -37,7 +41,7 @@
      GetRequest,
      PutMatchRequest,
      GetMatchRequest,
-@@ -196,6 +198,8 @@
+@@ -195,6 +197,8 @@ class KVServer:
              PutRequest: self._handle_put_request,
              GetMatchRequest: self._handle_get_match_request,
              PutMatchRequest: self._handle_put_match_request,
@@ -46,17 +50,51 @@
              PrefetchRequest: self._handle_prefetch_request,
              WaitRequest: self._handle_wait_request,
              LaunchTaskRequest: self._handle_launch_task_request,
-@@ -453,7 +457,97 @@
-                             task_id=req_id, mask=mask)
+@@ -298,13 +302,26 @@ class KVServer:
+         # TODO: handle error and return error response
+         # TODO: support check finish
+         flexkv_logger.info("Servering waiting to be started")
+-        req = self.recv_from_client.recv_pyobj()
+-        if isinstance(req, StartRequest):
+-            flexkv_logger.info(f"Received start request from DP client "
+-                               f"(dp_client_id={req.dp_client_id}), "
+-                               f"Starting server...")
+-            self.start_server()
+-        else:
++        while True:
++            req = self.recv_from_client.recv_pyobj()
++            if isinstance(req, StartRequest):
++                flexkv_logger.info(f"Received start request from DP client "
++                                   f"(dp_client_id={req.dp_client_id}), "
++                                   f"Starting server...")
++                self.start_server()
++                break
++            if isinstance(req, IsReadyRequest):
++                # Readiness polls race ahead of the start request in shared
++                # multi-client mode; answer not-ready instead of dying.
++                flexkv_logger.info(f"pre-start IsReady poll from DP client "
++                                   f"(dp_client_id={req.dp_client_id}); not ready yet")
++                try:
++                    result_zmq = self.client_manager.get_zmq(req.dp_client_id)
++                    result_zmq.send_pyobj(Response(dp_client_id=req.dp_client_id,
++                                                   is_ready=False))
++                except Exception as exc:
++                    flexkv_logger.warning(f"pre-start IsReady reply failed: {exc}")
++                continue
+             raise TypeError(f"Received RequestType: {type(req)} from DP client "
+                             f"dp_client_id={req.dp_client_id} before the start request")
+         self._running = True
+@@ -426,6 +443,97 @@ class KVServer:
          result_zmq = self.client_manager.get_zmq(req.dp_client_id)
          result_zmq.send_pyobj(response)
-+
+ 
 +    def _handle_pin_request(self, req: PinRequest) -> None:
-+        """Pin the CPU radix path matching token_ids (victim-pinning, L2 design).
++        """Pin the CPU radix path matching token_ids (L2 design, active-set).
 +
 +        Locks the deepest matched node; ancestors become un-evictable because
-+        eviction only consumes leaves. Fire-and-forget: failures degrade to
-+        today's unprotected behavior and are logged, never raised.
++        eviction only consumes leaves. A quota with a deepest-context-first
++        selector decides who stays pinned. Failures log and degrade to
++        today's unprotected behavior, never raise.
 +        """
 +        self.kv_task_engine._update_tasks(timeout=0)
 +        if not hasattr(self, "_pin_table"):
@@ -93,8 +131,8 @@
 +            if prev is not None:
 +                engine.unlock(prev[0])
 +                self._pinned_blocks_total -= prev[1]
-+            # Quota selector (deepest-context-first): evict shallower pins to
-+            # make room; reject if this pin is shallower than everything held.
++            # Quota selector (deepest-context-first): displace shallower pins;
++            # reject if this pin is shallower than everything held.
 +            while (self._pin_quota_blocks
 +                   and self._pinned_blocks_total + blocks > self._pin_quota_blocks
 +                   and self._pin_table):
@@ -122,7 +160,7 @@
 +            )
 +        except Exception as e:
 +            flexkv_logger.warning(f"[PIN] pin pin_id={req.pin_id} failed: {e}")
- 
++
 +    def _handle_unpin_request(self, req: UnpinRequest) -> None:
 +        """Release a pin. Idempotent; unknown pin ids are a no-op."""
 +        if not hasattr(self, "_pin_table"):
