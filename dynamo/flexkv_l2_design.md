@@ -1,6 +1,6 @@
 # ThunderAgent × FlexKV L2: Victim Pinning Design
 
-Status: **Phase-2 mechanism complete; Gate A closed 2026-08-16 (structural finding) — Gate B next.**
+Status: **Phase-2 mechanism complete; Gate A closed 2026-08-16 (structural finding) — Gate A′ (D1 admission-relaxation) running, Gate B queued behind it on the same chain.**
 Progress tracker: `flexkv_l2_progress.md`
 Branch: `feat/thunderagent-flexkv-l2`
 Owners: hou2lin
@@ -193,8 +193,24 @@ Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
   F4 invalidation (merged with rl_kv_clear; interface review is the ticket)
   GATE A: rerun 0.25 shared ±active-pin — needs-L2 catch rate 4.8% → >50%
           AND wall clearly below the no-pin shared baseline
+          [closed 2026-08-16: every mechanism metric improves monotonically
+           (GPU hit 35.8→44.6%, reprocess ×5.2→×3.6, catch 3.2→7.2%) but wall
+           is flat — structural: at 0.25 admission caps running ≈ 5, recompute
+           is paid from idle FLOPs. See the progress tracker for the verdict.]
+  GATE A′ (added 2026-08-16 from the Gate A finding): D1 admission-relaxation —
+          same 0.25/C256/r16 shared arm + active pin (quota 0.9) +
+          DYN_THUNDERAGENT_FLEXKV_L2=1: the capacity ledger credits FlexKV
+          host tokens (~+1.8M/shard vs ~0.45M GPU ⇒ admission widens ~5×),
+          lifting running off ~5 so saved recompute becomes throughput.
+          pass = wall clearly below the 0.25 6h4x band while completion stays
+          clean. fail-mode to watch: eviction storm outruns L2 catch and wall
+          regresses → add a partial-credit ratio knob and re-run.
   GATE B: long-trajectory probe (max_model_len 131072, max_turns 100,
-          8×8 rollouts, C32, ±pin) — pause's native regime
+          p32×r2 = 64 trajectories, C32, ±pin) — pause's native regime.
+          [false start 2026-08-16: launcher bound max_num_batched_tokens to
+           tok=131k → engine profile grew ~4 GiB → colocated weight-transfer
+           all-gather OOM. Fixed: PHASE1_MAX_NUM_BATCHED_TOKENS env, pinned
+           32768 (chunked prefill splits 131k prompts). Re-queued behind A′.]
 
 Phase 3:  D5 CPU-aware victim + resume prefetch + DMA pacing
   GATE: batch-resume stress (many victims resumed same tick), no GET bubbles /

@@ -3,9 +3,10 @@
 Companion to `flexkv_l2_design.md` (the plan) — this file records where we
 actually are. Update on every gate decision or item status change.
 
-**Current position (2026-08-16): Phase 2 mechanism complete; Gate A closed
-with a structural finding; Gate B (long-trajectory probe) launched 08-16
-evening — two arms running.**
+**Current position (2026-08-16 late evening): three-arm chain running —
+Gate A′ (`k8ad1`, D1 admission-relaxation) first, then Gate B both arms
+(`k8gbo`/`k8gbp`). Gate B had a false start (launcher OOM, fixed); user
+re-prioritized A′ ahead of B.**
 
 ## Phase status at a glance
 
@@ -13,7 +14,8 @@ evening — two arms running.**
 |---|---|---|
 | Phase 1 — victim pinning minimal loop | ✅ **CLOSED** (2026-08-15) | Mechanism pass (1,697/1,697 pins), direction pass (+50% catch), wall not significant → redirected to §3.6 |
 | Phase 2 — active-set pinning + quota | 🔶 **Mechanism DONE, Gate A closed with structural finding** (2026-08-16) | All mechanism metrics improve monotonically; wall is insensitive because recompute is off the critical path in the starvation regime — see "Gate A verdict" below |
-| Gate B — long-trajectory probe | 🚀 **LAUNCHED 2026-08-16** (decisive) | max_model_len 131072 (4k prompt + 124k response), max_turns 100, p32×r2 = 64 traj, C32, mem-util 0.68, shared FlexKV 336 GB; arms: `k8gbo` (no pin) → `k8gbp` (active pin, quota 0.9); pod-side sequential chain (survives local cert expiry) |
+| Gate A′ — D1 admission-relaxation | 🚀 **LAUNCHED 2026-08-16 (runs first)** | `k8ad1`: 0.25/C256/r16 shared 336 GB + active pin q0.9 + `DYN_THUNDERAGENT_FLEXKV_L2=1` (capacity credits host tokens, admission widens ~5×/shard). Pass = wall clearly below the 6h4x band. Tests whether Gate A's mechanism gains convert to wall time once running lifts off ~5 |
+| Gate B — long-trajectory probe | 🚀 queued on same chain (after A′) | max_model_len 131072 (4k prompt + 124k response), max_turns 100, p32×r2 = 64 traj, C32, mem-util 0.68, shared FlexKV 336 GB; arms: `k8gbo` (no pin) → `k8gbp` (active pin, quota 0.9). **False start 08-16**: launcher bound `max_num_batched_tokens` to tok=131k → engine +4 GiB → weight-transfer all-gather OOM (2 GiB ask, 1.74 free); fixed via `PHASE1_MAX_NUM_BATCHED_TOKENS=32768` |
 | Phase 3 — CPU-aware victim / prefetch / DMA pacing | ⏳ not started | — |
 | R2 — private-mode / multi-node channel | 💤 deferred (user decision 2026-08-15) | — |
 
@@ -24,7 +26,7 @@ evening — two arms running.**
 | item | status | evidence |
 |---|---|---|
 | R1 publish FlexKV capacity → MDC | ✅ done | 8 unit tests; live log `host_total_tokens=1048576 kv_bytes_per_token=98304` (matches capacity audit) twice on-machine |
-| D1 router ledger credits host tokens | ✅ staged, **never activated** → 🔥 **activation unblocked, promoted** | patch in `patches/`; gated by `DYN_THUNDERAGENT_FLEXKV_L2` (kept off — activation is bound to a working pin story per design §2). **2026-08-16: precondition met** — Gate A proved the pin story works. D1 is the missing link for the 0.25 starvation regime: admission accounts GPU-only capacity → running ≈ 5; crediting host tokens lifts running, converting saved recompute from idle FLOPs into throughput. Plan: **Gate A′ admission-relaxation arm** (0.25 + `DYN_THUNDERAGENT_FLEXKV_L2=1` + active pin, expanded pool) right after Gate B. Risk to measure: full credit widens admission ~9× — if L2 catch can't absorb the extra eviction storm, wall may regress; may need a partial-credit ratio knob |
+| D1 router ledger credits host tokens | ✅ **ACTIVATED 2026-08-16** (`k8ad1`, Gate A′) | patch in `patches/`; gate `DYN_THUNDERAGENT_FLEXKV_L2` was kept off until the pin story worked (design §2); Gate A met that precondition. D1 is the missing link for the 0.25 starvation regime: admission accounts GPU-only capacity → running ≈ 5; crediting host tokens (~+1.8M/shard) widens admission ~5×, converting saved recompute from idle FLOPs into throughput. Risk under measure in Gate A′: if L2 catch can't absorb the wider eviction storm, wall regresses → add a partial-credit ratio knob |
 | F1 Pin/Unpin messages + KVServer handlers | ✅ done (shared mode) | pinsmk8: 341/341 pinned, unpin balanced |
 | D2/D3 router hooks (victim mode) | ✅ done | Phase-1 gate arms |
 | Phase-1 gate (0.25 shared ±pin) | ✅ closed | catch 3.2→4.8%, wall 6h46m→6h36m (±variance); pause victims are only ~8% of context loss → §3.6 redirect |
@@ -70,6 +72,11 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
   (lineage mismatch burned one arm)
 - private per-shard mode has **no KVServer process** — direct-IPC pin path is
   shared-mode only; private needs R2
+- launcher previously bound `max_num_batched_tokens` to `tok` — at 131k this
+  grows the engine ~4 GiB and OOMs the colocated weight transfer; now
+  env-decoupled (`PHASE1_MAX_NUM_BATCHED_TOKENS`), long-context arms pin 32768
+- preflight kill is now a retry loop (6×5s) — kill -9 → GPU memory release
+  takes seconds; the old single-shot check false-FATALed the next arm
 
 ## Timeline
 
@@ -80,3 +87,5 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
 | 08-15 | Phase-1 gate closed; §3.6 redirect; active-set + quota implemented and smoked |
 | 08-16 | Gate A both runs closed; structural finding recorded; Gate B is next |
 | 08-16 (evening) | Gate B launched: `k8gbo`/`k8gbp` two-arm pod-side chain (131k ctx, 100 turns, 64 traj, C32) |
+| 08-16 (evening) | Gate B false start: `max_num_batched_tokens`=tok OOM at weight transfer; launcher env-decoupled, preflight kill-loop hardened |
+| 08-16 (late) | Re-prioritized per user: **Gate A′ first** — 3-arm chain `k8ad1` → `k8gbo` → `k8gbp` launched 15:41Z; D1 activated for the first time (`DYN_THUNDERAGENT_FLEXKV_L2=1`) |
