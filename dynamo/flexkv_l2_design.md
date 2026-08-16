@@ -1,6 +1,7 @@
 # ThunderAgent × FlexKV L2: Victim Pinning Design
 
-Status: **Phase-1 gate closed 2026-08-15 (mechanism pass, redirect to §3.6) — Phase 2 active**
+Status: **Phase-2 mechanism complete; Gate A closed 2026-08-16 (structural finding) — Gate B next.**
+Progress tracker: `flexkv_l2_progress.md`
 Branch: `feat/thunderagent-flexkv-l2`
 Owners: hou2lin
 Last updated: 2026-08-13
