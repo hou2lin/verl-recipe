@@ -255,6 +255,17 @@ Phase 3:  D5 CPU-aware victim + resume prefetch + DMA pacing
 Deferred (graduation, de-prioritized 2026-08-14): R2 worker-extension RPC —
   required only to bring pinning to private per-shard topology / multi-node.
   All Phase 2/3 development and validation proceed on shared-mode arms.
+
+Upstream alignment note (2026-08-17): ai-dynamo is productizing admission as
+  a Rust policy framework — #11434 (merged; PolicyClassAdmissionStrategy API)
+  and #11616 (closed, restacked on #11787; Session-Aware policy "inspired by
+  ThunderAgent", validated AGAINST the Python ThunderAgent we run). That line
+  is device-capacity-only ("no HiCache/offload" in its validation) — the L2
+  layer (capacity credit + retrieval semantics) has no Rust counterpart yet.
+  Graduation posture therefore shifts: our Python-router changes (D1/D2/D3)
+  are the prototype + experimental evidence; the durable upstream deliverable
+  is the design input for the Rust policy's L2 extension — chiefly the
+  credit+demotion+wait triad and the k8ad1 landing-starvation counterexample.
 ```
 
 ## 6. Risks / open questions
