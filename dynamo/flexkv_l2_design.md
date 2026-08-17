@@ -219,12 +219,19 @@ Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
            (3) the FlexKV cancel-loop hang is an upstream bug to fix. Re-run
            deferred until after Gate B; credit_ratio ≈ 0.3 (~2.2× admission)
            is the candidate next probe.
-           Why HiCache doesn't hit this: load-back is part of the scheduler's
-           unified decision (host-hit load counts against the request's
-           prefill budget; can't allocate → request WAITS, never degrades),
-           and SGLang never credits host capacity into admission at all —
-           its host tier only cheapens post-eviction restore. D1 is where we
-           go *beyond* the reference; the fix ladder is ours to build:
+           Correction (2026-08-17, from re-reading capacity.py): the upstream
+           hicache branch credits host_total_tokens UNCONDITIONALLY (no env
+           gate) — TA×SGLang+HiCache runs with widened admission by default,
+           and the H20 reference curves were produced in that state. What
+           makes the credit safe there is the *retrieval semantic*: host-hit
+           loads enter the scheduler budget and WAIT when unallocatable
+           (never degrade to recompute), plus demotion guarantees the data
+           exists. The reference ships credit+demotion+wait as a set; we
+           shipped credit (D1, copied from that branch) and demotion-emulation
+           (pin) but not wait — k8ad1 died on the missing leg. G1's precise
+           meaning stands: FlexKV never *reported* capacity (R1 fixed that),
+           not "HiCache doesn't credit". Ladder items (b)/(c) below are the
+           credit's safety precondition, not polish:
            (a) router-only: partial credit + util-coupled dynamic credit
                (credit→0 as util crosses the 0.80 soft ceiling; router
                already subscribes to FPM/util) — Gate A′ re-probe config;
