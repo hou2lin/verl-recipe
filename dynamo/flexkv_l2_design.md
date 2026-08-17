@@ -247,6 +247,17 @@ Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
            tok=131k → engine profile grew ~4 GiB → colocated weight-transfer
            all-gather OOM. Fixed: PHASE1_MAX_NUM_BATCHED_TOKENS env, pinned
            32768 (chunked prefill splits 131k prompts). Re-queued behind A′.]
+          [CLOSED 2026-08-17: no pressure — bare/no-pin/pin identical at
+           GPU hit 97.7%, recompute 2.3%, needs-L2 1.4%, catch 0%. Pin
+           mechanism perfect (2,719/2,719) but jobless. Trajectories end
+           naturally at ~86k; C32 active set ≈1.38M < 1.55M pool → zero
+           eviction. LESSON: length alone is not the L2 regime —
+           oversubscription is; length only multiplies the per-eviction
+           restore cost. Hence GATE B′.]
+  GATE B′ (proposed 2026-08-17): same 131k config at C64 — single wave of
+          64, active set ≈2.75M vs 1.55M pool (~1.8× oversubscribed) →
+          eviction with c²-priced restore on the critical path. Arms ±pin.
+          This is the honest version of the Gate B hypothesis.
 
 Phase 3:  D5 CPU-aware victim + resume prefetch + DMA pacing
   GATE: batch-resume stress (many victims resumed same tick), no GET bubbles /
