@@ -218,7 +218,22 @@ Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
            a *prerequisite* for aggressive credit, not a later optimization;
            (3) the FlexKV cancel-loop hang is an upstream bug to fix. Re-run
            deferred until after Gate B; credit_ratio ≈ 0.3 (~2.2× admission)
-           is the candidate next probe.]
+           is the candidate next probe.
+           Why HiCache doesn't hit this: load-back is part of the scheduler's
+           unified decision (host-hit load counts against the request's
+           prefill budget; can't allocate → request WAITS, never degrades),
+           and SGLang never credits host capacity into admission at all —
+           its host tier only cheapens post-eviction restore. D1 is where we
+           go *beyond* the reference; the fix ladder is ours to build:
+           (a) router-only: partial credit + util-coupled dynamic credit
+               (credit→0 as util crosses the 0.80 soft ceiling; router
+               already subscribes to FPM/util) — Gate A′ re-probe config;
+           (b) connector: bounded-wait GET retry instead of fallback, and
+               GET-priority eviction (a certain 27k-token hit outranks a
+               cold maybe-reused prefix) — new F items;
+           (c) scheduler fusion (the HiCache shape): loads enter vLLM
+               allocate_slots budgeting, unallocatable → waiting — Phase 3,
+               with DMA pacing.]
   GATE B: long-trajectory probe (max_model_len 131072, max_turns 100,
           p32×r2 = 64 trajectories, C32, ±pin) — pause's native regime.
           [false start 2026-08-16: launcher bound max_num_batched_tokens to
