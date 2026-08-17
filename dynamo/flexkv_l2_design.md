@@ -266,6 +266,20 @@ Upstream alignment note (2026-08-17): ai-dynamo is productizing admission as
   are the prototype + experimental evidence; the durable upstream deliverable
   is the design input for the Rust policy's L2 extension — chiefly the
   credit+demotion+wait triad and the k8ad1 landing-starvation counterexample.
+
+Capacity-credit lineage (2026-08-17): host credit entered capacity.py in
+  #11185 (2026-07-06, `sglang_hicache_capacity.host_total_tokens`,
+  unconditional). Our running checkout 59d6146 (#11245, 07-07) has that form.
+  One day later #11321 generalized it to the backend-neutral
+  `native_offloading_capacity.total_tokens` WITH write-policy translation:
+  write_back → G+H, write_through → G+(H−G) (GPU-resident blocks are host
+  copies; avoid double counting), selective → no static credit. Consequences:
+  (1) FlexKV write-behind is copy-semantics ⇒ our full-credit D1 double
+  counts the overlap — partial credit is not a workaround, it is the
+  upstream-correct semantic; (2) R1 should migrate to publish
+  `native_offloading_capacity.total_tokens` (write_through translation)
+  instead of the bespoke `flexkv_capacity` key, and after a dynamo rebase the
+  D1 credit patch mostly dissolves into "FlexKV reports capacity per policy".
 ```
 
 ## 6. Risks / open questions

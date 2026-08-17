@@ -65,6 +65,18 @@ FLOPs. L2's wall-clock benefit only exists where recompute sits on the
 critical path: **long-trajectory regimes (restore cost ∝ c², Gate B) or
 admission-less schedulers (sticky+FlexKV −19%, already measured).**
 
+### Upstream lineage check (2026-08-17)
+
+Host-capacity credit entered upstream in **#11185** (07-06, hicache key,
+unconditional); our checkout `59d6146` (#11245, 07-07) includes it. **#11321**
+(07-07, not in our checkout) generalized the contract to
+`native_offloading_capacity.total_tokens` with write-policy translation
+(write_through → `G+(H−G)`, no double counting). Actions recorded in the
+design doc: partial credit is the upstream-correct semantic for FlexKV's
+copy-based write-behind; R1 should migrate to the neutral key on next rebase.
+Admission is also being productized in Rust (#11434 API merged; #11616
+Session-Aware policy, device-only) — our L2 work is the prototype line.
+
 ## Operational hardening picked up along the way (permanent)
 
 - launcher FlexKV overlay: `server/request.py` added to cythonize+cleanup list
