@@ -28,7 +28,7 @@ rollouts with FlexKV silently no-op — preserved as bare-131k reference data.**
 | item | status | evidence |
 |---|---|---|
 | R1 publish FlexKV capacity → MDC | ✅ done | 8 unit tests; live log `host_total_tokens=1048576 kv_bytes_per_token=98304` (matches capacity audit) twice on-machine |
-| D1 router ledger credits host tokens | ✅ **ACTIVATED 2026-08-16** (`k8ad1`, Gate A′) | patch in `patches/`; gate `DYN_THUNDERAGENT_FLEXKV_L2` was kept off until the pin story worked (design §2); Gate A met that precondition. D1 is the missing link for the 0.25 starvation regime: admission accounts GPU-only capacity → running ≈ 5; crediting host tokens (~+1.8M/shard) widens admission ~5×, converting saved recompute from idle FLOPs into throughput. Risk under measure in Gate A′: if L2 catch can't absorb the wider eviction storm, wall regresses → add a partial-credit ratio knob |
+| D1 router ledger credits host tokens | ✅ **ACTIVATED 2026-08-16** (`k8ad1`, Gate A′) | patch in `patches/`; gate `DYN_THUNDERAGENT_FLEXKV_L2` was kept off until the pin story worked (design §2); Gate A met that precondition. D1 is the missing link for the 0.25 starvation regime: admission accounts GPU-only capacity → running ≈ 5; crediting host tokens (~+1.8M/shard) widens admission ~5×, converting saved recompute from idle FLOPs into throughput. Verdict (Gate A′ row above): full credit fails via GET landing starvation — next probe is partial credit ≈ 0.3 |
 | F1 Pin/Unpin messages + KVServer handlers | ✅ done (shared mode) | pinsmk8: 341/341 pinned, unpin balanced |
 | D2/D3 router hooks (victim mode) | ✅ done | Phase-1 gate arms |
 | Phase-1 gate (0.25 shared ±pin) | ✅ closed | catch 3.2→4.8%, wall 6h46m→6h36m (±variance); pause victims are only ~8% of context loss → §3.6 redirect |
