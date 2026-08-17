@@ -205,6 +205,20 @@ Phase 2 (next, redirected per §3.6):  active-set pinning (pin trigger at
           pass = wall clearly below the 0.25 6h4x band while completion stays
           clean. fail-mode to watch: eviction storm outruns L2 catch and wall
           regresses → add a partial-credit ratio knob and re-run.
+          [CLOSED 2026-08-17, k8ad1: **full credit fails, and the mechanism is
+           one layer deeper than the predicted eviction storm — GET landing
+           starvation.** Widened admission keeps the GPU pool saturated, so
+           FlexKV GETs that *did match* can't allocate destination blocks:
+           3 cancels → allocation fallback → "recomputing N matched tokens".
+           Measured: FlexKV hit 0.00–0.07%, GPU hit 4–9% (vs 44.6% Gate A),
+           and shard0 hung inside the cancel loop at +2.8h (no crash log);
+           arm killed at 12.8h. Conclusions: (1) D1 needs a partial-credit
+           ratio (leave GPU headroom for GET landing); (2) engine-side GET
+           landing reservation — i.e. Phase-3 resume-prefetch/DMA-pacing — is
+           a *prerequisite* for aggressive credit, not a later optimization;
+           (3) the FlexKV cancel-loop hang is an upstream bug to fix. Re-run
+           deferred until after Gate B; credit_ratio ≈ 0.3 (~2.2× admission)
+           is the candidate next probe.]
   GATE B: long-trajectory probe (max_model_len 131072, max_turns 100,
           p32×r2 = 64 trajectories, C32, ±pin) — pause's native regime.
           [false start 2026-08-16: launcher bound max_num_batched_tokens to

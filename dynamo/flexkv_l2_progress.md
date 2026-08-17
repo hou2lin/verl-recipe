@@ -3,7 +3,7 @@
 Companion to `flexkv_l2_design.md` (the plan) — this file records where we
 actually are. Update on every gate decision or item status change.
 
-**Current position (2026-08-16 late evening): three-arm chain on its third
+**Current position (2026-08-17 morning): Gate A′ closed (full-credit fail, GET landing starvation); Gate B arms running on the chain. Prior context: three-arm chain on its third
 launch (18:37Z) — Gate A′ (`k8ad1`, D1 admission-relaxation) first, then Gate
 B both arms (`k8gbo`/`k8gbp`). Launch 1 died on launcher OOM (batched-tokens
 coupling); launch 2 died on an upstream FlexKV KVServer pre-start race (fixed
@@ -16,7 +16,7 @@ rollouts with FlexKV silently no-op — preserved as bare-131k reference data.**
 |---|---|---|
 | Phase 1 — victim pinning minimal loop | ✅ **CLOSED** (2026-08-15) | Mechanism pass (1,697/1,697 pins), direction pass (+50% catch), wall not significant → redirected to §3.6 |
 | Phase 2 — active-set pinning + quota | 🔶 **Mechanism DONE, Gate A closed with structural finding** (2026-08-16) | All mechanism metrics improve monotonically; wall is insensitive because recompute is off the critical path in the starvation regime — see "Gate A verdict" below |
-| Gate A′ — D1 admission-relaxation | 🚀 **LAUNCHED 2026-08-16 (runs first)** | `k8ad1`: 0.25/C256/r16 shared 336 GB + active pin q0.9 + `DYN_THUNDERAGENT_FLEXKV_L2=1` (capacity credits host tokens, admission widens ~5×/shard). Pass = wall clearly below the 6h4x band. Tests whether Gate A's mechanism gains convert to wall time once running lifts off ~5 |
+| Gate A′ — D1 admission-relaxation | ❌ **CLOSED 2026-08-17: full credit fails — GET landing starvation** | `k8ad1` (0.25/C256/r16 + pin q0.9 + full host-token credit): admission widened as designed, but the saturated GPU pool starves FlexKV GETs of destination blocks — matched data gets **re-computed anyway** ("recomputing N matched tokens" after 3 alloc cancels). FlexKV hit 0.00–0.07%, GPU hit 4–9% (vs 44.6% in Gate A); shard0 hung in the cancel loop at +2.8h; arm killed at 12.8h. Verdict: partial-credit ratio + engine-side GET landing reservation (Phase-3 prefetch/pacing) are prerequisites; cancel-loop hang is an upstream FlexKV bug. Re-probe (credit≈0.3) after Gate B |
 | Gate B — long-trajectory probe | 🚀 queued on same chain (after A′) | max_model_len 131072 (4k prompt + 124k response), max_turns 100, p32×r2 = 64 traj, C32, mem-util 0.68, shared FlexKV 336 GB; arms: `k8gbo` (no pin) → `k8gbp` (active pin, quota 0.9). **False start 08-16**: launcher bound `max_num_batched_tokens` to tok=131k → engine +4 GiB → weight-transfer all-gather OOM (2 GiB ask, 1.74 free); fixed via `PHASE1_MAX_NUM_BATCHED_TOKENS=32768` |
 | Phase 3 — CPU-aware victim / prefetch / DMA pacing | ⏳ not started | — |
 | R2 — private-mode / multi-node channel | 💤 deferred (user decision 2026-08-15) | — |
@@ -100,3 +100,4 @@ admission-less schedulers (sticky+FlexKV −19%, already measured).**
 | 08-16 (evening) | Gate B false start: `max_num_batched_tokens`=tok OOM at weight transfer; launcher env-decoupled, preflight kill-loop hardened |
 | 08-16 (late) | Re-prioritized per user: **Gate A′ first** — 3-arm chain `k8ad1` → `k8gbo` → `k8gbp` launched 15:41Z; D1 activated for the first time (`DYN_THUNDERAGENT_FLEXKV_L2=1`) |
 | 08-16 (night) | Chain launch 2 all-failed on the upstream KVServer pre-start race (k8ad1: shards hung 1800s; k8gbo/k8gbp: FlexKV silent no-op, full bare rollouts preserved as 131k reference — 2,744 turns in ~50 min). Race fixed in F1 patch; chain launch 3 at 18:37Z |
+| 08-17 (morning) | **Gate A′ closed: full credit fails via GET landing starvation** (FlexKV hit ~0%, GPU hit 4–9%, shard0 hung +2.8h; killed at 12.8h). Chain advanced to Gate B (`k8gbo` from 01:26Z) |
