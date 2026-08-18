@@ -261,6 +261,40 @@ def test_multi_teacher_config_uses_dedicated_pools_and_validates_gpu_footprints(
     assert processed.distillation.teacher_models.tulu3_teacher.inference.tensor_model_parallel_size == 8
 
 
+def test_qwen3_8b_actor_rollout_lora_config_validates():
+    config = OmegaConf.load(_TINKER_CONFIG_DIR / "advance" / "qwen3_8b_actor_rollout_lora.yaml")
+
+    processed = process_actor_rollout_ref_config(config)
+    errors = _validate_config(processed)
+
+    assert errors == []
+    assert processed.server.model_name == "Qwen/Qwen3-8B"
+    assert processed.actor_rollout_ref.actor.strategy == "fsdp"
+    assert processed.actor_rollout_ref.actor.fsdp_config.model_dtype == "bfloat16"
+    assert processed.actor_rollout_ref.actor.fsdp_config.param_offload is False
+    assert processed.actor_rollout_ref.actor.fsdp_config.optimizer_offload is False
+    assert processed.actor_rollout_ref.actor.fsdp_config.use_orig_params is True
+    assert processed.actor_rollout_ref.actor.ppo_mini_batch_size == 32
+    assert processed.actor_rollout_ref.actor.use_dynamic_bsz is True
+    assert processed.actor_rollout_ref.actor.ppo_max_token_len_per_gpu == 12288
+    assert processed.actor_rollout_ref.actor.optim.lr == pytest.approx(3.0e-6)
+    assert processed.actor_rollout_ref.rollout.name == "vllm"
+    assert processed.actor_rollout_ref.rollout.tensor_model_parallel_size == 2
+    assert processed.actor_rollout_ref.rollout.gpu_memory_utilization == 0.6
+    assert processed.actor_rollout_ref.rollout.n == 5
+    assert processed.actor_rollout_ref.rollout.prompt_length == 512
+    assert processed.actor_rollout_ref.rollout.response_length == 2048
+    assert processed.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz is True
+    assert processed.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu == 12288
+    assert processed.actor_rollout_ref.rollout.load_format == "safetensors"
+    assert processed.actor_rollout_ref.rollout.layered_summon is False
+    assert processed.actor_rollout_ref.model.path.endswith("/Qwen3-8B")
+    assert processed.actor_rollout_ref.model.lora_rank == 64
+    assert processed.actor_rollout_ref.model.lora_alpha == 32
+    assert processed.actor_rollout_ref.model.target_modules == "all-linear"
+    assert processed.actor_rollout_ref.ref.enable is False
+
+
 @pytest.mark.parametrize(
     ("teacher_identifiers", "expected_name", "expected_path"),
     [

@@ -2,9 +2,9 @@
 UPSTREAM=https://github.com/verl-project/verl.git
 MODE=rolling
 BRANCH=main
-VERL_COMMIT=ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a
+VERL_COMMIT=cfacd76a0bdd4540346f99588d3ab35b07f4fe6f
 PIP_INSTALL=uv sync --project verl_tinker --python python3.12
-GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a && git submodule update --init --recursive recipe
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout cfacd76a0bdd4540346f99588d3ab35b07f4fe6f && git submodule update --init --recursive recipe
 RECIPE_SUBMODULE_COMMIT=e44a9ca9a252322f76fe74753cc7afd812355b67
 RECIPE_FOLDER=verl_tinker
 RECIPE_FOLDER_LAST_COMMIT=e44a9ca9a252322f76fe74753cc7afd812355b67

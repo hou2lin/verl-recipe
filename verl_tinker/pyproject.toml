@@ -34,7 +34,7 @@ dependencies = [
     "tinker==0.19.0",
     "transformers==5.9.0",
     "veomni @ git+https://github.com/ByteDance-Seed/VeOmni.git@9ff4858618ae07901ece5c3070d9b7f3d5458da3",
-    "verl @ git+https://github.com/verl-project/verl.git@ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a",
+    "verl @ git+https://github.com/verl-project/verl.git@cfacd76a0bdd4540346f99588d3ab35b07f4fe6f",
     "vllm>=0.26.0",
     "vexact @ git+https://github.com/verl-project/vexact.git@2da1ea2181b5fe09597077c9dc86539ec047e610",
     "kernels==0.14.1",

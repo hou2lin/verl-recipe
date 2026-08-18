@@ -10,8 +10,10 @@ one active training client at a time, not isolated multi-client sessions.
 
 ## News
 
-- 2026-07-04: Released `verl-tinker` 🚀
+- 2026-08-18: Add in support for lora training
 - 2026-07-24: Add in support for Teacher models to enable OPD workflows 🧑‍🏫
+- 2026-07-04: Released `verl-tinker` 🚀
+
 
 ## Install
 
@@ -264,8 +266,12 @@ Most long-running operations return a `request_id`. Poll
 - Multi-teacher deployments can set `distillation.dedicated_resource_pools=true`
   to strictly pack each teacher into its own Ray placement group. Teachers are
   allocated largest-first; each teacher must fit on a single node.
-- LoRA training is not supported. Some LoRA-shaped metadata is returned for
-  Tinker Cookbook compatibility, but the backend trains full model weights.
+- LoRA is configured server-side through VeRL's
+  `actor_rollout_ref.model.lora` / `lora_rank` / `lora_adapter_path` settings;
+  a client's `CreateModelRequest.lora_config` does not reconfigure the running
+  engine. With LoRA enabled, scalar prompt-logprob sampling for the initial
+  model evaluates the frozen base weights with the adapter disabled. It does
+  not enable autoregressive base-model sampling after rollout weights diverge.
 - Multiple clients are not isolated: they share one model state, optimizer
   state, and sampler state.
 

@@ -3040,8 +3040,8 @@ dependencies = [
 
 [[package]]
 name = "verl"
-version = "0.9.0.dev0"
-source = { git = "https://github.com/verl-project/verl.git?rev=ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a#ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a" }
+version = "0.10.0.dev0"
+source = { git = "https://github.com/verl-project/verl.git?rev=cfacd76a0bdd4540346f99588d3ab35b07f4fe6f#cfacd76a0bdd4540346f99588d3ab35b07f4fe6f" }
 dependencies = [
     { name = "accelerate", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "codetiming", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
@@ -3133,7 +3133,7 @@ requires-dist = [
     { name = "transformers", specifier = "==5.9.0" },
     { name = "triton", specifier = "==3.6.0" },
     { name = "veomni", git = "https://github.com/ByteDance-Seed/VeOmni.git?rev=9ff4858618ae07901ece5c3070d9b7f3d5458da3" },
-    { name = "verl", git = "https://github.com/verl-project/verl.git?rev=ddfbf4ea01b27ab47ac9de50514a9c9dcb631e7a" },
+    { name = "verl", git = "https://github.com/verl-project/verl.git?rev=cfacd76a0bdd4540346f99588d3ab35b07f4fe6f" },
     { name = "vexact", git = "https://github.com/verl-project/vexact.git?rev=2da1ea2181b5fe09597077c9dc86539ec047e610" },
     { name = "vllm", specifier = ">=0.26.0", index = "https://pypi.org/simple/" },
 ]
