@@ -82,7 +82,7 @@ defaults are applied in `DynamoHttpServer`.
 | `request_engine_data` / `request_completion_token_ids` | `true` / `false`                                         | Ask the frontend to return `nvext.engine_data` / raw `completion_token_ids` (token-in/token-out for RL). |
 | `return_tokens_as_token_ids`                           | `true` / `false`                                         | Emit token ids instead of detokenized text.                                                              |
 | `request_timeout_s`                                    | `600` (default; scripts use `1800`)                      | Per-request timeout.                                                                                     |
-| `free_engine_on_train`                                 | `true`                                                   | Free the engine (sleep) during the training phase.                                                       |
+| `free_engine_on_train`                                 | mirrors `rollout.free_cache_engine`                      | DEPRECATED as an independent switch: now follows `rollout.free_cache_engine`; an explicit value that contradicts it fails at startup. |
 | `enable_worker_system_metrics`                         | `true` / `false`                                         | Expose the per-worker system-status / metrics port (paired with `metrics_sidecar.py`).                   |
 | `extra_args`                                           | `["--generation-config","vllm","--stream-interval=100"]` | Extra CLI args forwarded verbatim to `dynamo.vllm`.                                                      |
 
