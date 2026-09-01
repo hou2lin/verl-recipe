@@ -436,6 +436,38 @@ class DynamoLLMServerManager(LLMServerManager):
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
+    async def shutdown(self):
+        """Tear down every dynamo server actor this manager launched.
+
+        FullyAsyncRollouter.shutdown_services() calls manager.shutdown()
+        unconditionally; the pin LLMServerManager has no such method, so
+        without this the fully_async teardown dies with AttributeError and
+        the dynamo subprocess stack (etcd/nats/frontend/vllm) leaks.
+        """
+        replicas = list(self.rollout_replicas)
+        # Under the fully_async rebase, hybrid-pool replicas are migrated out
+        # of rollout_replicas into hybrid_replicas (and only the active subset
+        # ever returns) — pick them up too so their servers don't leak.
+        for replica in getattr(self, "hybrid_replicas", {}).values():
+            if replica not in replicas:
+                replicas.append(replica)
+        results = await asyncio.gather(
+            *[server.shutdown.remote() for replica in replicas for server in replica.servers],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                logger.warning("dynamo server shutdown failed: %s", result)
+        # The fork's LLMServerManager may add its own shutdown (FlexKV service
+        # teardown, design doc Q1); chain to it when present — the pin has
+        # none. Never let its failure mask an otherwise clean teardown.
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if parent_shutdown is not None:
+            try:
+                await parent_shutdown()
+            except Exception:
+                logger.warning("base LLMServerManager.shutdown() failed after dynamo teardown", exc_info=True)
+
     def get_client(self, client_cls=None, **kwargs):
         """Return an LLM client for the shared Dynamo frontend.
 

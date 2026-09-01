@@ -1955,6 +1955,12 @@ class DynamoHttpServer:
     async def sleep(self, **kwargs):
         # NB: no node_rank guard — each per-node server sleeps its OWN local
         # workers (self._control_endpoints are node-local), so all nodes must run.
+        #
+        # reset_connector (fork replica.py:277-284 forwards it on the False
+        # branch): dynamo has no external KV connector wired yet and the
+        # embedded engine's sleep() may not know the kwarg — swallow it here
+        # instead of forwarding. Sleep level 1 drops KV contents regardless.
+        kwargs.pop("reset_connector", None)
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] sleep: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
@@ -1966,7 +1972,11 @@ class DynamoHttpServer:
         kwargs.setdefault("level", 1)
         await self._engine_method_all("sleep", kwargs=kwargs, timeout=600)
 
-    async def clear_kv_cache(self):
+    async def clear_kv_cache(self, reset_connector: bool = True):
+        # reset_connector is accepted for fork-signature parity only: with no
+        # external KV connector configured there is nothing extra to drop
+        # (vLLM treats reset_prefix_cache(reset_connector=True) as a no-op
+        # success then). FlexKV wiring will forward it to the sidecar.
         if not self._control_endpoints:
             return
         await self._engine_method_all("reset_prefix_cache")
@@ -1974,18 +1984,19 @@ class DynamoHttpServer:
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
 
-    async def release_kv_cache(self):
+    async def release_kv_cache(self, reset_connector: bool = True):
         """Pre-NCCL-sync hook: weights must stay in place for the first hop.
 
         The KV cache was already invalidated by abort_all_requests
         (pause_generation with clear_cache=True) one step earlier in the
         CheckpointEngineManager choreography — contents only, the KV pool GPU
         memory stays resident, same as upstream vLLM's stub (TODO upstream:
-        true KV release).
+        true KV release). reset_connector: fork-signature parity, see
+        clear_kv_cache.
         """
         return None
 
-    async def resume_kv_cache(self):
+    async def resume_kv_cache(self, reset_connector: bool = True):
         """Post-NCCL-sync counterpart to release_kv_cache. Parity stub."""
         return None
 
@@ -2047,7 +2058,12 @@ class DynamoHttpServer:
             await finalize(probe_id)
         logger.info("[DynamoHttpServer] logprob channel probe OK")
 
-    async def abort_all_requests(self, reset_prefix_cache: bool = True):
+    async def abort_all_requests(
+        self,
+        reset_prefix_cache: bool = True,
+        checkpoint_kv: bool = False,
+        timeout_s: float = 30.0,
+    ):
         """Abort all in-flight requests on this node's dynamo.vllm shards.
 
         Bridges vLLM AsyncLLM.pause_generation (vLLM >= 0.12) through each
@@ -2056,7 +2072,24 @@ class DynamoHttpServer:
         optionally clears caches, and leaves the engines paused. New and
         client-retried generate() calls block on the resume gate until
         resume_generation().
+
+        ``checkpoint_kv`` / ``timeout_s`` mirror the fork's vLLMHttpServer
+        signature — the fork RolloutReplica base ALWAYS forwards them
+        (replica.py:293-310), so omitting them breaks the very first
+        CheckpointEngineManager.update_weights with a TypeError.
+        checkpoint_kv=True means "wait for the external KV connector to
+        checkpoint aborted requests before returning" (abort-offload barrier,
+        VERL_ABORT_KV_EVENT logs); dynamo has no external KV connector wired
+        yet, so honoring it silently would drop the barrier semantics — fail
+        loudly instead. timeout_s only bounds that barrier wait and is
+        accepted-but-unused until then.
         """
+        if checkpoint_kv:
+            raise NotImplementedError(
+                "abort_all_requests(checkpoint_kv=True) requires the abort-offload KV "
+                "barrier, which the dynamo backend does not implement yet; disable "
+                "rollout.abort_kv_reuse for rollout.name=dynamo."
+            )
         if self._use_direct_generate():
             # The debug direct-generate path holds the sidecar's single
             # in-flight REP slot for the whole generation, so the pause
@@ -2373,13 +2406,18 @@ class DynamoReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
 
-    async def sleep(self):
+    async def sleep(self, reset_connector: bool = True):
         """Drain in-flight requests before the weight-offloading sleep.
 
         Mirrors vLLMReplica.sleep: the base class would sleep immediately,
         which is undefined behavior when requests are still active (e.g. the
         colocated-reward-model validation path sleeps without an abort).
         Unlike vLLM, dynamo servers are per-node — drain every one of them.
+
+        reset_connector matches the fork base signature (replica.py:277-284;
+        the fork CheckpointEngineManager may pass False under abort-offload).
+        It is not forwarded: no external KV connector is wired yet and the
+        server drops KV contents at sleep level 1 either way.
         """
         await asyncio.gather(*[server.wait_for_requests_to_drain.remote() for server in self.servers])
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
