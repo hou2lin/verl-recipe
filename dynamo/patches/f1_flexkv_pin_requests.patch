@@ -1,0 +1,184 @@
+diff --git a/flexkv/server/request.py b/flexkv/server/request.py
+index 8508aa6..c31d4f3 100644
+--- a/flexkv/server/request.py
++++ b/flexkv/server/request.py
+@@ -140,3 +140,25 @@ class ShutdownRequest:
+ @dataclass
+ class CheckRunningRequest:
+     dp_client_id: int
++
++@dataclass
++class PinRequest:
++    """Pin the CPU radix path matching token_ids against eviction.
++
++    Victim/active-set pinning (ThunderAgent L2 design): sent by the TA router
++    so the write-behind CPU copy survives until it is read back.
++    Fire-and-forget (no response), like PutRequest.
++    """
++    dp_client_id: int
++    token_ids: "np.ndarray"
++    pin_id: str
++    task_id: int = -1
++    namespace: "Optional[List[str]]" = None
++
++
++@dataclass
++class UnpinRequest:
++    """Release a pin created by PinRequest. Idempotent."""
++    dp_client_id: int
++    pin_id: str
++    task_id: int = -1
+diff --git a/flexkv/server/server.py b/flexkv/server/server.py
+index 34987e2..768bb70 100644
+--- a/flexkv/server/server.py
++++ b/flexkv/server/server.py
+@@ -26,6 +26,8 @@ from flexkv.server.request import (
+     RegisterTPClientRequest,
+     IsReadyRequest,
+     PutRequest,
++    PinRequest,
++    UnpinRequest,
+     GetRequest,
+     PutMatchRequest,
+     GetMatchRequest,
+@@ -195,6 +197,8 @@ class KVServer:
+             PutRequest: self._handle_put_request,
+             GetMatchRequest: self._handle_get_match_request,
+             PutMatchRequest: self._handle_put_match_request,
++            PinRequest: self._handle_pin_request,
++            UnpinRequest: self._handle_unpin_request,
+             PrefetchRequest: self._handle_prefetch_request,
+             WaitRequest: self._handle_wait_request,
+             LaunchTaskRequest: self._handle_launch_task_request,
+@@ -298,13 +302,26 @@ class KVServer:
+         # TODO: handle error and return error response
+         # TODO: support check finish
+         flexkv_logger.info("Servering waiting to be started")
+-        req = self.recv_from_client.recv_pyobj()
+-        if isinstance(req, StartRequest):
+-            flexkv_logger.info(f"Received start request from DP client "
+-                               f"(dp_client_id={req.dp_client_id}), "
+-                               f"Starting server...")
+-            self.start_server()
+-        else:
++        while True:
++            req = self.recv_from_client.recv_pyobj()
++            if isinstance(req, StartRequest):
++                flexkv_logger.info(f"Received start request from DP client "
++                                   f"(dp_client_id={req.dp_client_id}), "
++                                   f"Starting server...")
++                self.start_server()
++                break
++            if isinstance(req, IsReadyRequest):
++                # Readiness polls race ahead of the start request in shared
++                # multi-client mode; answer not-ready instead of dying.
++                flexkv_logger.info(f"pre-start IsReady poll from DP client "
++                                   f"(dp_client_id={req.dp_client_id}); not ready yet")
++                try:
++                    result_zmq = self.client_manager.get_zmq(req.dp_client_id)
++                    result_zmq.send_pyobj(Response(dp_client_id=req.dp_client_id,
++                                                   is_ready=False))
++                except Exception as exc:
++                    flexkv_logger.warning(f"pre-start IsReady reply failed: {exc}")
++                continue
+             raise TypeError(f"Received RequestType: {type(req)} from DP client "
+                             f"dp_client_id={req.dp_client_id} before the start request")
+         self._running = True
+@@ -426,6 +443,97 @@ class KVServer:
+         result_zmq = self.client_manager.get_zmq(req.dp_client_id)
+         result_zmq.send_pyobj(response)
+ 
++    def _handle_pin_request(self, req: PinRequest) -> None:
++        """Pin the CPU radix path matching token_ids (L2 design, active-set).
++
++        Locks the deepest matched node; ancestors become un-evictable because
++        eviction only consumes leaves. A quota with a deepest-context-first
++        selector decides who stays pinned. Failures log and degrade to
++        today's unprotected behavior, never raise.
++        """
++        self.kv_task_engine._update_tasks(timeout=0)
++        if not hasattr(self, "_pin_table"):
++            self._pin_table = {}   # pin_id -> (node, blocks)
++            try:
++                ratio = float(os.environ.get("FLEXKV_PINNED_QUOTA_RATIO", "0.5"))
++            except ValueError:
++                ratio = 0.5
++            total_cpu_blocks = getattr(
++                getattr(self.kv_task_engine.cache_engine, "cache_config", None),
++                "num_cpu_blocks", 0) or 0
++            self._pin_quota_blocks = int(total_cpu_blocks * ratio) if total_cpu_blocks else 0
++            self._pinned_blocks_total = 0
++        try:
++            import numpy as _np
++            from flexkv.common.block import SequenceMeta
++            engine = self.kv_task_engine.cache_engine.cpu_cache_engine
++            if engine is None:
++                raise ValueError("no cpu_cache_engine")
++            tokens_per_block = getattr(engine, "tokens_per_block", None) or \
++                self.kv_task_engine.cache_engine.tokens_per_block
++            token_ids = _np.asarray(req.token_ids, dtype=_np.int64)
++            aligned = (len(token_ids) // tokens_per_block) * tokens_per_block
++            if aligned <= 0:
++                raise ValueError(f"nothing to pin (len {len(token_ids)})")
++            meta = SequenceMeta(token_ids=token_ids[:aligned],
++                                tokens_per_block=tokens_per_block)
++            result = engine.match(meta)
++            node = getattr(result, "last_node", None)
++            if node is None:
++                raise ValueError(f"match result {type(result).__name__} has no last_node")
++            blocks = max(int(aligned / tokens_per_block), 1)
++            prev = self._pin_table.pop(req.pin_id, None)
++            if prev is not None:
++                engine.unlock(prev[0])
++                self._pinned_blocks_total -= prev[1]
++            # Quota selector (deepest-context-first): displace shallower pins;
++            # reject if this pin is shallower than everything held.
++            while (self._pin_quota_blocks
++                   and self._pinned_blocks_total + blocks > self._pin_quota_blocks
++                   and self._pin_table):
++                shallow_id = min(self._pin_table, key=lambda k: self._pin_table[k][1])
++                if self._pin_table[shallow_id][1] >= blocks:
++                    break
++                s_node, s_blocks = self._pin_table.pop(shallow_id)
++                engine.unlock(s_node)
++                self._pinned_blocks_total -= s_blocks
++                flexkv_logger.info(f"[PIN] displaced pin_id={shallow_id} blocks={s_blocks}")
++            if (self._pin_quota_blocks
++                    and self._pinned_blocks_total + blocks > self._pin_quota_blocks):
++                flexkv_logger.info(
++                    f"[PIN] rejected pin_id={req.pin_id} blocks={blocks} "
++                    f"(quota {self._pinned_blocks_total}/{self._pin_quota_blocks})"
++                )
++                return
++            engine.lock_node(node)
++            self._pin_table[req.pin_id] = (node, blocks)
++            self._pinned_blocks_total += blocks
++            flexkv_logger.info(
++                f"[PIN] pinned pin_id={req.pin_id} blocks={blocks} "
++                f"pinned_total={len(self._pin_table)} "
++                f"pinned_blocks={self._pinned_blocks_total}/{self._pin_quota_blocks}"
++            )
++        except Exception as e:
++            flexkv_logger.warning(f"[PIN] pin pin_id={req.pin_id} failed: {e}")
++
++    def _handle_unpin_request(self, req: UnpinRequest) -> None:
++        """Release a pin. Idempotent; unknown pin ids are a no-op."""
++        if not hasattr(self, "_pin_table"):
++            return
++        entry = self._pin_table.pop(req.pin_id, None)
++        if entry is None:
++            return
++        try:
++            node, blocks = entry
++            self.kv_task_engine.cache_engine.cpu_cache_engine.unlock(node)
++            self._pinned_blocks_total = max(
++                0, getattr(self, "_pinned_blocks_total", 0) - blocks)
++            flexkv_logger.info(
++                f"[PIN] unpinned pin_id={req.pin_id} pinned_total={len(self._pin_table)}"
++            )
++        except Exception as e:
++            flexkv_logger.warning(f"[PIN] unpin pin_id={req.pin_id} failed: {e}")
++
+     def _handle_prefetch_request(self, req: PrefetchRequest) -> None:
+         """Handle Prefetch request"""
+         task_id = self.kv_task_engine.prefetch_async(

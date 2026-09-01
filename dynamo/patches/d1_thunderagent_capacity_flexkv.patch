@@ -1,0 +1,47 @@
+--- a/components/src/dynamo/thunderagent_router/capacity.py
++++ b/components/src/dynamo/thunderagent_router/capacity.py
+@@ -14,6 +14,7 @@
+ 
+ import json
+ import logging
++import os
+ from typing import Optional
+ 
+ from dynamo.llm import FpmEventSubscriber
+@@ -23,7 +24,14 @@
+ 
+ _SGLANG_HICACHE_CAPACITY_RUNTIME_KEY = "sglang_hicache_capacity"
+ 
++# vLLM+FlexKV analogue of the HiCache record (published by the verl recipe's
++# control wrapper). Gated off by default: crediting host capacity is only safe
++# once the victim-pinning protocol keeps spilled KV alive until resume --
++# budget-without-pinning admits past the GPU pool with nothing to back it.
++_FLEXKV_CAPACITY_RUNTIME_KEY = "flexkv_capacity"
++_FLEXKV_L2_ENABLED = os.environ.get("DYN_THUNDERAGENT_FLEXKV_L2", "0") == "1"
+ 
++
+ class WorkerCapacityProvider:
+     """Maps ``worker_id -> program-retention tokens`` from each worker's MDC."""
+ 
+@@ -103,5 +111,21 @@
+                 )
+                 if isinstance(host_tokens, (int, float)) and host_tokens > 0:
+                     result += int(host_tokens)
++                if _FLEXKV_L2_ENABLED:
++                    flexkv = (
++                        runtime_data.get(_FLEXKV_CAPACITY_RUNTIME_KEY, {})
++                        if isinstance(runtime_data, dict)
++                        else {}
++                    )
++                    flexkv_host_tokens = (
++                        flexkv.get("host_total_tokens")
++                        if isinstance(flexkv, dict)
++                        else None
++                    )
++                    if (
++                        isinstance(flexkv_host_tokens, (int, float))
++                        and flexkv_host_tokens > 0
++                    ):
++                        result += int(flexkv_host_tokens)
+         self._parsed[card_json] = result
+         return result
