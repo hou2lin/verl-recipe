@@ -35,6 +35,8 @@ STALENESS_THRESHOLD=${STALENESS_THRESHOLD:-0.1}
 # Per-POOL concurrency (the LB sees one dynamo server per pool); 16 per
 # engine shard — the smoke pool has a single TP=1 shard.
 CONCURRENT_SAMPLES=${CONCURRENT_SAMPLES:-16}
+# round-robin | kv | thunderagent (TA = capacity-credit admission routing)
+ROUTER_MODE=${ROUTER_MODE:-round-robin}
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-0.5B-Instruct"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
@@ -78,7 +80,7 @@ python3 -m recipe.dynamo.main_dynamo_fully_async \
     async_training.trigger_parameter_sync_step="${TRIGGER_SYNC_STEP}" \
     async_training.staleness_threshold="${STALENESS_THRESHOLD}" \
     async_training.concurrent_samples_per_replica="${CONCURRENT_SAMPLES}" \
-    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=round-robin \
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode="${ROUTER_MODE}" \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
