@@ -123,10 +123,11 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         return command
 
     def _frontend_router_args(self) -> list[str]:
-        args = super()._frontend_router_args()
-        if self._thunderagent_enabled() and "--router-reset-states" not in args:
-            args.append("--router-reset-states")
-        return args
+        # NB: intentionally no --router-reset-states here either — the flag
+        # exists only in older internal dynamo builds (>=1.4.2 frontend
+        # argparse rejects it and exits rc=1 at startup). Builds that support
+        # it can opt back in via extra frontend args.
+        return super()._frontend_router_args()
 
     def _start_thunderagent(self) -> None:
         if not self._thunderagent_enabled() or self._thunderagent_process is not None:
