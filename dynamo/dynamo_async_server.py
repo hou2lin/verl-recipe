@@ -41,6 +41,8 @@ import ray
 import requests
 from ray.actor import ActorHandle
 
+from verl.checkpoint_engine.base import CheckpointEngineWorker as _BaseCheckpointEngineWorker
+from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
@@ -163,6 +165,11 @@ class DynamoHttpServer:
         # instead of reaching a paused vLLM engine.
         self._generation_resumed = asyncio.Event()
         self._generation_resumed.set()
+        # SYNC_HANG_FIX: armed by abort_all_requests, cancelled by
+        # resume_generation. Screams in the driver log when the paused window
+        # exceeds engine_kwargs.dynamo.abort_resume_watchdog_s (default 600s),
+        # i.e. the CheckpointEngineManager choreography upstream is stuck.
+        self._resume_watchdog_task: Optional[asyncio.Task] = None
 
         # Sleep/wake around training follows verl's rollout.free_cache_engine.
         # An explicit engine_kwargs.dynamo.free_engine_on_train may only
@@ -1993,11 +2000,23 @@ class DynamoHttpServer:
         memory stays resident, same as upstream vLLM's stub (TODO upstream:
         true KV release). reset_connector: fork-signature parity, see
         clear_kv_cache.
+
+        SYNC_HANG_FIX: log so the CheckpointEngineManager choreography step 3
+        is visible in the driver log (the 13h smokeA hang was undebuggable
+        partly because steps 2-5 emitted nothing).
         """
+        logger.info(
+            "[DynamoHttpServer] release_kv_cache: noop (KV invalidated at abort; pool stays resident) node=%s",
+            self.node_rank,
+        )
         return None
 
     async def resume_kv_cache(self, reset_connector: bool = True):
-        """Post-NCCL-sync counterpart to release_kv_cache. Parity stub."""
+        """Post-NCCL-sync counterpart to release_kv_cache. Parity stub.
+
+        SYNC_HANG_FIX: log = choreography step 7 marker, see release_kv_cache.
+        """
+        logger.info("[DynamoHttpServer] resume_kv_cache: noop (node=%s)", self.node_rank)
         return None
 
     async def wait_for_requests_to_drain(self):
@@ -2111,10 +2130,45 @@ class DynamoHttpServer:
             timeout=600,
         )
         logger.info("[DynamoHttpServer] abort_all_requests: engines paused (node=%s)", self.node_rank)
+        self._arm_resume_watchdog()
         return {"aborted_count": None, "request_ids": [], "paused": True}
+
+    def _arm_resume_watchdog(self) -> None:
+        """SYNC_HANG_FIX: alarm when nobody resumes us after an abort.
+
+        smokeA_run7 sat 13h with engines paused and zero log output because
+        the weight-sync choreography between abort and resume stalled in a
+        different process. The paused state is the one recipe-owned signal
+        that outlives the stall, so watch it here.
+        """
+        if self._resume_watchdog_task is not None and not self._resume_watchdog_task.done():
+            self._resume_watchdog_task.cancel()
+        self._resume_watchdog_task = asyncio.create_task(self._resume_watchdog_loop())
+
+    async def _resume_watchdog_loop(self) -> None:
+        interval_s = float(self._dynamo_cfg().get("abort_resume_watchdog_s", 600))
+        if interval_s <= 0:
+            return
+        start = time.time()
+        while not self._generation_resumed.is_set():
+            try:
+                await asyncio.wait_for(self._generation_resumed.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[DynamoHttpServer] engines still PAUSED %.0fs after abort_all_requests and no "
+                    "resume_generation arrived (node=%s) — the CheckpointEngineManager choreography "
+                    "(release_kv_cache -> NCCL update_weights -> resume) is stuck upstream. Look for "
+                    "the last '[DynamoCEWorker]'/'[v4a-4]' stage log; py-spy the trainer WorkerDict, "
+                    "the CheckpointEngineWorker and the FullyAsyncTrainer actors.",
+                    time.time() - start,
+                    self.node_rank,
+                )
 
     async def resume_generation(self):
         """Resume request intake after abort_all_requests."""
+        if self._resume_watchdog_task is not None:
+            self._resume_watchdog_task.cancel()
+            self._resume_watchdog_task = None
         if self._control_endpoints:
             await self._engine_method_all("resume_generation", timeout=120)
         self._generation_resumed.set()
@@ -2351,6 +2405,7 @@ class DynamoHttpServer:
         for attr, _, _ in _SUBPROCESS_REGISTRY:
             state[attr] = None if not attr.endswith("_processes") else []
         state["_watchdog_task"] = None
+        state["_resume_watchdog_task"] = None
         state["_frontend_log_fp"] = None
         state["_vllm_log_fps"] = []
         state["_vllm_log_paths"] = []
@@ -2363,6 +2418,85 @@ class DynamoHttpServer:
 # --------------------------------------------------------------------------- #
 # DynamoReplica
 # --------------------------------------------------------------------------- #
+
+
+class DynamoCheckpointEngineWorker(_BaseCheckpointEngineWorker):
+    """CheckpointEngineWorker with an observable, fail-fast first hop.
+
+    SYNC_HANG_FIX (smokeA_run7): the fully_async first param sync wedged
+    forever between CheckpointEngineManager step 4/5 (abort logged, then
+    silence for 13h). Root operability gap: on the rollout side the whole
+    abort -> prepare -> init_process_group -> update_weights choreography
+    runs inside verl's CheckpointEngineWorker with
+
+      (i)  the sync checkpoint-engine calls (prepare / init_process_group /
+           finalize) executing ON the asyncio actor's event loop, where one
+           wedged native wait (NCCL bootstrap, cupy sync, blocking ray.get)
+           silently starves the already-queued ``update_weights`` task, and
+      (ii) zero logging and zero timeout between the abort and
+           ServerAdapter.update_weights' first line, so any stall is a
+           silent forever-hang with the engines left paused.
+
+    This subclass (verl untouched — wired in via
+    DynamoReplica.get_ray_class_with_init_args):
+      1. runs checkpoint-engine methods in a thread executor so the event
+         loop can never be starved by them (NCCL-from-thread is already the
+         upstream pattern: BroadcastOperation uses run_in_executor),
+      2. logs ENTER/EXIT of every choreography stage to the driver log,
+      3. puts a watchdog (env VERL_DYNAMO_CE_UPDATE_TIMEOUT_S, default
+         1800s, <=0 disables) on update_weights so a stuck first hop fails
+         the job with a stage-labelled error instead of idling for hours.
+    """
+
+    _WATCHDOG_ENV = "VERL_DYNAMO_CE_UPDATE_TIMEOUT_S"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Executor threads must re-select the device (CUDA current-device is
+        # per-thread). Pool CE workers are one-per-GPU with CUDA_VISIBLE_DEVICES
+        # narrowed by Ray, so the local device index is LOCAL_RANK (always 0 in
+        # verl's ray env). Read from env instead of torch to avoid initializing
+        # a CUDA context at actor-construction time.
+        self._ce_device_id = int(os.getenv("LOCAL_RANK", "0"))
+
+    def _ce_log(self, msg: str) -> None:
+        print(f"[DynamoCEWorker][rank={os.environ.get('RANK', '?')}] {msg}", flush=True)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+    async def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        """Run sync CE calls off-loop, with stage logs (see class docstring)."""
+        from verl.utils.device import get_torch_device
+
+        self._ce_log(f"execute_checkpoint_engine({method}) ENTER")
+        t0 = time.time()
+
+        def _call():
+            get_torch_device().set_device(self._ce_device_id)
+            return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+        result = await asyncio.get_running_loop().run_in_executor(None, _call)
+        self._ce_log(f"execute_checkpoint_engine({method}) EXIT +{time.time() - t0:.1f}s")
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None):
+        timeout_s = float(os.environ.get(self._WATCHDOG_ENV, "1800"))
+        self._ce_log(f"update_weights ENTER (global_steps={global_steps}, watchdog={timeout_s:.0f}s)")
+        t0 = time.time()
+        try:
+            if timeout_s > 0:
+                await asyncio.wait_for(super().update_weights(global_steps=global_steps), timeout=timeout_s)
+            else:
+                await super().update_weights(global_steps=global_steps)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"[DynamoCEWorker] update_weights watchdog fired after {timeout_s:.0f}s "
+                f"(global_steps={global_steps}): the NCCL first hop from the trainer or the "
+                f"CUDA-IPC second hop into the dynamo engine never completed. Check the last "
+                f"'[DynamoCEWorker]'/'[v4a-4]' stage log to locate the stall; raise "
+                f"{self._WATCHDOG_ENV} for very large models."
+            ) from None
+        self._ce_log(f"update_weights EXIT +{time.time() - t0:.1f}s")
 
 
 class DynamoReplica(RolloutReplica):
@@ -2405,6 +2539,24 @@ class DynamoReplica(RolloutReplica):
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
+
+    def get_ray_class_with_init_args(self):
+        """Use the recipe CE worker (observable + fail-fast first hop).
+
+        Mirrors the base RolloutReplica implementation but swaps in
+        DynamoCheckpointEngineWorker — see its docstring (SYNC_HANG_FIX).
+        The CheckpointEngineManager's temp worker group still binds method
+        signatures from verl's base class; the overridden coroutines execute
+        on the actor, so no verl change is needed.
+        """
+        from verl.single_controller.ray import RayClassWithInitArgs
+
+        return RayClassWithInitArgs(
+            cls=ray.remote(DynamoCheckpointEngineWorker),
+            rollout_config=self.config,
+            model_config=self.model_config,
+            replica_rank=self.replica_rank,
+        )
 
     async def sleep(self, reset_connector: bool = True):
         """Drain in-flight requests before the weight-offloading sleep.
@@ -2631,4 +2783,4 @@ class DynamoReplica(RolloutReplica):
         )
 
 
-__all__ = ["DynamoHttpServer", "DynamoReplica"]
+__all__ = ["DynamoCheckpointEngineWorker", "DynamoHttpServer", "DynamoReplica"]
