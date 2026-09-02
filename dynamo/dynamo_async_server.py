@@ -378,6 +378,38 @@ class DynamoHttpServer:
         env.setdefault("FLEXKV_ENABLE_MPS", "0")
         return env
 
+    def _flexkv_shard_env_vars(self, spec_idx: int, worker_cvd: str, num_shards: int) -> dict[str, str]:
+        """Per-shard FlexKV isolation on multi-shard nodes (port of b20472a).
+
+        Private mode (default): every shard runs its own in-process FlexKV
+        stack, so the default ipc socket path (FLEXKV_SERVER_RECV_PORT,
+        ipc:///tmp/flexkv_server) collides across shards — GPU registrations
+        crosstalk and a shard's TransferManager can eat another shard's
+        registration. Suffix the path with the shard's GPU ids. The metrics
+        servers likewise default to fixed ports 8080/8081; offset per shard.
+
+        Shared pool mode (FLEXKV_SHARED_CPU_CACHE=1): all shards join ONE
+        KVServer over one socket — instance_num>1 flips KVManager into
+        server_client_mode (shard 0 spawns the server, others connect), and
+        the cache budget scales by shard count so totals match private mode.
+        NB: server_client_mode re-enters the multi-client registration
+        territory — pair it with FLEXKV_ZMQ_IMMEDIATE=1 /
+        FLEXKV_TRANSLATE_PHYSICAL_DEVICE=1 (the B2 patch gates).
+        """
+        env = self._flexkv_env_vars()
+        base_port = env.get("FLEXKV_SERVER_RECV_PORT", "ipc:///tmp/flexkv_server")
+        if env.get("FLEXKV_SHARED_CPU_CACHE", "0") == "1":
+            env["FLEXKV_INSTANCE_NUM"] = str(num_shards)
+            env["FLEXKV_INSTANCE_ID"] = str(spec_idx)
+            env["FLEXKV_SERVER_RECV_PORT"] = base_port
+            per_shard_gb = float(env.get("FLEXKV_CPU_CACHE_GB", "16"))
+            env["FLEXKV_CPU_CACHE_GB"] = str(int(per_shard_gb * num_shards))
+        else:
+            env["FLEXKV_SERVER_RECV_PORT"] = f"{base_port}_g{worker_cvd.replace(',', '-')}"
+        env["FLEXKV_PY_METRICS_PORT"] = str(int(env.get("FLEXKV_PY_METRICS_PORT", "8080")) + spec_idx * 2)
+        env["FLEXKV_CPP_METRICS_PORT"] = str(int(env.get("FLEXKV_CPP_METRICS_PORT", "8081")) + spec_idx * 2)
+        return env
+
     # ------------------------------------------------------------------ #
     # verl interface — addresses
     # ------------------------------------------------------------------ #
@@ -734,7 +766,7 @@ class DynamoHttpServer:
             # "block_hash mismatch" and prefix-cache hits collapse.
             env.setdefault("PYTHONHASHSEED", "0")
             if self._enable_flexkv():
-                env.update(self._flexkv_env_vars())
+                env.update(self._flexkv_shard_env_vars(spec_idx, worker_cvd, len(worker_specs)))
 
             cmd = self._build_vllm_cmd(
                 served_model_name,
