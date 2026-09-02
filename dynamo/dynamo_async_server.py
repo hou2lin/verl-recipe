@@ -369,6 +369,13 @@ class DynamoHttpServer:
         for key, value in os.environ.items():
             if key.startswith("FLEXKV_"):
                 env[key] = value
+        # MPS off by default (explicit user setting wins): with FlexKV's
+        # default on, the KVManager races to start nvidia-cuda-mps-control,
+        # the daemon inherits this shard's restricted CUDA_VISIBLE_DEVICES,
+        # and EVERY later CUDA client in the container gets routed through
+        # MPS and fails with "No CUDA GPUs are available" on all other GPUs
+        # — including the next run's EngineCore (smokeB run3).
+        env.setdefault("FLEXKV_ENABLE_MPS", "0")
         return env
 
     # ------------------------------------------------------------------ #
