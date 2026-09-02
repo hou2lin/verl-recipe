@@ -45,6 +45,13 @@ export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 # bypass_mode=true (yaml default): rollout logprobs feed training directly,
 # the upstream fully_async recommendation. fsdp2 matches the upstream
 # fully_async example scripts.
+#
+# NOTE: the strategy MUST be set at the role level (actor.strategy=fsdp2).
+# FSDPActorConfig.__post_init__ copies actor.strategy over engine.strategy,
+# so a bare actor.fsdp_config.strategy=fsdp2 is silently clobbered back to
+# fsdp1 — where every offload knob (offload_policy/param_offload/
+# optimizer_offload) is a no-op for training and large models OOM in
+# update_actor.
 python3 -m recipe.dynamo.main_dynamo_fully_async \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
@@ -54,7 +61,7 @@ python3 -m recipe.dynamo.main_dynamo_fully_async \
     data.max_prompt_length="${max_prompt_length}" \
     data.max_response_length="${max_response_length}" \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
-    actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
