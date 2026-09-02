@@ -1,0 +1,25 @@
+# Gate R2-C64 task config: uni-agent ReAct on SWE-Bench Verified, docker
+# sandbox against the pod's dind sidecar (DOCKER_HOST=tcp://localhost:2375).
+# Slide-faithful knobs: max_steps=15 (max_turns), max_total_tokens=40960.
+- name: swe_bench
+  sandbox:
+    provider: docker
+    runtime_timeout: 7200
+  agent:
+    name: react
+    max_steps: 15
+    tools:
+      - name: str_replace_editor
+      - name: stateful_shell
+        command_timeout: 120
+        env_vars:
+          PAGER: "cat"
+          GIT_PAGER: "cat"
+          MANPAGER: "cat"
+          TQDM_DISABLE: "1"
+          PIP_PROGRESS_BAR: "off"
+      - name: submit
+    model:
+      temperature: 0.8
+      top_p: 0.9
+      max_total_tokens: 40960
