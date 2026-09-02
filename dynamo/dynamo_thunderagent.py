@@ -87,7 +87,9 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             str(self.model_config.local_path),
             "--router-block-size",
             str(self._thunderagent_router_block_size()),
-            "--router-reset-states",
+            # NB: no --router-reset-states — that flag exists only in older
+            # internal builds; dynamo >= 1.4.2 argparse rejects it. Builds
+            # that support it can opt back in via thunderagent.extra_args.
             *self._thunderagent_extra_args(),
         ]
 
