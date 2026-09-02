@@ -33,6 +33,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -2446,6 +2447,16 @@ class DynamoCheckpointEngineWorker(_BaseCheckpointEngineWorker):
       3. puts a watchdog (env VERL_DYNAMO_CE_UPDATE_TIMEOUT_S, default
          1800s, <=0 disables) on update_weights so a stuck first hop fails
          the job with a stage-labelled error instead of idling for hours.
+
+    The update_weights watchdog is a *timer thread*, not asyncio.wait_for:
+    the CUDA-IPC second hop (BucketedWeightSender.async_send_weights) issues
+    synchronous zmq recvs ON the actor's event loop, so when the engine-side
+    receiver dies mid-handshake (smokeA_run8: vllm load_weights raised on a
+    tied-weights model and the REQ/REP peer vanished) the loop is wedged in
+    native code and no asyncio timeout can ever be scheduled. The timer
+    thread os._exit(1)s the actor instead — Ray surfaces ActorDiedError to
+    the CheckpointEngineManager and the job fails minutes after the stall
+    with the stage log pointing at the culprit hop.
     """
 
     _WATCHDOG_ENV = "VERL_DYNAMO_CE_UPDATE_TIMEOUT_S"
@@ -2483,19 +2494,29 @@ class DynamoCheckpointEngineWorker(_BaseCheckpointEngineWorker):
         timeout_s = float(os.environ.get(self._WATCHDOG_ENV, "1800"))
         self._ce_log(f"update_weights ENTER (global_steps={global_steps}, watchdog={timeout_s:.0f}s)")
         t0 = time.time()
-        try:
-            if timeout_s > 0:
-                await asyncio.wait_for(super().update_weights(global_steps=global_steps), timeout=timeout_s)
-            else:
-                await super().update_weights(global_steps=global_steps)
-        except asyncio.TimeoutError:
-            raise RuntimeError(
-                f"[DynamoCEWorker] update_weights watchdog fired after {timeout_s:.0f}s "
+
+        def _watchdog_abort():
+            self._ce_log(
+                f"update_weights watchdog fired after {timeout_s:.0f}s "
                 f"(global_steps={global_steps}): the NCCL first hop from the trainer or the "
-                f"CUDA-IPC second hop into the dynamo engine never completed. Check the last "
-                f"'[DynamoCEWorker]'/'[v4a-4]' stage log to locate the stall; raise "
+                f"CUDA-IPC second hop into the dynamo engine never completed (a dead engine-side "
+                f"receiver leaves the zmq REQ sender blocked forever — check the replica shard log "
+                f"for an update_weights_from_ipc traceback, and the raw worker-*.out for the last "
+                f"'[DynamoCEWorker]' stage). Exiting the CE worker so the job fails fast; raise "
                 f"{self._WATCHDOG_ENV} for very large models."
-            ) from None
+            )
+            os._exit(1)
+
+        timer: Optional[threading.Timer] = None
+        if timeout_s > 0:
+            timer = threading.Timer(timeout_s, _watchdog_abort)
+            timer.daemon = True
+            timer.start()
+        try:
+            await super().update_weights(global_steps=global_steps)
+        finally:
+            if timer is not None:
+                timer.cancel()
         self._ce_log(f"update_weights EXIT +{time.time() - t0:.1f}s")
 
 
