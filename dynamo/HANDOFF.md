@@ -16,7 +16,7 @@
 ## 2. 环境与路径
 
 ```
-登录        ssh USER@LOGIN_HOST
+登录        ssh <user>@<dfw login FQDN>（见本地 server.txt，不入库）
             密码登录，用 cc_project/rany.sh（expect 封装）；短主机名会假死，必须用 FQDN
 $B          /workspace     （= fs1 路径的符号链接）
 $W          /workspace
