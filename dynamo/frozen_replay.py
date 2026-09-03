@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Frozen-replay harness for the FlexKV steady-state KV-reuse measurement.
+
+Reproduces the old-stack slide methodology (Qwen3-32B, C64, 32G GPU KV/rank,
+Uni-Agent SWE): a *fixed* set of trajectories is replayed against the serving
+engine at steady state, so the same multi-turn prefixes recur and FlexKV's
+CPU tier can be hit (H2D GET) instead of recomputed.
+
+Why a separate harness (not the RL trainer): live single-pass RL rollout has
+no KV reuse — each prompt is generated once, the GPU cache never spills, so
+GET=0 (measured: arm1 put=297 / get=0). The slide's numbers come from frozen
+*replay*, where teacher-forcing (prompt frozen per turn, response tokens
+discarded) keeps each trajectory's prefix stable across rounds.
+
+Design (mirrors the slide's "64 fixed trajectories x 8 rollouts = 902
+requests, forced shard routing"):
+  1. Load a fixed trajectory set (JSONL: one object per turn with the exact
+     prompt token context the RL run sent). Built by dump_trajectories.py
+     from an RL run's rollout logs.
+  2. Warm round: replay every request once so its prefix lands in the GPU
+     cache and (on eviction) the FlexKV CPU tier.
+  3. Steady-state rounds: replay the same set R times at concurrency C. With
+     teacher-forcing the prefixes are identical, so from round 2 on every
+     GPU-miss should be a FlexKV CPU hit (H2D GET) rather than a recompute.
+  4. Emit per-round wall-clock + throughput; the path breakdown
+     (GPU-hit/CPU-fetch/recompute) is read from the engine's FlexKV stats
+     (record_get) and vLLM prefix-cache counters after the run.
+
+The two arms (FLEXKV on/off) are the serving side; this harness is identical
+across arms — it only drives load. max_tokens=1 per request: we measure
+prefill KV reuse (prompt path), not decode, exactly like the slide's
+teacher-forced "response tokens discarded".
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import time
+
+import aiohttp
+
+
+async def _one_request(session, url, model, prompt_token_ids, sem, stats):
+    async with sem:
+        t0 = time.monotonic()
+        payload = {
+            "model": model,
+            # Replay the exact token context so prefixes match byte-for-byte
+            # across rounds (chat re-templating would perturb them).
+            "prompt": prompt_token_ids,
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        try:
+            async with session.post(url, json=payload) as resp:
+                await resp.json()
+                stats["ok"] += 1
+        except Exception as exc:  # noqa: BLE001 - harness must survive one bad req
+            stats["err"] += 1
+            stats.setdefault("errors", []).append(str(exc)[:120])
+        stats["latency_s"] += time.monotonic() - t0
+
+
+async def _round(session, url, model, requests, concurrency, stats):
+    sem = asyncio.Semaphore(concurrency)
+    tasks = [
+        asyncio.create_task(_one_request(session, url, model, r, sem, stats))
+        for r in requests
+    ]
+    await asyncio.gather(*tasks)
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--endpoint", required=True, help="http://host:port")
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--trajectories", required=True, help="JSONL of {prompt_token_ids: [...]}")
+    ap.add_argument("--concurrency", type=int, default=64)
+    ap.add_argument("--warm-rounds", type=int, default=1)
+    ap.add_argument("--steady-rounds", type=int, default=3)
+    ap.add_argument("--out", default="/workspace/phase2/replay_result.json")
+    args = ap.parse_args()
+
+    url = f"{args.endpoint.rstrip('/')}/v1/completions"
+    requests: list[list[int]] = []
+    with open(args.trajectories) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            ids = obj.get("prompt_token_ids") or obj.get("prompt")
+            if ids:
+                requests.append(ids)
+    if not requests:
+        raise SystemExit(f"no trajectories loaded from {args.trajectories}")
+
+    result = {
+        "endpoint": args.endpoint,
+        "model": args.model,
+        "num_requests_per_round": len(requests),
+        "concurrency": args.concurrency,
+        "rounds": [],
+    }
+    timeout = aiohttp.ClientTimeout(total=None)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for phase, nrounds in (("warm", args.warm_rounds), ("steady", args.steady_rounds)):
+            for r in range(nrounds):
+                stats = {"ok": 0, "err": 0, "latency_s": 0.0}
+                t0 = time.monotonic()
+                await _round(session, url, args.model, requests, args.concurrency, stats)
+                wall = time.monotonic() - t0
+                row = {
+                    "phase": phase,
+                    "round": r,
+                    "wall_s": round(wall, 3),
+                    "ok": stats["ok"],
+                    "err": stats["err"],
+                    "throughput_req_s": round(stats["ok"] / wall, 3) if wall else 0,
+                    "mean_latency_s": round(stats["latency_s"] / max(stats["ok"] + stats["err"], 1), 4),
+                }
+                result["rounds"].append(row)
+                print(f"[replay] {phase} round {r}: {row['ok']} ok / {row['err']} err "
+                      f"wall={row['wall_s']}s tput={row['throughput_req_s']} req/s "
+                      f"lat={row['mean_latency_s']}s", flush=True)
+
+    with open(args.out, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"[replay] wrote {args.out}", flush=True)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
