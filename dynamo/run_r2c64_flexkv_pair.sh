@@ -111,6 +111,8 @@ python3 -m verl.trainer.main_ppo \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.max_concurrent_sessions="${CONCURRENCY}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.task_config_path="${TASK_CONFIG}" \
     ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.model_name="${SERVED_MODEL_NAME}" \
+    ++actor_rollout_ref.rollout.custom.agent_framework.agent_runners.task.runner_kwargs.report_reward=True \
+    ++actor_rollout_ref.rollout.custom.agent_framework.use_reward_loop_worker=False \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=round-robin \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=false \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_engine_data=true \
