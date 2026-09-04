@@ -42,7 +42,7 @@ import time
 import aiohttp
 
 
-async def _one_request(session, url, model, prompt_token_ids, sem, stats):
+async def _one_request(session, url, model, prompt_token_ids, sem, stats, max_tokens=1):
     async with sem:
         t0 = time.monotonic()
         payload = {
@@ -50,7 +50,14 @@ async def _one_request(session, url, model, prompt_token_ids, sem, stats):
             # Replay the exact token context so prefixes match byte-for-byte
             # across rounds (chat re-templating would perturb them).
             "prompt": prompt_token_ids,
-            "max_tokens": 1,
+            # Teacher-forced generation: generate the recorded response length
+            # (real decode load, real in-flight KV pressure), DISCARD the
+            # output; the next turn uses the frozen recorded context. This is
+            # the slide's "response tokens discarded" semantics — max_tokens=1
+            # (prefill-only) understates rollout time AND removes the decode
+            # KV-block pressure that gates fetch landing.
+            "max_tokens": max_tokens,
+            "ignore_eos": max_tokens > 1,
             "temperature": 0.0,
             "stream": False,
         }
@@ -72,7 +79,17 @@ async def _one_trajectory(session, url, model, turns, think_time, sem, stats):
     async with sem:
         nturns = len(turns)
         for i, ctx in enumerate(turns):
-            await _one_request(session, url, model, ctx, asyncio.Semaphore(1), stats)
+            # generation length for this turn = the recorded response chunk
+            # (next turn context minus this one); last turn generates the
+            # trajectory-typical chunk so decode load stays realistic.
+            if i < nturns - 1:
+                gen_len = max(1, len(turns[i + 1]) - len(ctx))
+            elif nturns > 1:
+                gen_len = max(1, len(turns[-1]) - len(turns[-2]))
+            else:
+                gen_len = 512
+            await _one_request(session, url, model, ctx, asyncio.Semaphore(1), stats,
+                               max_tokens=gen_len)
             if think_time > 0 and i < nturns - 1:
                 await asyncio.sleep(think_time)
 
