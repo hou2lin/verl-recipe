@@ -24,7 +24,7 @@ echo "[srcKG8] $(date -u +%FT%TZ) START source-kg8-mt20" >> /workspace/phase2/sr
 FLEXKV=0 \
 EXP_NAME=src-kg8-mt20 \
 MODEL_PATH=/models/hub/models--Qwen--Qwen3-32B/snapshots/9216db5781bf21249d130ec9da846c4624c16137 \
-TRAIN_FILE=/workspace/data/uni_agent/swe_rebench_known_good_8.parquet \
+TRAIN_FILE=/workspace/data/uni_agent/swe_rebench_known_good_8_agentic.parquet \
 TASK_CONFIG=/workspace/phase2/task_config_swe_kg8.yaml \
 MAX_PROMPT_LENGTH=4096 MAX_RESPONSE_LENGTH=36864 \
 TRAIN_BATCH_SIZE=8 N_RESP_PER_PROMPT=8 MINI_BATCH_SIZE=8 \
