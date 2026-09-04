@@ -5,6 +5,7 @@ export PATH=/workspace/bin:$PATH
 export PYTHONPATH=/workspace/dynres/pkgroot:${PYTHONPATH:-}
 export DOCKER_HOST=tcp://localhost:2375
 export VERL_DYNAMO_CE_UPDATE_TIMEOUT_S=600
+export VERL_DYNAMO_FE_READY_TIMEOUT=2400
 # self-cleaning
 pkill -9 -f "main_pp[o]" 2>/dev/null; pkill -9 -f "_dynamo_vllm_with_contro[l]" 2>/dev/null
 pkill -9 -f "dynamo.fronten[d]" 2>/dev/null; pkill -9 -f "VLLM::EngineCor[e]" 2>/dev/null
