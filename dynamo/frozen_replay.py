@@ -64,6 +64,28 @@ async def _one_request(session, url, model, prompt_token_ids, sem, stats):
         stats["latency_s"] += time.monotonic() - t0
 
 
+async def _one_trajectory(session, url, model, turns, think_time, sem, stats):
+    """Real agent pattern: turns strictly sequential within a trajectory,
+    think-time between them (tool execution gap). Concurrency = trajectories
+    in flight, so between one trajectory's turns dozens of others interleave
+    — reproducing the turn-gap eviction/refetch dynamics of live rollout."""
+    async with sem:
+        nturns = len(turns)
+        for i, ctx in enumerate(turns):
+            await _one_request(session, url, model, ctx, asyncio.Semaphore(1), stats)
+            if think_time > 0 and i < nturns - 1:
+                await asyncio.sleep(think_time)
+
+
+async def _paced_round(session, url, model, trajectories, concurrency, think_time, stats):
+    sem = asyncio.Semaphore(concurrency)
+    tasks = [
+        asyncio.create_task(_one_trajectory(session, url, model, turns, think_time, sem, stats))
+        for turns in trajectories
+    ]
+    await asyncio.gather(*tasks)
+
+
 async def _round(session, url, model, requests, concurrency, stats):
     sem = asyncio.Semaphore(concurrency)
     tasks = [
@@ -80,21 +102,35 @@ async def main() -> None:
     ap.add_argument("--trajectories", required=True, help="JSONL of {prompt_token_ids: [...]}")
     ap.add_argument("--concurrency", type=int, default=64)
     ap.add_argument("--warm-rounds", type=int, default=1)
-    ap.add_argument("--steady-rounds", type=int, default=3)
+    ap.add_argument("--steady-rounds", type=int, default=3,
+                    help="flat mode: fixed steady rounds; paced mode: MAX passes (stops early on convergence)")
+    ap.add_argument("--paced", action="store_true",
+                    help="trajectory-paced replay: per-trajectory sequential turns with think-time, C = trajectories in flight (real agent pattern)")
+    ap.add_argument("--think-time", type=float, default=2.0,
+                    help="paced mode: seconds between a trajectory's turns (tool-execution gap)")
+    ap.add_argument("--converge-pct", type=float, default=5.0,
+                    help="paced mode: stop when round wall improves < this %% vs previous")
     ap.add_argument("--out", default="/workspace/phase2/replay_result.json")
     args = ap.parse_args()
 
     url = f"{args.endpoint.rstrip('/')}/v1/completions"
     requests: list[list[int]] = []
+    trajectories: list[list[list[int]]] = []
     with open(args.trajectories) as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             obj = json.loads(line)
-            ids = obj.get("prompt_token_ids") or obj.get("prompt")
-            if ids:
-                requests.append(ids)
+            if "turns" in obj:
+                trajectories.append(obj["turns"])
+                for t in obj["turns"]:
+                    requests.append(t)
+            else:
+                ids = obj.get("prompt_token_ids") or obj.get("prompt")
+                if ids:
+                    requests.append(ids)
+                    trajectories.append([ids])
     if not requests:
         raise SystemExit(f"no trajectories loaded from {args.trajectories}")
 
@@ -105,13 +141,21 @@ async def main() -> None:
         "concurrency": args.concurrency,
         "rounds": [],
     }
+    result["paced"] = bool(args.paced)
+    result["num_trajectories"] = len(trajectories)
+    result["think_time_s"] = args.think_time if args.paced else None
     timeout = aiohttp.ClientTimeout(total=None)
+    prev_wall = None
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for phase, nrounds in (("warm", args.warm_rounds), ("steady", args.steady_rounds)):
             for r in range(nrounds):
                 stats = {"ok": 0, "err": 0, "latency_s": 0.0}
                 t0 = time.monotonic()
-                await _round(session, url, args.model, requests, args.concurrency, stats)
+                if args.paced:
+                    await _paced_round(session, url, args.model, trajectories,
+                                       args.concurrency, args.think_time, stats)
+                else:
+                    await _round(session, url, args.model, requests, args.concurrency, stats)
                 wall = time.monotonic() - t0
                 row = {
                     "phase": phase,
@@ -126,6 +170,12 @@ async def main() -> None:
                 print(f"[replay] {phase} round {r}: {row['ok']} ok / {row['err']} err "
                       f"wall={row['wall_s']}s tput={row['throughput_req_s']} req/s "
                       f"lat={row['mean_latency_s']}s", flush=True)
+                if args.paced and phase == "steady" and prev_wall is not None:
+                    if prev_wall > 0 and (prev_wall - wall) / prev_wall * 100 < args.converge_pct:
+                        print(f"[replay] converged (<{args.converge_pct}% improvement); stopping", flush=True)
+                        prev_wall = wall
+                        break
+                prev_wall = wall if phase == "steady" else None
 
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)

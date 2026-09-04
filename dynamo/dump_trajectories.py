@@ -35,7 +35,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--glob", required=True, help="glob for trajectory.npz files")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--mode", choices=["prompt", "turns"], default="turns")
+    ap.add_argument("--mode", choices=["prompt", "turns", "traj"], default="turns")
     ap.add_argument("--turn-chunk", type=int, default=512,
                     help="response tokens per synthetic turn (turns mode)")
     ap.add_argument("--limit", type=int, default=0, help="max requests (0=all)")
@@ -60,6 +60,24 @@ def main() -> None:
                 if len(prompt) <= args.max_context:
                     requests.append(prompt)
                 continue
+            if args.mode == "traj":
+                # one JSONL row per trajectory: ordered teacher-forced turn
+                # contexts (turn k+1 strictly extends turn k) — for the paced
+                # replay that mirrors the real agent turn sequence.
+                resp_key = prefix + "response_ids"
+                response = d[resp_key].astype(int).tolist() if resp_key in d else []
+                turns = []
+                ctx = list(prompt)
+                if len(ctx) <= args.max_context:
+                    turns.append(list(ctx))
+                for i in range(0, len(response), args.turn_chunk):
+                    ctx = ctx + response[i : i + args.turn_chunk]
+                    if len(ctx) > args.max_context:
+                        break
+                    turns.append(list(ctx))
+                if turns:
+                    requests.append({"turns": turns})
+                continue
             # turns mode: frozen teacher-forced prefixes
             resp_key = prefix + "response_ids"
             response = d[resp_key].astype(int).tolist() if resp_key in d else []
@@ -80,9 +98,12 @@ def main() -> None:
 
     with open(args.out, "w") as f:
         for r in requests:
-            f.write(json.dumps({"prompt_token_ids": r}) + "\n")
+            if isinstance(r, dict):
+                f.write(json.dumps(r) + "\n")
+            else:
+                f.write(json.dumps({"prompt_token_ids": r}) + "\n")
 
-    lens = [len(r) for r in requests]
+    lens = [sum(len(t) for t in r["turns"]) if isinstance(r, dict) else len(r) for r in requests]
     print(f"[dump] {n_traj} trajectories -> {len(requests)} requests "
           f"(mode={args.mode}); ctx len min={min(lens)} max={max(lens)} "
           f"mean={sum(lens)//len(lens)}; wrote {args.out}", flush=True)
