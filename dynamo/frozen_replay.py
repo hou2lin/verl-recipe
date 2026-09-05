@@ -71,11 +71,17 @@ async def _one_request(session, url, model, prompt_token_ids, sem, stats, max_to
         stats["latency_s"] += time.monotonic() - t0
 
 
-async def _one_trajectory(session, url, model, turns, think_time, sem, stats):
+async def _one_trajectory(session, url, model, turns, think_time, sem, stats,
+                          gaps=None):
     """Real agent pattern: turns strictly sequential within a trajectory,
     think-time between them (tool execution gap). Concurrency = trajectories
     in flight, so between one trajectory's turns dozens of others interleave
-    — reproducing the turn-gap eviction/refetch dynamics of live rollout."""
+    — reproducing the turn-gap eviction/refetch dynamics of live rollout.
+
+    gaps: optional per-turn recorded tool-execution times (seconds), one per
+    turn transition (len == nturns-1). When present they replace the uniform
+    think_time, reproducing the real heavy-tailed, decorrelated arrival
+    process instead of a synchronized approximation."""
     async with sem:
         nturns = len(turns)
         for i, ctx in enumerate(turns):
@@ -90,15 +96,18 @@ async def _one_trajectory(session, url, model, turns, think_time, sem, stats):
                 gen_len = 512
             await _one_request(session, url, model, ctx, asyncio.Semaphore(1), stats,
                                max_tokens=gen_len)
-            if think_time > 0 and i < nturns - 1:
-                await asyncio.sleep(think_time)
+            if i < nturns - 1:
+                delay = gaps[i] if gaps and i < len(gaps) else think_time
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
 
 async def _paced_round(session, url, model, trajectories, concurrency, think_time, stats):
     sem = asyncio.Semaphore(concurrency)
     tasks = [
-        asyncio.create_task(_one_trajectory(session, url, model, turns, think_time, sem, stats))
-        for turns in trajectories
+        asyncio.create_task(_one_trajectory(session, url, model, turns, think_time,
+                                            sem, stats, gaps=gaps))
+        for turns, gaps in trajectories
     ]
     await asyncio.gather(*tasks)
 
@@ -140,14 +149,14 @@ async def main() -> None:
                 continue
             obj = json.loads(line)
             if "turns" in obj:
-                trajectories.append(obj["turns"])
+                trajectories.append((obj["turns"], obj.get("gaps")))
                 for t in obj["turns"]:
                     requests.append(t)
             else:
                 ids = obj.get("prompt_token_ids") or obj.get("prompt")
                 if ids:
                     requests.append(ids)
-                    trajectories.append([ids])
+                    trajectories.append(([ids], None))
     if not requests:
         raise SystemExit(f"no trajectories loaded from {args.trajectories}")
 
