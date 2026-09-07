@@ -119,6 +119,44 @@ V1-trainer files (`feat/dynamo-v1-migration`), all replay/benchmark harnesses
   `overlap_blocks` up to 2459; FlexKV H2D fetches land with 0 cancels in the
   healthy regime; GPU-hit + external-hit joint coverage 98%+.
 
+### Measured end-to-end benefit (same workload, two GPU generations)
+
+Frozen-replay A/B of the full chain (Dynamo kv-router frontend + 4×TP2
+`dynamo.vllm` shards, FlexKV on vs off), identical configuration on both
+machines: Qwen3-32B bf16, `--kv-cache-memory-bytes 32GiB/rank`
+(262,144 KV tokens per TP2 engine), concurrency 64, paced replay with 2 s
+think-time, 1 warm round + steady rounds until <5 % round-to-round change.
+Workload: 111 real multi-turn SWE-agent trajectories (3,952 requests per
+round, mean context 18.9k tokens, max 40,960) recorded from an RL rollout
+and replayed teacher-forced, so both arms see byte-identical requests.
+
+| | 8×H20 (96 GB) | 8×H100 (80 GB) |
+|---|---|---|
+| steady-round wall, FlexKV **off** | 2390.7 / 2474.4 s (mean 2432.5) | 1763.3 s |
+| steady-round wall, FlexKV **on** | 2258.0 / 2262.1 s (mean 2260.1) | 1803.1 s |
+| **round wall-clock change (on vs off)** | **−7.1 % (faster)** | +2.2 % (slower) |
+| mean request latency, off → on | 24.5 s → 22.6 s (−7.7 %) | 16.1 s → 17.1 s (+6.1 %) |
+| GPU prefix-cache hit rate | 76–79 % | ~94 % |
+| FlexKV external hit rate (on) | 18–21 % | 9.5 % |
+| H2D fetches completed (4 shards) | 1,244 | 357 |
+| GET fetch latency p50 / mean / p99 | 0.045 / 0.44 / 6.8 s | 0.20 / 0.53 / 4.3 s |
+| request errors / GET cancels / router `overlap_blocks` | 0 / 0 / 2459 | 0 / 0 / 2459 |
+
+Reading: the L2 tier pays off when GPU eviction pressure is high *and*
+recompute is expensive relative to a PCIe fetch. On H20 the slower compute
+keeps KV resident longer, GPU hit rate drops to ~77 %, FlexKV serves ~20 % of
+prefix tokens from DRAM, and end-to-end round time improves by 7.1 % — in
+line with the ~6.5 % originally reported for this stack on H20. On H100 the
+GPU already covers ~94 % of prefixes and recompute is cheap, so the fixed
+lookup/IPC cost of the L2 path slightly outweighs the fetch savings (−2.2 %).
+Every round in every arm completed with zero request errors on both machines.
+
+Benchmark stack: vLLM PR-54484 head `4582c0d`, ai-dynamo 1.4.2, FlexKV
+`17bec07` (pre-#279, upstream code path; robustness env-gates left at their
+default off). The replay harness (`frozen_replay.py`,
+`serve_dynamo_kvrouter_*`) lives on the research branch and is intentionally
+not part of this PR.
+
 ### Known issues / operating guidance (disclosed honestly)
 
 1. **High-miss operating points can livelock the current FlexKV
@@ -136,10 +174,14 @@ V1-trainer files (`feat/dynamo-v1-migration`), all replay/benchmark harnesses
    bucket without `model.embed_tokens.weight`. Use untied models (Qwen3-8B+)
    or co-locate tied pairs in one bucket. Worth reporting on the vLLM PR
    thread.
-3. **Benefit is hardware-dependent**: on compute-rich GPUs (H100) recompute
-   is cheap and the L2 tier's end-to-end gain can be neutral-to-negative;
-   compute-constrained parts (H20 class) are the win scenario. This PR
-   delivers capability and compatibility, not a universal speedup claim.
+3. **Benefit is hardware-dependent** (measured, see table above): on
+   compute-rich GPUs (H100) recompute is cheap and the GPU cache already
+   covers ~94 % of prefixes, so the L2 tier is a small net cost (+2.2 % round
+   time); on compute-constrained parts (H20) it is a clear win (−7.1 % round
+   time, −7.7 % latency). Rule of thumb: expect a gain when the FlexKV-off
+   GPU prefix hit rate is well below ~90 % and the fetch path is not
+   saturated. This PR delivers capability and compatibility, not a universal
+   speedup claim.
 
 ### Test plan
 
