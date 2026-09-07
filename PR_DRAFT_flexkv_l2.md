@@ -3,7 +3,7 @@
 > **STATUS: local draft, NOT submitted. 🔴 Hard rule: no external PR/MR without explicit user review and approval.**
 > Goal (user-settled 2026-09-07): make **verl + dynamo + vLLM + FlexKV L2 cache** work, as a **verl-recipe-only** change.
 > Base: `verl-project/verl-recipe` `main` (rebase to tip before submitting; `ee3aef1` at time of writing)
-> Head: `feat/dynamo-flexkv-l2` (to be cut from `feat/dynamo-dynres`, core + FlexKV files only)
+> Head: `feat/dynamo-flexkv-l2` — CUT at `e7fa725` on `upstream/main` (`ee3aef1`). NOTE: upstream main already ships the colocated dynamo recipe, so this PR is a focused delta: **13 files, +2050/−281** (fully_async standalone mode + FlexKV L2 wiring + smoke + tests + docs).
 > Supersedes `PR_DRAFT_fully_async.md`. The V1-trainer line stays on its own branch/draft (`feat/dynamo-v1-migration`).
 >
 > Validation stack (user-specified):
@@ -106,12 +106,15 @@ V1-trainer files (`feat/dynamo-v1-migration`), all replay/benchmark harnesses
 
 ### Acceptance evidence (validation stack above)
 
-- **smokeA** — Dynamo backend, 1+1 GPU (trainer / standalone rollout), 2 RL
-  steps with per-step weight sync choreography, verl tree clean:
-  `<PENDING — fill from smokeA_016c290.log>`
-- **smokeB** — same smoke with `FLEXKV=1`: FlexKV server per shard, D2H PUT
-  observed, connector reset survives weight sync:
-  `<PENDING — fill from smokeB_016c290.log>`
+- **smokeA PASS** (2026-09-07 07:31 UTC) — Dynamo backend, 1+1 GPU
+  (trainer / standalone rollout), Qwen3-8B, 2 RL steps with per-step weight
+  sync choreography (`update_weights ENTER global_steps=2` → step 2 trained),
+  verl tree clean, `PASS: Dynamo fully_async smoke completed`.
+- **smokeB PASS** (2026-09-07 08:30 UTC) — same smoke with `FLEXKV=1` on
+  **unpatched FlexKV `016c290`**: FlexKV initialized from env (KV layout
+  derived from resolved cache config — the #279 path), 4 successful D2H PUT
+  operations, the last one **after** the weight sync (CPU tier survives the
+  choreography), `PASS` + tree clean.
 - Full-chain serving validation (8×H100, 4×TP2, kv-router): router
   `overlap_blocks` up to 2459; FlexKV H2D fetches land with 0 cancels in the
   healthy regime; GPU-hit + external-hit joint coverage 98%+.
