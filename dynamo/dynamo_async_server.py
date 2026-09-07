@@ -33,6 +33,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -41,9 +42,9 @@ import ray
 import requests
 from ray.actor import ActorHandle
 
-from verl.checkpoint_engine.base import CheckpointEngineWorker
+from verl.checkpoint_engine.base import CheckpointEngineWorker as _BaseCheckpointEngineWorker
+from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.config import omega_conf_to_dataclass
-from verl.utils.device import get_torch_device
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica
@@ -159,6 +160,45 @@ class DynamoHttpServer:
         # Set by ServerAdapter.update_weights to tag generations.
         self.global_steps: Optional[int] = None
 
+        # Partial-rollout gate: abort_all_requests() clears it and pauses the
+        # engines; resume_generation() resumes the engines and sets it.
+        # generate() waits on it so new / client-retried requests queue here
+        # instead of reaching a paused vLLM engine.
+        self._generation_resumed = asyncio.Event()
+        self._generation_resumed.set()
+        # SYNC_HANG_FIX: armed by abort_all_requests, cancelled by
+        # resume_generation. Screams in the driver log when the paused window
+        # exceeds engine_kwargs.dynamo.abort_resume_watchdog_s (default 600s),
+        # i.e. the CheckpointEngineManager choreography upstream is stuck.
+        self._resume_watchdog_task: Optional[asyncio.Task] = None
+
+        # Sleep/wake around training follows verl's rollout.free_cache_engine.
+        # An explicit engine_kwargs.dynamo.free_engine_on_train may only
+        # restate it — a contradiction between the two switches used to no-op
+        # silently (OOM in colocate training); now it fails at startup.
+        verl_free_cache_engine = bool(getattr(self.config, "free_cache_engine", False))
+        explicit_free_engine = self._dynamo_cfg().get("free_engine_on_train")
+        if (
+            explicit_free_engine is not None
+            and self._dynamo_cfg_bool("free_engine_on_train", verl_free_cache_engine) != verl_free_cache_engine
+        ):
+            raise ValueError(
+                f"engine_kwargs.dynamo.free_engine_on_train={explicit_free_engine!r} contradicts "
+                f"rollout.free_cache_engine={verl_free_cache_engine}. This switch now mirrors "
+                "rollout.free_cache_engine and is no longer independently tunable. To keep engines "
+                "resident during training (the old free_engine_on_train=false behavior), set "
+                "rollout.free_cache_engine=false as well."
+            )
+        if verl_free_cache_engine and not bool(getattr(self.config, "enable_sleep_mode", True)):
+            # vLLM sleep() silently no-ops without sleep mode — the trainer
+            # would believe memory was freed while nothing happened (OOM later).
+            raise ValueError(
+                "rollout.free_cache_engine=true requires rollout.enable_sleep_mode=true for the "
+                "dynamo backend: vLLM sleep() is a silent no-op without sleep mode, so training "
+                "would OOM with no error at the sleep site."
+            )
+        self._free_engine_on_train_flag = verl_free_cache_engine
+
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port: Optional[int] = None  # = frontend_port once ready
 
@@ -247,8 +287,13 @@ class DynamoHttpServer:
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _free_engine_on_train(self) -> bool:
-        """Opt-in sleep/wake of colocated vLLM workers around training."""
-        return self._dynamo_cfg_bool("free_engine_on_train", False)
+        """Sleep/wake of colocated vLLM workers around training.
+
+        Mirrors verl's rollout.free_cache_engine (validated in __init__), so
+        the trainer-side release/resume gating and the dynamo-side engine
+        sleep/wake can never silently diverge.
+        """
+        return self._free_engine_on_train_flag
 
     def _enable_rl_mode(self) -> bool:
         """Enable Dynamo's RL/TITO-friendly vLLM mode."""
@@ -292,6 +337,77 @@ class DynamoHttpServer:
             ),
         }
         env["DYN_ENABLE_RL"] = "true" if self._enable_rl_mode() else "false"
+        return env
+
+    def _enable_flexkv(self) -> bool:
+        """Enable the FlexKV CPU-tier KV cache (KVConnector) in every shard."""
+        return self._dynamo_cfg_bool("enable_flexkv", False)
+
+    def _flexkv_env_vars(self) -> dict[str, str]:
+        """Env forwarded into every dynamo.vllm subprocess when FlexKV is on.
+
+        ``DYNAMO_USE_FLEXKV=1`` activates the KVEventCollector inside FlexKV's
+        vllm_v1_adapter (upstream taco line), which re-publishes FlexKV
+        CPU-cache hits as vLLM ``BlockStored`` events over the ZMQ KV-events
+        channel so the Dynamo KV router can route future requests to workers
+        that already hold those blocks in CPU memory.
+
+        All ``FLEXKV_*`` vars in the trainer environment are forwarded
+        unchanged (config file via FLEXKV_CONFIG_PATH is the primary channel;
+        the explicit list below only documents the common knobs). With the
+        default FlexKV config (instance_num=1, no server_client_mode) each
+        shard runs FlexKV in-process — no external KVServer, no registration
+        protocol.
+
+        Cache-staleness note: no extra reset wiring is needed on this stack —
+        vLLM's pause path (EngineCore.pause_scheduler, clear_cache=True,
+        reset_connector=True default) already resets the FlexKV connector on
+        every abort_all_requests, so the CPU tier cannot serve stale KV
+        across RL weight updates.
+        """
+        env: dict[str, str] = {"DYNAMO_USE_FLEXKV": "1"}
+        for key, value in os.environ.items():
+            if key.startswith("FLEXKV_"):
+                env[key] = value
+        # MPS off by default (explicit user setting wins): with FlexKV's
+        # default on, the KVManager races to start nvidia-cuda-mps-control,
+        # the daemon inherits this shard's restricted CUDA_VISIBLE_DEVICES,
+        # and EVERY later CUDA client in the container gets routed through
+        # MPS and fails with "No CUDA GPUs are available" on all other GPUs
+        # — including the next run's EngineCore (smokeB run3).
+        env.setdefault("FLEXKV_ENABLE_MPS", "0")
+        return env
+
+    def _flexkv_shard_env_vars(self, spec_idx: int, worker_cvd: str, num_shards: int) -> dict[str, str]:
+        """Per-shard FlexKV isolation on multi-shard nodes (port of b20472a).
+
+        Private mode (default): every shard runs its own in-process FlexKV
+        stack, so the default ipc socket path (FLEXKV_SERVER_RECV_PORT,
+        ipc:///tmp/flexkv_server) collides across shards — GPU registrations
+        crosstalk and a shard's TransferManager can eat another shard's
+        registration. Suffix the path with the shard's GPU ids. The metrics
+        servers likewise default to fixed ports 8080/8081; offset per shard.
+
+        Shared pool mode (FLEXKV_SHARED_CPU_CACHE=1): all shards join ONE
+        KVServer over one socket — instance_num>1 flips KVManager into
+        server_client_mode (shard 0 spawns the server, others connect), and
+        the cache budget scales by shard count so totals match private mode.
+        NB: server_client_mode re-enters the multi-client registration
+        territory — pair it with FLEXKV_ZMQ_IMMEDIATE=1 /
+        FLEXKV_TRANSLATE_PHYSICAL_DEVICE=1 (the B2 patch gates).
+        """
+        env = self._flexkv_env_vars()
+        base_port = env.get("FLEXKV_SERVER_RECV_PORT", "ipc:///tmp/flexkv_server")
+        if env.get("FLEXKV_SHARED_CPU_CACHE", "0") == "1":
+            env["FLEXKV_INSTANCE_NUM"] = str(num_shards)
+            env["FLEXKV_INSTANCE_ID"] = str(spec_idx)
+            env["FLEXKV_SERVER_RECV_PORT"] = base_port
+            per_shard_gb = float(env.get("FLEXKV_CPU_CACHE_GB", "16"))
+            env["FLEXKV_CPU_CACHE_GB"] = str(int(per_shard_gb * num_shards))
+        else:
+            env["FLEXKV_SERVER_RECV_PORT"] = f"{base_port}_g{worker_cvd.replace(',', '-')}"
+        env["FLEXKV_PY_METRICS_PORT"] = str(int(env.get("FLEXKV_PY_METRICS_PORT", "8080")) + spec_idx * 2)
+        env["FLEXKV_CPP_METRICS_PORT"] = str(int(env.get("FLEXKV_CPP_METRICS_PORT", "8081")) + spec_idx * 2)
         return env
 
     # ------------------------------------------------------------------ #
@@ -598,6 +714,11 @@ class DynamoHttpServer:
             env.update(self._dynamo_env_vars())
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
             env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
+            # verl's base vLLMColocateWorkerExtension._get_zmq_handle consumes
+            # this natively (int(base) + dp-resolved local rank; dynamo shards
+            # run dp=1 so the resolver is the identity) — the recipe no longer
+            # overrides _get_zmq_handle.
+            env["VERL_ZMQ_BASE_TRAINER_RANK"] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
             # Match verl's native vLLM colocated path: both trainer-side
             # BucketedWeightSender and vLLM-side BucketedWeightReceiver include
@@ -644,6 +765,8 @@ class DynamoHttpServer:
             # the same prefix hashes differently per worker → the router logs
             # "block_hash mismatch" and prefix-cache hits collapse.
             env.setdefault("PYTHONHASHSEED", "0")
+            if self._enable_flexkv():
+                env.update(self._flexkv_shard_env_vars(spec_idx, worker_cvd, len(worker_specs)))
 
             cmd = self._build_vllm_cmd(
                 served_model_name,
@@ -855,6 +978,14 @@ class DynamoHttpServer:
             executor_backend = "uni" if tp == 1 else "mp"
         cmd += ["--distributed-executor-backend", str(executor_backend)]
         cmd += ["--kv-events-config", kv_events_config_json]
+        if self._enable_flexkv():
+            # FlexKVConnectorV1 is registered natively in vLLM's
+            # KVConnectorFactory (main + #54484 line). kv_both: the shard both
+            # saves (PUT, incl. offload_aborted_kv) and loads (GET) CPU-tier KV.
+            cmd += [
+                "--kv-transfer-config",
+                '{"kv_connector":"FlexKVConnectorV1","kv_role":"kv_both"}',
+            ]
         # Pass through extra args from rollout.engine_kwargs.dynamo.extra_args.
         extra = self._dynamo_cfg().get("extra_args") or []
         if isinstance(extra, list):
@@ -866,6 +997,13 @@ class DynamoHttpServer:
             return
         env = os.environ.copy()
         env.update(self._dynamo_env_vars())
+        # In RL mode the frontend binds an extra "RL worker discovery" listener
+        # on DYN_RL_PORT (default 8001, dynamo service_v2.rs). With two pools
+        # on one node (separate_async: hybrid on trainer GPUs + standalone on
+        # rollout GPUs) the fixed default collides and the second frontend
+        # exits rc=1 — allocate a free port per pool.
+        if "DYN_RL_PORT" not in env:
+            env["DYN_RL_PORT"] = str(self._allocate_tcp_port(bind_wildcard=True))
 
         cmd = [
             sys.executable,
@@ -1098,17 +1236,35 @@ class DynamoHttpServer:
         image_data=None,
         video_data=None,
         priority: int = 0,
+        audio_data=None,
+        mm_processor_kwargs=None,
+        **kwargs,
     ):
         """Dispatch generation through the Dynamo frontend HTTP router.
 
         the actor manages the
         subprocess stack, while token generation goes through the OpenAI-style
         frontend so Dynamo can route across registered workers.
+
+        Remaining kwargs from verl clients (e.g. priority scheduling hints)
+        are accepted and ignored; Dynamo's KV router owns request scheduling.
+        Multimodal inputs are rejected loudly — silently dropping them would
+        train on text-only prompts while reporting success.
         """
-        if image_data is not None or video_data is not None:
+        if image_data is not None or video_data is not None or audio_data is not None or mm_processor_kwargs:
             return self._build_token_output(
                 stop_reason="error: Dynamo frontend generate does not support multimodal inputs",
             )
+
+        # Partial rollout: while the engines are paused (abort_all_requests),
+        # answer immediately with an empty aborted output instead of parking
+        # the coroutine. FullyAsyncLLMServerClient polls with a 1s retry loop,
+        # so parked coroutines would only pin this actor's max_concurrency
+        # slots — with every in-flight trajectory parked, the control calls
+        # that eventually open the gate (resume_generation) could never be
+        # scheduled, deadlocking the first on_step_end.
+        if not self._generation_resumed.is_set():
+            return self._build_token_output(token_ids=[], stop_reason="aborted", allow_empty=True)
 
         if self._use_direct_generate():
             return await self._generate_direct(prompt_ids, sampling_params, request_id)
@@ -1137,6 +1293,19 @@ class DynamoHttpServer:
                 )
             return self._completion_response_to_token_output(json.loads(body_text), include_log_probs=include_log_probs)
         except Exception:
+            if not self._generation_resumed.is_set():
+                # The engines are paused (abort_all_requests): an in-flight
+                # request whose frontend response errored out was almost
+                # certainly killed by the pause. Report it as aborted-empty so
+                # FullyAsyncLLMServerClient retries after resume instead of
+                # failing the trajectory. (A clean abort response still
+                # returns partial tokens via finish_reason="abort".)
+                logger.warning(
+                    "[generate] frontend dispatch failed while engines are paused; "
+                    "treating as aborted (request_id=%s)",
+                    request_id,
+                )
+                return self._build_token_output(token_ids=[], stop_reason="aborted", allow_empty=True)
             logger.exception("[generate] frontend dispatch failed (request_id=%s)", request_id)
             raise
 
@@ -1332,10 +1501,17 @@ class DynamoHttpServer:
             if not token_ids:
                 raise RuntimeError(f"direct_generate @ {endpoint} returned no tokens: {result}")
             log_probs = result.get("log_probs") if include_log_probs else None
+            direct_finish_reason = result.get("finish_reason")
+            if direct_finish_reason in ("abort", "cancelled"):
+                direct_stop_reason = "aborted"
+            elif direct_finish_reason:
+                direct_stop_reason = "completed"
+            else:
+                direct_stop_reason = None
             return self._build_token_output(
                 token_ids=token_ids,
                 log_probs=log_probs,
-                stop_reason="completed" if result.get("finish_reason") else None,
+                stop_reason=direct_stop_reason,
             )
         except Exception:
             logger.exception("[generate] direct sidecar request failed (request_id=%s)", request_id)
@@ -1417,7 +1593,24 @@ class DynamoHttpServer:
         if tokenizer is None:
             raise RuntimeError("model_config.tokenizer is required for Dynamo frontend generation")
         self._log_engine_data_token_ids_status(choice, data)
-        token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
+        finish_reason = choice.get("finish_reason")
+        is_aborted = finish_reason in ("abort", "cancelled")
+
+        def _aborted_empty():
+            # Aborted with no trustworthy partial data: return an empty output
+            # with stop_reason "aborted" so FullyAsyncLLMServerClient retries
+            # the same prompt after resume — never pad fallback tokens here.
+            return self._build_token_output(
+                token_ids=[],
+                log_probs=[] if include_log_probs else None,
+                stop_reason="aborted",
+                allow_empty=True,
+            )
+
+        token_ids = self._extract_completion_token_ids(
+            choice, data, tokenizer, allow_text_mapping=not include_log_probs
+        )
+        used_text_fallback = token_ids is None
         if token_ids is None:
             logger.warning(
                 "Dynamo frontend response did not include parseable token ids; falling back to text encode. "
@@ -1425,12 +1618,51 @@ class DynamoHttpServer:
             )
             token_ids = normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
         if not token_ids:
+            if is_aborted:
+                return _aborted_empty()
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
-        log_probs = self._extract_completion_log_probs(choice, len(token_ids), data) if include_log_probs else None
-        finish_reason = choice.get("finish_reason")
+
+        log_probs = None
+        if include_log_probs:
+            if used_text_fallback:
+                if is_aborted:
+                    return _aborted_empty()
+                # Re-encoded text token ids have no correspondence with the
+                # sampled tokens the frontend logprobs describe — aligning them
+                # would be silent data corruption. Point at the config instead.
+                raise RuntimeError(
+                    "calculate_log_probs=True requires a real token-id channel, but this response "
+                    "had no parseable token ids (text re-encode fallback). Enable "
+                    "engine_kwargs.dynamo.request_engine_data (or return_tokens_as_token_ids), "
+                    "or disable calculate_log_probs."
+                )
+            try:
+                log_probs = self._extract_completion_log_probs(choice, len(token_ids), data)
+                if log_probs is None:
+                    # No trustworthy logprob source at all (no engine_data
+                    # channel and no frontend token_logprobs). Deferring this
+                    # produces log_probs=None TokenOutputs that starve or
+                    # crash the training consumer far from the root cause.
+                    raise RuntimeError(
+                        "calculate_log_probs is enabled but the response carries no logprob "
+                        "source (neither nvext.engine_data.completion_logprobs nor "
+                        "choice.logprobs.token_logprobs). Enable "
+                        "engine_kwargs.dynamo.request_engine_data or fix the frontend config."
+                    )
+            except RuntimeError:
+                if is_aborted:
+                    # Partial data from an aborted request with inconsistent
+                    # logprobs is untrusted — drop it and let the client retry.
+                    return _aborted_empty()
+                raise
         if finish_reason == "stop" or finish_reason == "length":
             stop_reason = "completed"
-        elif finish_reason == "abort":
+        elif finish_reason in ("abort", "cancelled"):
+            # ai-dynamo's handlers normalize vLLM's "abort" to "cancelled"
+            # (dynamo.common.utils.engine_response.normalize_finish_reason)
+            # before the Rust frontend serializes the response — treat both
+            # as aborted so partial-rollout resume triggers instead of a
+            # truncated trajectory silently entering training as completed.
             stop_reason = "aborted"
         else:
             stop_reason = finish_reason
@@ -1472,21 +1704,31 @@ class DynamoHttpServer:
         token_ids: Optional[list[int]] = None,
         log_probs: Optional[list[float]] = None,
         stop_reason: Optional[str] = None,
+        allow_empty: bool = False,
     ):
         """Build a verl TokenOutput while preserving AgentLoop shape invariants."""
         from verl.workers.rollout.replica import TokenOutput
 
-        token_ids = token_ids or self._fallback_token_ids()
-        if log_probs is not None:
-            if len(log_probs) < len(token_ids):
-                log_probs = log_probs + [0.0] * (len(token_ids) - len(log_probs))
-            elif len(log_probs) > len(token_ids):
-                log_probs = log_probs[: len(token_ids)]
+        if not allow_empty:
+            token_ids = token_ids or self._fallback_token_ids()
+        else:
+            token_ids = token_ids or []
+        if log_probs is not None and len(log_probs) != len(token_ids):
+            raise RuntimeError(
+                f"log_probs/token_ids length mismatch ({len(log_probs)} vs {len(token_ids)}); "
+                "refusing to pad/truncate (fake logprobs would corrupt training data)."
+            )
+        # Empty (aborted-before-first-token) outputs carry NO version tag:
+        # the client aggregates min/max_global_steps per attempt regardless of
+        # token count, so tagging a token-less attempt inflates trajectory
+        # version-span metrics. FullyAsyncLLMServerClient only registers
+        # non-None versions, so omitting the key skips the attempt cleanly.
+        extra_fields = {"global_steps": self.global_steps or 0} if token_ids else {}
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
-            extra_fields={"global_steps": self.global_steps or 0},
+            extra_fields=extra_fields,
         )
 
     def _fallback_token_ids(self) -> list[int]:
@@ -1518,8 +1760,15 @@ class DynamoHttpServer:
         choice: dict[str, Any],
         response: Optional[dict[str, Any]] = None,
         tokenizer: Optional[Any] = None,
+        allow_text_mapping: bool = True,
     ) -> Optional[list[int]]:
-        """Extract vLLM OpenAI extension token ids when available."""
+        """Extract vLLM OpenAI extension token ids when available.
+
+        ``allow_text_mapping=False`` disables the per-token text→id mapping
+        channel: it is CONTENT-dependent (tokens like "" don't round-trip),
+        so ids recovered through it cannot be trusted to align with logprobs.
+        The exact ``token_id:N`` string parse stays available either way.
+        """
         from verl.utils.tokenizer import normalize_token_ids
 
         candidates: list[Any] = [
@@ -1594,7 +1843,7 @@ class DynamoHttpServer:
             token_ids_from_strings = DynamoHttpServer._parse_token_id_strings(token_strings)
             if token_ids_from_strings is not None:
                 return token_ids_from_strings
-            if tokenizer is not None:
+            if tokenizer is not None and allow_text_mapping:
                 return DynamoHttpServer._encode_logprob_token_strings(token_strings, tokenizer)
         return None
 
@@ -1657,6 +1906,15 @@ class DynamoHttpServer:
             values = engine_data.get("completion_logprobs")
             if isinstance(values, list):
                 return DynamoHttpServer._normalize_log_probs(values, token_count)
+            if isinstance(engine_data.get("completion_token_ids"), list):
+                # dynamo's handler omits completion_logprobs when its own
+                # token/logprob accounting misaligned (documented degradation).
+                # The frontend-aggregated token_logprobs come from a different
+                # accumulator — even a length match would be untrustworthy.
+                raise RuntimeError(
+                    "dynamo omitted engine_data.completion_logprobs (server-side token/logprob "
+                    "misalignment, see worker log); refusing cross-provenance frontend logprobs."
+                )
 
         logprobs = choice.get("logprobs")
         if not isinstance(logprobs, dict):
@@ -1670,12 +1928,26 @@ class DynamoHttpServer:
 
     @staticmethod
     def _normalize_log_probs(values: list[Any], token_count: int) -> list[float]:
-        """Pad/truncate selected-token logprobs to match token ids."""
+        """Validate selected-token logprobs against the token count.
+
+        Fail fast on length mismatch or None entries: a padded 0.0 is a fake
+        logprob (probability 1.0) that silently poisons rollout_log_probs —
+        under rollout_correction bypass_mode it feeds the policy-loss ratio
+        directly. A loud error here beats corrupted training data.
+        """
+        if len(values) != token_count:
+            raise RuntimeError(
+                f"Dynamo returned {len(values)} logprobs for {token_count} tokens; "
+                "refusing to pad/truncate (fake logprobs would corrupt training data)."
+            )
         result: list[float] = []
-        for value in values[:token_count]:
-            result.append(0.0 if value is None else float(value))
-        if len(result) < token_count:
-            result.extend([0.0] * (token_count - len(result)))
+        for index, value in enumerate(values):
+            if value is None:
+                raise RuntimeError(
+                    f"Dynamo returned a None logprob at position {index}/{token_count}; "
+                    "refusing to substitute 0.0 (probability 1.0) for a real value."
+                )
+            result.append(float(value))
         return result
 
     async def collective_rpc(
@@ -1765,12 +2037,20 @@ class DynamoHttpServer:
             logger.info("[DynamoHttpServer] wake_up: no control sidecar, skipping")
             return
         # bridge to engine.wake_up via control sidecar (engine method,
-        # not collective_rpc — handled in sidecar).
-        await self._engine_method_all("wake_up", kwargs=kwargs)
+        # not collective_rpc — handled in sidecar). Weight/KV re-onlining can
+        # exceed the default 120s on large models.
+        await self._engine_method_all("wake_up", kwargs=kwargs, timeout=600)
 
     async def sleep(self, **kwargs):
         # NB: no node_rank guard — each per-node server sleeps its OWN local
         # workers (self._control_endpoints are node-local), so all nodes must run.
+        #
+        # reset_connector (fork replica.py:277-284 forwards it on the False
+        # branch): AsyncLLM.sleep already defaults reset_connector=True on
+        # this vLLM line, so dropping the kwarg here keeps the engine default
+        # (connector reset on sleep) — correct for FlexKV too. Sleep level 1
+        # drops GPU KV contents regardless.
+        kwargs.pop("reset_connector", None)
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] sleep: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
@@ -1780,49 +2060,204 @@ class DynamoHttpServer:
         # v1 can't refit weights, so use sleep level 1 (offload weights to CPU +
         # drop KV); wake_up restores weights from CPU — no refit needed.
         kwargs.setdefault("level", 1)
-        await self._engine_method_all("sleep", kwargs=kwargs)
+        await self._engine_method_all("sleep", kwargs=kwargs, timeout=600)
 
-    async def clear_kv_cache(self):
+    async def clear_kv_cache(self, reset_connector: bool = True):
+        # reset_connector is forwarded: with FlexKV (or any KV connector) on,
+        # the CPU tier must drop stale KV too. Without a connector configured
+        # vLLM treats reset_prefix_cache(reset_connector=True) as a no-op
+        # success (scheduler.reset_connector_cache logs and returns True).
         if not self._control_endpoints:
             return
-        await self._engine_method_all("reset_prefix_cache")
+        await self._engine_method_all(
+            "reset_prefix_cache", kwargs={"reset_connector": bool(reset_connector)}
+        )
 
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
 
-    async def release_kv_cache(self):
-        """Release only kv_cache GPU memory, keeping model weights intact.
+    async def release_kv_cache(self, reset_connector: bool = True):
+        """Pre-NCCL-sync hook: weights must stay in place for the first hop.
 
-        Called by CheckpointEngineManager before backends like NCCL or NIXL
-        rebuild process groups. Dynamo's per-node sidecars route this through
-        the standard reset_prefix_cache path; the engine keeps weights
-        resident (sleep_level=1 from DynamoRollout) so the trainer can write
-        through to live tensors.
+        The KV cache was already invalidated by abort_all_requests
+        (pause_generation with clear_cache=True) one step earlier in the
+        CheckpointEngineManager choreography — contents only, the KV pool GPU
+        memory stays resident, same as upstream vLLM's stub (TODO upstream:
+        true KV release). reset_connector: fork-signature parity, see
+        clear_kv_cache.
+
+        SYNC_HANG_FIX: log so the CheckpointEngineManager choreography step 3
+        is visible in the driver log (the 13h smokeA hang was undebuggable
+        partly because steps 2-5 emitted nothing).
         """
-        if not self._control_endpoints:
-            return
-        await self._engine_method_all("reset_prefix_cache")
+        logger.info(
+            "[DynamoHttpServer] release_kv_cache: noop (KV invalidated at abort; pool stays resident) node=%s",
+            self.node_rank,
+        )
+        return None
 
-    async def resume_kv_cache(self):
-        """Restore kv_cache GPU memory after a weight sync.
+    async def resume_kv_cache(self, reset_connector: bool = True):
+        """Post-NCCL-sync counterpart to release_kv_cache. Parity stub.
 
-        Counterpart to release_kv_cache(). Dynamo never truly releases KV
-        memory (sleep_level=1 keeps weights resident; reset_prefix_cache
-        only drops the cache contents), so there is nothing to resume.
+        SYNC_HANG_FIX: log = choreography step 7 marker, see release_kv_cache.
         """
-        return
+        logger.info("[DynamoHttpServer] resume_kv_cache: noop (node=%s)", self.node_rank)
+        return None
 
     async def wait_for_requests_to_drain(self):
         if not self._control_endpoints:
             return
         await self._engine_method_all("wait_for_requests_to_drain")
 
-    async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # dynamo doesn't expose a global abort; v1 returns no-op result so
-        # RolloutReplica.abort_all_requests's gather doesn't blow up.
-        return {"aborted_count": 0, "request_ids": []}
+    async def probe_logprob_channel(self):
+        """Startup probe: verify a trustworthy logprob source end-to-end.
+
+        With calculate_log_probs on, a missing token-id/logprob channel only
+        surfaces as per-request errors — the trainer then waits forever for
+        trajectories that never arrive (silent hang). One probe request at
+        launch turns that into an immediate, actionable startup failure.
+        """
+        probe_id = f"logprob-probe-{time.time_ns()}"
+        # Right after "workers registered" the frontend's model registration
+        # can still be propagating (observed: 404 with empty body ~16ms after
+        # the health check passes). Retry within a window; deterministic
+        # config errors just re-raise after the deadline — still fail-fast
+        # relative to a training-time hang. Each attempt is HARD-capped with
+        # asyncio.wait_for: without it, a connected-but-unresponsive frontend
+        # holds the probe for the full request_timeout_s (600s default,
+        # 1800s in the recommended config) and the deadline never fires.
+        window_s = float(self._dynamo_cfg().get("logprob_probe_timeout_s", 60))
+        deadline = time.monotonic() + window_s
+        last_error: Optional[BaseException] = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if isinstance(last_error, asyncio.TimeoutError):
+                    raise RuntimeError(
+                        f"logprob channel probe timed out after {window_s}s: the frontend accepted "
+                        "connections but never answered the probe request"
+                    ) from last_error
+                raise last_error if last_error is not None else RuntimeError("logprob probe never ran")
+            try:
+                output = await asyncio.wait_for(
+                    self.generate(
+                        prompt_ids=self._fallback_token_ids(),
+                        sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
+                        request_id=probe_id,
+                        thunderagent_session_id=probe_id,
+                    ),
+                    timeout=max(1.0, min(15.0, remaining)),
+                )
+                break
+            except (RuntimeError, asyncio.TimeoutError) as error:
+                last_error = error
+                await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
+            raise RuntimeError(
+                f"logprob channel probe failed: got log_probs={output.log_probs!r} for "
+                f"{len(output.token_ids)} tokens"
+            )
+        finalize = getattr(self, "finalize_program", None)
+        if finalize is not None:
+            await finalize(probe_id)
+        logger.info("[DynamoHttpServer] logprob channel probe OK")
+
+    async def abort_all_requests(
+        self,
+        reset_prefix_cache: bool = True,
+        checkpoint_kv: bool = False,
+        timeout_s: float = 30.0,
+    ):
+        """Abort all in-flight requests on this node's dynamo.vllm shards.
+
+        Bridges vLLM AsyncLLM.pause_generation (vLLM >= 0.12) through each
+        shard's control sidecar: aborts in-flight requests (the frontend
+        returns their partial tokens with finish_reason "abort"), drains,
+        optionally clears caches, and leaves the engines paused. New and
+        client-retried generate() calls block on the resume gate until
+        resume_generation().
+
+        ``checkpoint_kv`` / ``timeout_s`` mirror the fork's vLLMHttpServer
+        signature — the fork RolloutReplica base ALWAYS forwards them
+        (replica.py:293-310), so omitting them breaks the very first
+        CheckpointEngineManager.update_weights with a TypeError.
+        checkpoint_kv=True means "wait for the external KV connector to
+        checkpoint aborted requests before returning" (abort-offload barrier,
+        VERL_ABORT_KV_EVENT logs); dynamo has no external KV connector wired
+        yet, so honoring it silently would drop the barrier semantics — fail
+        loudly instead. timeout_s only bounds that barrier wait and is
+        accepted-but-unused until then.
+        """
+        if checkpoint_kv:
+            raise NotImplementedError(
+                "abort_all_requests(checkpoint_kv=True) requires the abort-offload KV "
+                "barrier, which the dynamo backend does not implement yet; disable "
+                "rollout.abort_kv_reuse for rollout.name=dynamo."
+            )
+        if self._use_direct_generate():
+            # The debug direct-generate path holds the sidecar's single
+            # in-flight REP slot for the whole generation, so the pause
+            # request would queue behind every running generation and time
+            # out. Incompatible with abort semantics — fail fast.
+            raise RuntimeError(
+                "engine_kwargs.dynamo.direct_generate=true is incompatible with abort_all_requests "
+                "(V1 async trainers pause engines every step); disable direct_generate."
+            )
+        self._generation_resumed.clear()
+        if not self._control_endpoints:
+            logger.info("[DynamoHttpServer] abort_all_requests: no control sidecar, skipping")
+            return {"aborted_count": 0, "request_ids": [], "paused": False}
+        # Pause failures must raise: sleeping (weight-offloading) an engine
+        # that still has active requests is undefined behavior.
+        await self._engine_method_all(
+            "pause_generation",
+            kwargs={"wait_for_inflight_requests": False, "clear_cache": reset_prefix_cache},
+            timeout=600,
+        )
+        logger.info("[DynamoHttpServer] abort_all_requests: engines paused (node=%s)", self.node_rank)
+        self._arm_resume_watchdog()
+        return {"aborted_count": None, "request_ids": [], "paused": True}
+
+    def _arm_resume_watchdog(self) -> None:
+        """SYNC_HANG_FIX: alarm when nobody resumes us after an abort.
+
+        smokeA_run7 sat 13h with engines paused and zero log output because
+        the weight-sync choreography between abort and resume stalled in a
+        different process. The paused state is the one recipe-owned signal
+        that outlives the stall, so watch it here.
+        """
+        if self._resume_watchdog_task is not None and not self._resume_watchdog_task.done():
+            self._resume_watchdog_task.cancel()
+        self._resume_watchdog_task = asyncio.create_task(self._resume_watchdog_loop())
+
+    async def _resume_watchdog_loop(self) -> None:
+        interval_s = float(self._dynamo_cfg().get("abort_resume_watchdog_s", 600))
+        if interval_s <= 0:
+            return
+        start = time.time()
+        while not self._generation_resumed.is_set():
+            try:
+                await asyncio.wait_for(self._generation_resumed.wait(), timeout=interval_s)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[DynamoHttpServer] engines still PAUSED %.0fs after abort_all_requests and no "
+                    "resume_generation arrived (node=%s) — the CheckpointEngineManager choreography "
+                    "(release_kv_cache -> NCCL update_weights -> resume) is stuck upstream. Look for "
+                    "the last '[DynamoCEWorker]'/'[v4a-4]' stage log; py-spy the trainer WorkerDict, "
+                    "the CheckpointEngineWorker and the FullyAsyncTrainer actors.",
+                    time.time() - start,
+                    self.node_rank,
+                )
 
     async def resume_generation(self):
+        """Resume request intake after abort_all_requests."""
+        if self._resume_watchdog_task is not None:
+            self._resume_watchdog_task.cancel()
+            self._resume_watchdog_task = None
+        if self._control_endpoints:
+            await self._engine_method_all("resume_generation", timeout=120)
+        self._generation_resumed.set()
+        logger.info("[DynamoHttpServer] resume_generation: gate open (node=%s)", self.node_rank)
         return None
 
     async def start_profile(self, **kwargs):
@@ -1831,10 +2266,15 @@ class DynamoHttpServer:
     async def stop_profile(self):
         return None
 
-    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None):
+    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None, timeout: float = 120):
         """Like collective_rpc but invokes a top-level AsyncLLM method
-        (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
-        not a worker-extension RPC. Distinguished by message kind.
+        (wake_up / sleep / pause_generation / resume_generation /
+        reset_prefix_cache / wait_for_requests_to_drain), not a
+        worker-extension RPC. Distinguished by message kind.
+
+        Raises RuntimeError when any shard reports failure — a silently
+        skipped sleep/pause leaves the engine in a state the trainer no
+        longer agrees with (e.g. sleeping an engine with active requests).
 
         v4a-6 (Iter 7.5): same parallel-dispatch fix as collective_rpc.
         Sequential iter deadlocked update_weights_from_ipc and now also
@@ -1852,6 +2292,7 @@ class DynamoHttpServer:
             "kind": "engine_method",
             "method": method,
             "kwargs": kwargs or {},
+            "timeout": timeout,
         }
 
         async def _call_one(idx: int, ep: str) -> None:
@@ -1860,14 +2301,11 @@ class DynamoHttpServer:
             try:
                 sock.connect(ep)
                 await sock.send(pickle.dumps(req))
-                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=600)
+                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=timeout)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
-                    logger.warning(
-                        "[DynamoHttpServer] engine_method %s failed @ %s: %s",
-                        method,
-                        ep,
-                        reply.get("error"),
+                    raise RuntimeError(
+                        f"engine_method {method} failed @ {ep}: {reply.get('error')}"
                     )
             finally:
                 sock.close()
@@ -2052,6 +2490,7 @@ class DynamoHttpServer:
         for attr, _, _ in _SUBPROCESS_REGISTRY:
             state[attr] = None if not attr.endswith("_processes") else []
         state["_watchdog_task"] = None
+        state["_resume_watchdog_task"] = None
         state["_frontend_log_fp"] = None
         state["_vllm_log_fps"] = []
         state["_vllm_log_paths"] = []
@@ -2066,20 +2505,103 @@ class DynamoHttpServer:
 # --------------------------------------------------------------------------- #
 
 
-class _DynamoCheckpointEngineWorker(CheckpointEngineWorker):
-    """CheckpointEngineWorker variant spawned with ``num_gpus=0``.
+class DynamoCheckpointEngineWorker(_BaseCheckpointEngineWorker):
+    """CheckpointEngineWorker with an observable, fail-fast first hop.
 
-    The base ``Worker._setup_env_cuda_visible_devices`` reads
-    ``ray.get_runtime_context().get_accelerator_ids()[device_name][0]`` when
-    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty
-    for a ``num_gpus=0`` actor, so it IndexErrors. Our spawn helper injects
-    ``CUDA_VISIBLE_DEVICES`` via ``runtime_env`` to pin the actor to the
-    GPU shared with its paired ``dynamo.vllm`` subprocess (CUDA IPC needs
-    same-GPU pairing), so torch sees that single GPU as device 0.
+    SYNC_HANG_FIX (smokeA_run7): the fully_async first param sync wedged
+    forever between CheckpointEngineManager step 4/5 (abort logged, then
+    silence for 13h). Root operability gap: on the rollout side the whole
+    abort -> prepare -> init_process_group -> update_weights choreography
+    runs inside verl's CheckpointEngineWorker with
+
+      (i)  the sync checkpoint-engine calls (prepare / init_process_group /
+           finalize) executing ON the asyncio actor's event loop, where one
+           wedged native wait (NCCL bootstrap, cupy sync, blocking ray.get)
+           silently starves the already-queued ``update_weights`` task, and
+      (ii) zero logging and zero timeout between the abort and
+           ServerAdapter.update_weights' first line, so any stall is a
+           silent forever-hang with the engines left paused.
+
+    This subclass (verl untouched — wired in via
+    DynamoReplica.get_ray_class_with_init_args):
+      1. runs checkpoint-engine methods in a thread executor so the event
+         loop can never be starved by them (NCCL-from-thread is already the
+         upstream pattern: BroadcastOperation uses run_in_executor),
+      2. logs ENTER/EXIT of every choreography stage to the driver log,
+      3. puts a watchdog (env VERL_DYNAMO_CE_UPDATE_TIMEOUT_S, default
+         1800s, <=0 disables) on update_weights so a stuck first hop fails
+         the job with a stage-labelled error instead of idling for hours.
+
+    The update_weights watchdog is a *timer thread*, not asyncio.wait_for:
+    the CUDA-IPC second hop (BucketedWeightSender.async_send_weights) issues
+    synchronous zmq recvs ON the actor's event loop, so when the engine-side
+    receiver dies mid-handshake (smokeA_run8: vllm load_weights raised on a
+    tied-weights model and the REQ/REP peer vanished) the loop is wedged in
+    native code and no asyncio timeout can ever be scheduled. The timer
+    thread os._exit(1)s the actor instead — Ray surfaces ActorDiedError to
+    the CheckpointEngineManager and the job fails minutes after the stall
+    with the stage log pointing at the culprit hop.
     """
 
-    def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
-        get_torch_device().set_device(0)
+    _WATCHDOG_ENV = "VERL_DYNAMO_CE_UPDATE_TIMEOUT_S"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Executor threads must re-select the device (CUDA current-device is
+        # per-thread). Pool CE workers are one-per-GPU with CUDA_VISIBLE_DEVICES
+        # narrowed by Ray, so the local device index is LOCAL_RANK (always 0 in
+        # verl's ray env). Read from env instead of torch to avoid initializing
+        # a CUDA context at actor-construction time.
+        self._ce_device_id = int(os.getenv("LOCAL_RANK", "0"))
+
+    def _ce_log(self, msg: str) -> None:
+        print(f"[DynamoCEWorker][rank={os.environ.get('RANK', '?')}] {msg}", flush=True)
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
+    async def execute_checkpoint_engine(self, method: str, *args, **kwargs):
+        """Run sync CE calls off-loop, with stage logs (see class docstring)."""
+        from verl.utils.device import get_torch_device
+
+        self._ce_log(f"execute_checkpoint_engine({method}) ENTER")
+        t0 = time.time()
+
+        def _call():
+            get_torch_device().set_device(self._ce_device_id)
+            return getattr(self.checkpoint_engine, method)(*args, **kwargs)
+
+        result = await asyncio.get_running_loop().run_in_executor(None, _call)
+        self._ce_log(f"execute_checkpoint_engine({method}) EXIT +{time.time() - t0:.1f}s")
+        return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_weights(self, global_steps: int = None):
+        timeout_s = float(os.environ.get(self._WATCHDOG_ENV, "1800"))
+        self._ce_log(f"update_weights ENTER (global_steps={global_steps}, watchdog={timeout_s:.0f}s)")
+        t0 = time.time()
+
+        def _watchdog_abort():
+            self._ce_log(
+                f"update_weights watchdog fired after {timeout_s:.0f}s "
+                f"(global_steps={global_steps}): the NCCL first hop from the trainer or the "
+                f"CUDA-IPC second hop into the dynamo engine never completed (a dead engine-side "
+                f"receiver leaves the zmq REQ sender blocked forever — check the replica shard log "
+                f"for an update_weights_from_ipc traceback, and the raw worker-*.out for the last "
+                f"'[DynamoCEWorker]' stage). Exiting the CE worker so the job fails fast; raise "
+                f"{self._WATCHDOG_ENV} for very large models."
+            )
+            os._exit(1)
+
+        timer: Optional[threading.Timer] = None
+        if timeout_s > 0:
+            timer = threading.Timer(timeout_s, _watchdog_abort)
+            timer.daemon = True
+            timer.start()
+        try:
+            await super().update_weights(global_steps=global_steps)
+        finally:
+            if timer is not None:
+                timer.cancel()
+        self._ce_log(f"update_weights EXIT +{time.time() - t0:.1f}s")
 
 
 class DynamoReplica(RolloutReplica):
@@ -2123,29 +2645,43 @@ class DynamoReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
 
-    async def init_hybrid_worker_pool(self, worker_group):
-        """Initialize Dynamo as worker pool for all rollout GPUs.
+    def get_ray_class_with_init_args(self):
+        """Use the recipe CE worker (observable + fail-fast first hop).
 
-        The verl CheckpointEngineManager fans weight-sync hooks
-        (update_weights / execute_checkpoint_engine / release_kv_cache /
-        resume_kv_cache) out to per-rollout-rank Ray actors. Dynamo's
-        rollout-side ``engine'' is a subprocess (not a Ray actor) plus a
-        node-level DynamoHttpServer, so we cannot route those hooks through
-        the trainer's borrowed WorkerDict handles — they don't expose the
-        rollout-side methods. We therefore:
-
-        1. Borrow the trainer worker_group only to look up per-GPU placement.
-        2. Spawn dynamo.vllm subprocesses on those GPUs (existing logic).
-        3. Spawn dedicated CheckpointEngineWorker Ray actors (one per
-           rollout rank) colocated on the same GPUs as the subprocess
-           workers via env-injected CUDA_VISIBLE_DEVICES.
-        4. Reassign ``self.workers`` to those CheckpointEngineWorker
-           handles so framework hooks land where the methods actually
-           live.
+        Mirrors the base RolloutReplica implementation but swaps in
+        DynamoCheckpointEngineWorker — see its docstring (SYNC_HANG_FIX).
+        The CheckpointEngineManager's temp worker group still binds method
+        signatures from verl's base class; the overridden coroutines execute
+        on the actor, so no verl change is needed.
         """
+        from verl.single_controller.ray import RayClassWithInitArgs
+
+        return RayClassWithInitArgs(
+            cls=ray.remote(DynamoCheckpointEngineWorker),
+            rollout_config=self.config,
+            model_config=self.model_config,
+            replica_rank=self.replica_rank,
+        )
+
+    async def sleep(self, reset_connector: bool = True):
+        """Drain in-flight requests before the weight-offloading sleep.
+
+        Mirrors vLLMReplica.sleep: the base class would sleep immediately,
+        which is undefined behavior when requests are still active (e.g. the
+        colocated-reward-model validation path sleeps without an abort).
+        Unlike vLLM, dynamo servers are per-node — drain every one of them.
+
+        reset_connector matches the fork base signature (replica.py:277-284;
+        the fork CheckpointEngineManager may pass False under abort-offload).
+        It is not forwarded: no external KV connector is wired yet and the
+        server drops KV contents at sleep level 1 either way.
+        """
+        await asyncio.gather(*[server.wait_for_requests_to_drain.remote() for server in self.servers])
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
+    async def init_hybrid_worker_pool(self, worker_group):
+        """Initialize Dynamo as worker pool for all rollout GPUs."""
         self.rollout_mode = RolloutMode.HYBRID
-        # Hold trainer handles only as a placement lookup; replaced at the
-        # end with dedicated rollout-side actors.
         self.workers = list(worker_group.workers)
 
         assert len(self.workers) % self.world_size == 0, (
@@ -2155,131 +2691,67 @@ class DynamoReplica(RolloutReplica):
         num_logical_replicas = len(self.workers) // self.world_size
         await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
 
-        # Now that dynamo.vllm subprocesses are alive on the GPUs identified
-        # by self._trainer_worker_infos, spawn matching CheckpointEngineWorker
-        # actors and adopt them as our framework-facing workers. Naive mode
-        # must keep the trainer WorkerDict handles: its refit runs inside
-        # WorkerDict.update_weights, and a CE actor's ServerAdapter would
-        # collide with the WorkerDict adapter on the per-rank IPC socket
-        # (observed as a stuck sender -> 30min NCCL watchdog abort).
-        if self.config.checkpoint_engine.backend != "naive":
-            self.workers = self._spawn_rollout_checkpoint_engine_workers()
+    async def init_standalone_pool(self):
+        """Standalone shared worker pool over rollout.nnodes × n_gpus_per_node.
 
-    def _spawn_rollout_checkpoint_engine_workers(self) -> list[ActorHandle]:
-        """Spawn one CheckpointEngineWorker Ray actor per rollout rank.
-
-        Each actor:
-        - ``num_gpus=0`` — Ray does not see it as competing for the trainer's
-          resource pool slots.
-        - ``CUDA_VISIBLE_DEVICES`` env-injected to the same GPU as the
-          corresponding dynamo subprocess worker, so cupy/torch tensor
-          allocations land where the subprocess can receive them via CUDA IPC.
-        - ``RANK / WORLD_SIZE / LOCAL_RANK / LOCAL_WORLD_SIZE`` env match the
-          trainer rank layout so the actor's ``server_adapter``
-          (recipe.dynamo.dynamo_rollout.ServerAdapter) computes a
-          ``zmq_handle`` that pairs 1:1 with the subprocess worker.
-        - ``MASTER_ADDR / MASTER_PORT`` set so the CheckpointEngineWorker
-          actors form their own torch.distributed cpu:gloo group on
-          ``initialize_global_process_group_ray``. Port chosen to not
-          collide with the trainer's existing distributed init.
+        Mirrors verl's RolloutReplica.init_standalone but at POOL granularity:
+        one resource pool + one CheckpointEngineWorker per rollout GPU (they
+        receive weights over the checkpoint-engine first hop and forward them
+        node-locally via CUDA-IPC), then the same shared master/slave dynamo
+        stack as hybrid — one etcd/nats/frontend for the whole pool.
         """
-        worker_infos = self._trainer_worker_infos
-        total_ranks = len(worker_infos)
-        local_world_size = self.gpus_per_node
-        master_port = str(int(os.environ.get("VERL_DYNAMO_CE_MASTER_PORT", "29600")))
-        # CE worker rank 0 lands on the head node; on multi-node setups every
-        # other rank needs head's reachable IP, not 127.0.0.1. Resolve via
-        # ``ray.nodes()`` using the first worker's node_id.
-        master_addr = "127.0.0.1"
-        if worker_infos:
-            head_node_id = worker_infos[0][0]
-            for node in ray.nodes():
-                if node.get("NodeID") == head_node_id:
-                    master_addr = node.get("NodeManagerAddress") or master_addr
-                    break
+        from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+        from verl.utils.device import get_device_name
 
-        # Resolve placement-group ids → PlacementGroup objects (deduped) so
-        # each CE actor can colocate into the same bundle as its paired
-        # trainer worker. ``get_placement_group`` raises if the id is unknown
-        # (e.g. PG cleaned up); falling back to NodeAffinity keeps the actor
-        # on the same node even if PG capture fails.
-        trainer_pg_ids = self._trainer_worker_pg_ids
-        trainer_pg_lookup: dict[str, Any] = {}
-        for pg_id in trainer_pg_ids:
-            if pg_id and pg_id not in trainer_pg_lookup:
-                try:
-                    trainer_pg_lookup[pg_id] = ray.util.get_placement_group(pg_id)
-                except Exception:
-                    trainer_pg_lookup[pg_id] = None
+        self.rollout_mode = RolloutMode.STANDALONE
+        pool_nnodes = self.config.nnodes
+        pool_gpus_per_node = self.config.n_gpus_per_node
+        assert pool_nnodes > 0 and pool_gpus_per_node > 0, (
+            "standalone dynamo pool requires rollout.nnodes > 0 and rollout.n_gpus_per_node > 0"
+        )
 
-        actors: list[ActorHandle] = []
-        for rank, (node_id, gpu_id) in enumerate(worker_infos):
-            env_vars = {
-                "CUDA_VISIBLE_DEVICES": str(gpu_id),
-                "RANK": str(rank),
-                "WORLD_SIZE": str(total_ranks),
-                "LOCAL_RANK": str(rank % local_world_size),
-                "LOCAL_WORLD_SIZE": str(local_world_size),
-                "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
-                "MASTER_ADDR": master_addr,
-                "MASTER_PORT": master_port,
-                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-            }
+        resource_pool_name = f"dynamo_rollout_pool_{self.replica_rank}{self.name_suffix}"
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec={resource_pool_name: [pool_gpus_per_node] * pool_nnodes},
+            mapping=None,
+            max_colocate_count=2,
+        )
+        resource_pool_manager.create_resource_pool()
+        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
 
-            trainer_pg = trainer_pg_lookup.get(trainer_pg_ids[rank])
-            if trainer_pg is not None:
-                scheduling_strategy = ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
-                    placement_group=trainer_pg,
-                    placement_group_bundle_index=rank % local_world_size,
-                    placement_group_capture_child_tasks=False,
-                )
-            else:
-                scheduling_strategy = ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=node_id,
-                    soft=False,
-                )
+        worker_group = RayWorkerGroup(
+            resource_pool=self.resource_pool,
+            ray_cls_with_init=self.get_ray_class_with_init_args(),
+            bin_pack=False,
+            name_prefix=f"dynamo_rollout_standalone_{self.replica_rank}{self.name_suffix}",
+            use_gpu=True,
+            device_name=get_device_name(),
+        )
+        self.workers = worker_group.workers
 
-            actor = (
-                ray.remote(num_gpus=0, num_cpus=1)(_DynamoCheckpointEngineWorker)
-                .options(
-                    scheduling_strategy=scheduling_strategy,
-                    runtime_env={"env_vars": env_vars},
-                    name=f"dynamo_ce_worker_{self.replica_rank}_{rank}{self.name_suffix}",
-                )
-                .remote(
-                    rollout_config=self.config,
-                    model_config=self.model_config,
-                    replica_rank=rank // self.world_size,
-                )
-            )
-            actors.append(actor)
-        return actors
+        assert len(self.workers) % self.world_size == 0, (
+            f"standalone pool size {len(self.workers)} must be divisible by "
+            f"dynamo logical replica world_size {self.world_size}"
+        )
+        num_logical_replicas = len(self.workers) // self.world_size
+        await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
 
     async def _launch_shared_worker_pool(self, num_logical_replicas: int):
         """Launch a single frontend backed by all logical replica workers."""
         from verl.utils.device import get_resource_name
 
         tp = self.config.tensor_model_parallel_size
-        worker_infos_raw = await asyncio.gather(
+        worker_infos = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
                     lambda self: (
                         ray.get_runtime_context().get_node_id(),
                         ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
-                        ray.get_runtime_context().get_placement_group_id(),
                     )
                 )
                 for worker in self.workers
             ]
         )
-        # Strip pg_id from the tuple stored as worker_infos (so existing
-        # downstream consumers see the original 2-tuple shape), and resolve
-        # the per-rank placement_group id to a PlacementGroup object so the
-        # CE worker spawn can colocate into the trainer's bundle.
-        worker_infos = [(node_id, gpu_id) for node_id, gpu_id, _ in worker_infos_raw]
-        pg_ids = [pg_id for _, _, pg_id in worker_infos_raw]
-        self._trainer_worker_infos = worker_infos
-        self._trainer_worker_pg_ids = pg_ids
 
         node_order: list[str] = []
         node_to_workers: dict[str, list[ActorHandle]] = {}
@@ -2311,12 +2783,20 @@ class DynamoReplica(RolloutReplica):
                 )
                 for shard_idx in range(len(gpu_ids) // tp):
                     shard_gpus = gpu_ids[shard_idx * tp : (shard_idx + 1) * tp]
+                    # POOL-global replica id (self.replica_rank carries the
+                    # LLMServerManager start_rank offset): the engine-side ZMQ
+                    # socket is named replica-{VERL_REPLICA_RANK}-rank-{...}
+                    # and must (a) match the CE-sender side, which derives the
+                    # same pool-global id, and (b) never collide with the other
+                    # pool's engines when hybrid + standalone share a node in
+                    # separate_async.
+                    global_replica_rank = self.replica_rank + logical_replica_rank
                     node_to_specs[node_id].append(
                         {
-                            "replica_rank": logical_replica_rank,
+                            "replica_rank": global_replica_rank,
                             "cuda_visible_devices": ",".join(shard_gpus),
                             "rank_offset": shard_idx * tp,
-                            "label": f"replica{logical_replica_rank}_shard{shard_idx}",
+                            "label": f"replica{global_replica_rank}_shard{shard_idx}",
                         }
                     )
 
@@ -2386,6 +2866,8 @@ class DynamoReplica(RolloutReplica):
 
         await master.wait_frontend_ready.remote(expected_workers=expected_workers)
         await master._self_test_refit_path.remote()
+        if bool(getattr(self.config, "calculate_log_probs", False)):
+            await master.probe_logprob_channel.remote()
         self._server_handle = master
         self._server_address = f"[{fe_host}]:{fe_port}" if is_valid_ipv6_address(fe_host) else f"{fe_host}:{fe_port}"
         logger.info(
@@ -2397,13 +2879,13 @@ class DynamoReplica(RolloutReplica):
         )
 
     async def launch_servers(self):
-        """Dynamo uses a NeMo-style worker-pool entrypoint instead."""
+        """Dynamo uses NeMo-style worker-pool entrypoints instead."""
         raise RuntimeError(
             "DynamoReplica.launch_servers() is disabled because the dynamo "
             "backend uses a single shared worker pool. Call "
-            "DynamoReplica.init_hybrid_worker_pool(worker_group) via "
-            "AgentLoopManager instead."
+            "DynamoReplica.init_hybrid_worker_pool(worker_group) or "
+            "init_standalone_pool() via DynamoLLMServerManager instead."
         )
 
 
-__all__ = ["DynamoHttpServer", "DynamoReplica"]
+__all__ = ["DynamoCheckpointEngineWorker", "DynamoHttpServer", "DynamoReplica"]

@@ -1,0 +1,123 @@
+# fully_async entry config for the dynamo rollout backend (A档 scope).
+#
+# Standalone-only fully_async: the trainer owns trainer.nnodes ×
+# trainer.n_gpus_per_node; the dynamo standalone pool owns rollout.nnodes ×
+# rollout.n_gpus_per_node with one CheckpointEngineWorker per GPU. Weights
+# flow in two hops per parameter sync: checkpoint-engine backend (nccl,
+# cross-node capable) into the CE workers, then node-local CUDA-IPC into the
+# dynamo.vllm shards — the same wiring separate_async already exercises, now
+# driven by FullyAsyncTrainer's abort → release_kv → nccl → resume_kv →
+# resume choreography every trigger_parameter_sync_step.
+#
+# Out of A档 scope (keep off): use_trainer_do_validate and
+# use_dynamic_resource_scheduling (both spawn a hybrid pool on trainer GPUs),
+# rollout.disaggregation (fork dispatch only supports vllm/sglang).
+#
+# Launch via recipe.dynamo.main_dynamo_fully_async, NOT verl's
+# fully_async_main: the recipe entry asserts the DynamoLLMServerManager
+# rebase (monkey-patch #1) before Ray starts and copies rollout.* topology
+# into actor_rollout_ref exactly like upstream.
+#
+# NOTE: requires the verl pin from REQUIRED_VERL.txt (>= 1ae94559).
+
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - dynamo_base
+  - _self_
+
+# Mirrors verl's fully_async_ppo_trainer.yaml, which cannot sit in the
+# defaults list: hydra.searchpath is only legal in the primary config and
+# that file carries its own hydra block.
+async_training:
+
+  # Maximum samples staleness threshold
+  staleness_threshold: 0.1
+
+  # Frequency of parameter synchronization between rollouter and trainer,
+  # one step means trainer obtains a batch of required samples
+  trigger_parameter_sync_step: 4
+
+  # The number of ppo_mini_batches that the FullyAsyncTrainer obtains once
+  require_batches: 1
+
+  # Resume interrupted generations after each parameter sync; required for
+  # the dynamo aborted-empty retry contract (generate returns stop_reason
+  # "aborted" while paused and FullyAsyncLLMServerClient re-drives it).
+  partial_rollout: True
+
+  # B档: trainer-side validation / dynamic resource scheduling need the
+  # hybrid dynamo pool on trainer GPUs (two-stage init Step 1).
+  use_trainer_do_validate: False
+  use_dynamic_resource_scheduling: False
+  dynamic_schedule_policy: "default"
+  dynamic_schedule_deactivate_ratio: 0.3
+  dynamic_schedule_enable_rebalance: True
+
+  # PER-POOL concurrency bound, not per-engine: dynamo registers ONE server
+  # (the pool frontend) with the load balancer, so the rollouter computes
+  # max_concurrent_samples = active_pool_count × this value. Scale it with
+  # the pool width or throughput silently degrades — recommended
+  #   16 × (rollout.nnodes × rollout.n_gpus_per_node / tensor_model_parallel_size)
+  # i.e. 16 per vLLM shard, matching upstream's per-replica default.
+  concurrent_samples_per_replica: 16
+
+# Standalone dynamo pool topology. Copied into actor_rollout_ref.rollout by
+# the entry (upstream fully_async_main does the same).
+rollout:
+  nnodes: 1
+  n_gpus_per_node: 8
+
+  # number of responses (i.e. num sample times). > 1 for grpo
+  n: 4
+
+  # total rollout samples budget (min'd with dataset × epochs)
+  total_rollout_steps: 100
+
+data:
+  # fully_async streams samples one by one (asserted by FullyAsyncRollouter)
+  gen_batch_size: 1
+  train_batch_size: 0
+
+actor_rollout_ref:
+  # Rollouter asserts the disaggregated (non-fused) layout.
+  hybrid_engine: False
+
+  rollout:
+    # Hard fully_async requirement (rollouter asserts it): TokenOutput must
+    # carry rollout log_probs. Dynamo satisfies it via the
+    # nvext.engine_data.completion_logprobs channel + startup probe.
+    calculate_log_probs: True
+
+    # Standalone-only in A档 → hybrid override is irrelevant; keep the key
+    # for parity with upstream fully_async config.
+    standalone_gpu_memory_utilization: null
+
+    checkpoint_engine:
+      # Cross-pool first hop; naive backend cannot reach the standalone pool.
+      backend: nccl
+
+    agent:
+      agent_loop_manager_class: null
+
+    engine_kwargs:
+      dynamo:
+        thunderagent:
+          enabled: false
+
+  actor:
+    # Must use rollout log probs for training
+    use_rollout_log_probs: True
+
+  model:
+    # To use remove padding (thd)
+    use_remove_padding: True
+
+# Only then will the use of log probs be correct,
+# and it can be used in conjunction with other rollout_correction algorithms.
+algorithm:
+  rollout_correction:
+    bypass_mode: True
