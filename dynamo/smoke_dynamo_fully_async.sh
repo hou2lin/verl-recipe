@@ -42,6 +42,15 @@ MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-0.5B-Instruct"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
+# FLEXKV=1 turns this into the FlexKV L2 acceptance smoke (same 1+1 layout).
+FLEXKV=${FLEXKV:-0}
+flexkv_args=()
+if [ "$FLEXKV" = "1" ]; then
+  export FLEXKV_CPU_CACHE_GB=${FLEXKV_CPU_CACHE_GB:-16} FLEXKV_ENABLE_MPS=${FLEXKV_ENABLE_MPS:-0}
+  flexkv_args=(++actor_rollout_ref.rollout.engine_kwargs.dynamo.enable_flexkv=True)
+fi
+# cold-start (first model read + compile) can exceed the 600s default window
+export VERL_DYNAMO_FE_READY_TIMEOUT=${VERL_DYNAMO_FE_READY_TIMEOUT:-2400}
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 
 # bypass_mode=true (yaml default): rollout logprobs feed training directly,
@@ -56,6 +65,8 @@ export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 # update_actor.
 python3 -m recipe.dynamo.main_dynamo_fully_async \
     algorithm.adv_estimator=grpo \
+    +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+    +critic.model.override_config.attn_implementation=sdpa \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
     data.val_batch_size=1 \
@@ -90,6 +101,7 @@ python3 -m recipe.dynamo.main_dynamo_fully_async \
     trainer.total_epochs=100 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
+    "${flexkv_args[@]}" \
     "$@"
 
 echo "PASS: Dynamo fully_async smoke completed"
