@@ -15,10 +15,12 @@
 
 Reference impl: nemo_rl/models/generation/dynamo/dynamo_generation.py.
   1. Reserves no GPUs itself; trainer workers in colocated mode already claim
-     them. We only forward CUDA_VISIBLE_DEVICES into dynamo.vllm subprocesses.
-  2. Spawns + watchdogs etcd / nats-server / dynamo.vllm × N / dynamo.frontend.
-  3. Never holds an AsyncLLM. The actor's generate() method is only an
-     HTTP client shim to dynamo.frontend; it does not generate locally.
+     them. We only forward CUDA_VISIBLE_DEVICES into the engine subprocesses.
+  2. Spawns + watchdogs etcd / nats-server / dynamo.{vllm,sglang} × N /
+     dynamo.frontend. Which engine is picked is documented at ENGINE_VLLM below.
+  3. Never holds an in-process engine (no AsyncLLM, no sglang Engine). The
+     actor's generate() method is only an HTTP client shim to dynamo.frontend;
+     it does not generate locally.
 """
 
 from __future__ import annotations
@@ -54,27 +56,34 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # (attr_name, display_name, stop_timeout_seconds) — order = teardown order.
 # Stop consumers first (frontend), then producers (workers), then infra
 # (NATS, etcd). Keep parallel to nemo-rl's _SUBPROCESS_REGISTRY but with the
-# vllm worker pool added as a list-typed entry.
+# engine worker pool added as a list-typed entry. The display name also lands in
+# watchdog errors ("dynamo engine_workers[1] exited rc=..."), so keep it
+# engine-neutral.
 _SUBPROCESS_REGISTRY: list[tuple[str, str, int]] = [
     ("_frontend_process", "frontend", 15),
-    ("_vllm_processes", "vllm_workers", 30),
+    ("_engine_processes", "engine_workers", 30),
     ("_nats_process", "NATS", 10),
     ("_etcd_process", "etcd", 10),
 ]
 
-# Default verl-side rank-offset env var read by the WorkerExtension
+# Default verl-side rank-offset env var read by the vLLM WorkerExtension
 # (see recipe/dynamo/dynamo_worker_extension.py). Must be passed per-shard
 # when spawning dynamo.vllm so the vLLM TP rank inside the subprocess maps
-# to the same node-local rank that the trainer side computes.
+# to the same node-local rank that the trainer side computes. Set for sglang
+# shards too, but unread there: DynamoSGLangRollout derives the same mapping
+# trainer-side from shard = local_rank // tp.
 _RANK_OFFSET_ENV = "VERL_DYNAMO_RANK_OFFSET"
 _REPLICA_RANK_ENV = "VERL_REPLICA_RANK"
 
-# Where dynamo.vllm exposes its system control HTTP. Each subprocess gets
-# its own port (allocated by the actor).
+# Where an engine worker exposes its system HTTP (/metrics plus the /engine/*
+# routes). Each subprocess gets its own port (allocated by the actor). Optional
+# for vllm, which is controlled over the ZMQ sidecar below; mandatory for
+# sglang, whose only control plane is /engine/control/* on this port.
 _DYN_SYSTEM_PORT_ENV = "DYN_SYSTEM_PORT"
 
 # Verl-private control sidecar (see _dynamo_vllm_with_control.py) listens on
 # this ZMQ endpoint per subprocess; the actor uses it to bridge collective_rpc.
+# vllm only — sglang shards are spawned without a sidecar.
 _CONTROL_ZMQ_ENV = "VERL_DYNAMO_CONTROL_ZMQ"
 
 _FRONTEND_READY_TIMEOUT_S = float(os.getenv("VERL_DYNAMO_FE_READY_TIMEOUT", "600"))
@@ -103,7 +112,7 @@ _SUPPORTED_ENGINES = (ENGINE_VLLM, ENGINE_SGLANG)
 
 @dataclass(frozen=True)
 class _DynamoWorkerSpec:
-    """One dynamo.vllm subprocess to launch on this Ray actor."""
+    """One engine subprocess (dynamo.vllm or dynamo.sglang) on this Ray actor."""
 
     replica_rank: int
     cuda_visible_devices: str
@@ -122,12 +131,14 @@ class DynamoHttpServer:
     Lifecycle (driven by ``DynamoReplica.launch_servers``):
       __init__ → store config + cuda_visible_devices, no subprocesses yet
       launch_server(master_address, master_port, dp_rpc_port):
-        node 0 (master): _start_etcd → _start_nats → _start_vllm_workers
+        node 0 (master): _start_etcd → _start_nats → _start_engine_workers
                          → _start_frontend → _healthcheck_frontend
-        node N (slave) : just _start_vllm_workers, pointing to master etcd/nats
+        node N (slave) : just _start_engine_workers, pointing to master etcd/nats
       generate / wake_up / sleep / collective_rpc / ... :
         generate goes through master dynamo.frontend HTTP
-        collective_rpc bridges to per-subprocess control sidecar
+        control ops reach each subprocess over the engine's own control plane:
+        the ZMQ sidecar (collective_rpc) for vllm, /engine/control/* HTTP for
+        sglang
       shutdown : SIGTERM each entry of _SUBPROCESS_REGISTRY in order.
     """
 
@@ -197,11 +208,11 @@ class DynamoHttpServer:
         self._etcd_process: Optional[subprocess.Popen] = None
         self._nats_process: Optional[subprocess.Popen] = None
         self._frontend_process: Optional[subprocess.Popen] = None
-        self._vllm_processes: list[subprocess.Popen] = []
+        self._engine_processes: list[subprocess.Popen] = []
         self._etcd_data_dir: Optional[str] = None
         self._frontend_log_fp = None
-        self._vllm_log_fps: list = []
-        self._vllm_log_paths: list[str] = []
+        self._engine_log_fps: list = []
+        self._engine_log_paths: list[str] = []
         self._allocated_tcp_ports: set[int] = set()
         self._direct_generate_idx: int = 0
         self._direct_generate_lock = asyncio.Lock()
@@ -215,8 +226,9 @@ class DynamoHttpServer:
         self._http_session: Optional[Any] = None
         self._http_session_lock = asyncio.Lock()
 
-        # Per-subprocess control sidecar endpoints (filled in
-        # _start_vllm_workers); used by collective_rpc bridge in v2.
+        # vllm only: per-subprocess control sidecar endpoints (filled in
+        # _start_engine_workers); used by the collective_rpc bridge. The sglang
+        # equivalent is _engine_control_endpoints below.
         self._control_endpoints: list[str] = []
         # Per-worker /metrics endpoints (host:port), populated only when
         # enable_worker_system_metrics is on. These expose engine-level
@@ -248,7 +260,7 @@ class DynamoHttpServer:
         # all reach the engine. Created lazily: __init__ may run outside a loop.
         self._sglang_tag_lock: asyncio.Lock | None = None
 
-        # Filled in by _start_vllm_workers; consumed by generate() to build
+        # Filled in by _start_engine_workers; consumed by generate() to build
         # the OpenAI completions payload.
         self._served_model_name: Optional[str] = None
 
@@ -474,15 +486,24 @@ class DynamoHttpServer:
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _free_engine_on_train(self) -> bool:
-        """Opt-in sleep/wake of colocated vLLM workers around training."""
+        """Opt-in sleep/wake of the colocated engine workers around training."""
         return self._dynamo_cfg_bool("free_engine_on_train", False)
 
     def _enable_rl_mode(self) -> bool:
-        """Enable Dynamo's RL/TITO-friendly vLLM mode."""
+        """Enable Dynamo's RL/TITO-friendly mode (DYN_ENABLE_RL, both engines).
+
+        Distinct from ``dynamo.sglang.enable_rl``, which is the ``--enable-rl``
+        CLI flag on the sglang worker itself (see _build_sglang_cmd).
+        """
         return self._dynamo_cfg_bool("enable_rl", True)
 
     def _request_engine_data(self) -> bool:
-        """Ask Dynamo to return vLLM engine token data via nvext."""
+        """Ask Dynamo to return vLLM engine token data via nvext.
+
+        vllm only: dynamo populates nvext.engine_data on that path alone, which
+        is why _start_engine_workers refuses an engine=sglang run that leaves
+        request_completion_token_ids unset.
+        """
         return self._dynamo_cfg_bool("request_engine_data", self._enable_rl_mode())
 
     def _request_completion_token_ids(self) -> bool:
@@ -579,7 +600,7 @@ class DynamoHttpServer:
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def _launch_master(self, start_healthcheck: bool = True):
-        """Master: etcd + nats + vllm workers + frontend + healthcheck."""
+        """Master: etcd + nats + engine workers + frontend + healthcheck."""
         # Reserve ports up-front so we know all of them before starting.
         self._etcd_port = self._configured_or_allocated_port("etcd_port", bind_wildcard=True)
         self._etcd_peer_port = self._configured_or_allocated_port("etcd_peer_port", bind_wildcard=True)
@@ -589,19 +610,20 @@ class DynamoHttpServer:
 
         self._start_etcd()
         self._start_nats()
-        self._start_vllm_workers()
+        self._start_engine_workers()
         self._start_frontend()
 
         # Expose frontend to trainer.
         self._server_port = self._frontend_port
         if start_healthcheck:
             await self.wait_frontend_ready()
-            # v2: verify control-sidecar reachability so refit failures surface
-            # at startup instead of silently dropping weight updates mid-training.
+            # Verify control-plane reachability so refit failures surface at
+            # startup instead of silently dropping weight updates mid-training.
             # Soft-fail by default; set VERL_DYNAMO_REFIT_STRICT=1 for fail-fast.
-            # IMPORTANT: must run AFTER wait_frontend_ready so dynamo.vllm
-            # subprocesses are fully booted (their control sidecars cannot
-            # serve requests until the captured AsyncLLM is alive). In the
+            # IMPORTANT: must run AFTER wait_frontend_ready so the engine
+            # subprocesses are fully booted — neither control plane answers
+            # earlier (the vllm sidecar captures its AsyncLLM only once the
+            # engine is alive; sglang registers /engine/* just as late). In the
             # shared-pool path, launch_servers calls wait_frontend_ready
             # externally (start_healthcheck=False here) and runs
             # _self_test_refit_path explicitly there.
@@ -613,8 +635,8 @@ class DynamoHttpServer:
         )
 
     async def _launch_slave(self):
-        """Slave: vllm workers only, pointing at master etcd/nats."""
-        self._start_vllm_workers()
+        """Slave: engine workers only, pointing at master etcd/nats."""
+        self._start_engine_workers()
         # Slave doesn't run frontend/healthcheck; trainer reaches master FE.
         # We still set _server_port so get_server_address works — it returns
         # the master frontend port (advertised by DynamoReplica via __init__).
@@ -759,13 +781,18 @@ class DynamoHttpServer:
                 time.sleep(0.5)
         raise RuntimeError(f"{label} did not open port {port} within {timeout}s")
 
-    def _start_vllm_workers(self):
-        """Spawn N dynamo.vllm subprocesses on this node.
+    def _start_engine_workers(self):
+        """Spawn N dynamo.vllm (or dynamo.sglang) subprocesses on this node.
 
         Each subprocess is one DP shard; gets a contiguous TP-slice of GPUs
         from cuda_visible_devices. CUDA_VISIBLE_DEVICES + VERL_DYNAMO_RANK_OFFSET
-        are passed in env so the WorkerExtension's _get_zmq_handle picks the
+        are passed in env so the vLLM WorkerExtension's _get_zmq_handle picks the
         correct global rank for ZMQ-IPC weight bucket transfer (see §11.3).
+
+        Everything downstream of the GPU slicing is engine-dependent and gated on
+        ``is_sglang`` below: the sglang path skips the ZMQ sidecar, the KV-event
+        and VLLM_PORT allocations and the vLLM-only env, and instead requires
+        DYN_SYSTEM_PORT so /engine/control/* is reachable.
         """
         tp = self.config.tensor_model_parallel_size
         cvd_list = [s for s in self._cuda_visible_devices.split(",") if s]
@@ -817,7 +844,7 @@ class DynamoHttpServer:
             kv_events_config_json = None if is_sglang else self._build_kv_events_config_json(kv_event_port)
             vllm_port = None if is_sglang else self._allocate_vllm_tcpstore_port(spec_idx)
             # Allocate a registered (<32768, i16-safe) system-status port so this
-            # dynamo.vllm worker exposes /metrics (incl. pass-through
+            # worker exposes /metrics (on vllm incl. pass-through
             # vllm:prefix_cache_hits_total/queries_total) and the /engine/* routes.
             # Default ON, unconditionally sets DYN_SYSTEM_PORT=server_port (its fixed port avoids the i16 issue;
             # we use a fixed low port via _allocate_stable_node_port for the same
@@ -901,9 +928,10 @@ class DynamoHttpServer:
             existing_pp = env.get("PYTHONPATH", "")
             if recipe_root not in existing_pp.split(":"):
                 env["PYTHONPATH"] = f"{recipe_root}:{existing_pp}" if existing_pp else recipe_root
-            # NB: don't set DYN_SYSTEM_PORT — dynamo's Rust runtime parses it
-            # as i16 and rejects ephemeral ports >= 32768. We use our own
-            # control sidecar (VERL_DYNAMO_CONTROL_ZMQ) instead.
+            # vllm's control plane is this verl-private ZMQ sidecar rather than
+            # DYN_SYSTEM_PORT, which is set further down (only when worker metrics
+            # are on) from an i16-safe low port because dynamo's Rust runtime
+            # parses that variable as i16 and rejects ephemeral ports >= 32768.
             if control_endpoint is not None:
                 env[_CONTROL_ZMQ_ENV] = control_endpoint
             # Defensively unset any DYN_SYSTEM_* leaking from caller env.
@@ -947,13 +975,14 @@ class DynamoHttpServer:
 
             stdout_path = os.path.join(log_dir, f"{spec.label}.log")
             stdout_fp = open(stdout_path, "w")
-            self._vllm_log_fps.append(stdout_fp)
-            self._vllm_log_paths.append(stdout_path)
+            self._engine_log_fps.append(stdout_fp)
+            self._engine_log_paths.append(stdout_path)
 
             logger.info(
-                "[DynamoHttpServer] starting dynamo.vllm shard %s/%s "
+                "[DynamoHttpServer] starting dynamo.%s shard %s/%s "
                 "(replica=%s, rank_offset=%s, GPUs=%s, vllm_port=%s, kv_event_port=%s, control=%s, "
                 "DYN_ENABLE_RL=%s, request_engine_data=%s, log=%s): %s",
+                self._engine_kind(),
                 spec_idx,
                 len(worker_specs),
                 spec.replica_rank,
@@ -973,7 +1002,7 @@ class DynamoHttpServer:
                 stdout=stdout_fp,
                 stderr=subprocess.STDOUT,
             )
-            self._vllm_processes.append(proc)
+            self._engine_processes.append(proc)
 
     def _record_worker_metrics_endpoint(self, endpoint: str) -> None:
         """Append a worker /metrics endpoint to a per-(replica,node) file so an
@@ -994,7 +1023,7 @@ class DynamoHttpServer:
             logger.warning("[DynamoHttpServer] failed to record worker metrics endpoint %s: %s", endpoint, exc)
 
     def get_worker_metrics_endpoints(self) -> list[str]:
-        """host:port of each vLLM worker's /metrics on this node (empty unless
+        """host:port of each engine worker's /metrics on this node (empty unless
         enable_worker_system_metrics was on)."""
         return list(self._worker_metrics_endpoints)
 
@@ -1004,7 +1033,8 @@ class DynamoHttpServer:
         vLLM KV event publishers bind ``tcp://*:<port>``. Checking only the
         node IP can miss conflicts with wildcard listeners, so those ports are
         probed on 0.0.0.0. We also keep a local reservation set so a burst of
-        shard launches does not accidentally reuse a just-released port.
+        shard launches does not accidentally reuse a just-released port — that
+        set is also what keeps the sglang shards' ``--nccl-port`` distinct.
         """
         address = (
             "0.0.0.0" if bind_wildcard and not is_valid_ipv6_address(self._server_address) else self._server_address
@@ -1037,10 +1067,12 @@ class DynamoHttpServer:
     def _allocate_stable_node_port(self, base: int, shard_idx: int, window: int = 8) -> int:
         """Pick a stable node-local port for concurrently launched shards.
 
-        vLLM's TCPStore and KV event publisher both bind in child processes.
-        If the parent only probes a random free port and releases it, another
-        shard can claim it before the child binds. Use deterministic,
-        non-ephemeral per-node/per-shard windows to avoid those startup races.
+        Engine ports get bound in child processes, well after the parent picked
+        them: vLLM's TCPStore and KV event publisher, and the DYN_SYSTEM_PORT
+        system server on both engines. If the parent only probes a random free
+        port and releases it, another shard can claim it before the child binds.
+        Use deterministic, non-ephemeral per-node/per-shard windows to avoid
+        those startup races.
         """
         replica_slot = self.replica_rank % 4
         node_slot = self.node_rank % 16
@@ -1445,8 +1477,8 @@ class DynamoHttpServer:
                 for i, p in enumerate(proc):
                     if p.poll() is not None:
                         log_hint = ""
-                        if name == "vllm_workers" and i < len(self._vllm_log_paths):
-                            log_hint = f" (log={self._vllm_log_paths[i]})"
+                        if name == "engine_workers" and i < len(self._engine_log_paths):
+                            log_hint = f" (log={self._engine_log_paths[i]})"
                         raise RuntimeError(f"dynamo {name}[{i}] exited rc={p.returncode}{log_hint}")
             else:
                 if proc.poll() is not None:
@@ -1478,9 +1510,9 @@ class DynamoHttpServer:
     ):
         """Dispatch generation through the Dynamo frontend HTTP router.
 
-        the actor manages the
-        subprocess stack, while token generation goes through the OpenAI-style
-        frontend so Dynamo can route across registered workers.
+        The actor only manages the subprocess stack; token generation goes
+        through the OpenAI-style frontend so Dynamo can route across registered
+        workers. Engine-agnostic — the frontend hides which engine is behind it.
         """
         if image_data is not None or video_data is not None:
             return self._build_token_output(
@@ -1604,8 +1636,9 @@ class DynamoHttpServer:
         nvext = sp.pop("nvext", None)
         payload: dict[str, Any] = {
             "model": model,
-            # vLLM's OpenAI completions endpoint accepts token-id prompts. Keep
-            # Dynamo on the same token-in path as the native vLLM backend.
+            # Dynamo's OpenAI completions frontend accepts token-id prompts for
+            # either engine, so we keep the same token-in path the native vLLM
+            # backend uses rather than sending text.
             "prompt": prompt_token_ids,
             "max_tokens": int(max_tokens),
             "stream": False,
@@ -1658,6 +1691,9 @@ class DynamoHttpServer:
         This is primarily for smoke tests and debugging ai-dynamo/vLLM
         integration. It still exercises the spawned Dynamo vLLM shards but
         bypasses the OpenAI frontend path that has been observed to hang.
+
+        vllm only — there are no control sidecars on the sglang path, so the
+        guard below always trips there.
         """
         if not self._control_endpoints:
             raise RuntimeError("direct_generate=True requires Dynamo control sidecars")
@@ -1934,7 +1970,11 @@ class DynamoHttpServer:
         response: Optional[dict[str, Any]] = None,
         tokenizer: Optional[Any] = None,
     ) -> Optional[list[int]]:
-        """Extract vLLM OpenAI extension token ids when available."""
+        """Extract nvext / OpenAI-extension token ids when available.
+
+        Covers both channels: ``engine_data`` (vllm) and the top-level
+        ``completion_token_ids`` (the only one sglang populates).
+        """
         from verl.utils.tokenizer import normalize_token_ids
 
         candidates: list[Any] = [
@@ -2172,13 +2212,14 @@ class DynamoHttpServer:
         AsyncLLM, so the verl WorkerExtension methods (update_weights_from_ipc,
         wake_up, sleep, ...) execute inside vLLM workers.
 
-        v1: control sidecar isn't started yet, so we fail fast.
+        vllm only: there is no worker-extension equivalent on the sglang path,
+        where the same operations go through _sglang_control_all instead.
         """
         if not self._control_endpoints:
             raise NotImplementedError(
-                "DynamoHttpServer.collective_rpc requires control sidecars "
-                "(set rollout.engine_kwargs.dynamo.enable_control_sidecar=True "
-                "to enable). v1 generation-only smoke does not need this."
+                "DynamoHttpServer.collective_rpc requires the per-shard ZMQ "
+                "control sidecars, which only exist for engine=vllm and only "
+                "after _start_engine_workers has run."
             )
 
         # Control sidecar protocol: REQ side sends pickled dict, RECVs reply.
@@ -2190,18 +2231,17 @@ class DynamoHttpServer:
         import zmq
         import zmq.asyncio
 
-        # v4a-6 (Iter 7.5): Iter 7.4 revealed sequential endpoint iteration
-        # deadlocks `update_weights_from_ipc`. That RPC blocks until the
-        # receiver's IPC loop returns, but the loop returns only after
-        # sender finishes; sender depends on cupy NCCL broadcast which
-        # requires ALL replicas' rollout actors to join the group. With
-        # sequential iter, only ep[0]'s workers are ever woken — the
-        # other 3 replicas' receivers never set up, cupy broadcast hangs,
-        # everything deadlocks.
+        # Iterating the endpoints sequentially deadlocks
+        # `update_weights_from_ipc`. That RPC blocks until the receiver's IPC
+        # loop returns, but the loop returns only after the sender finishes;
+        # the sender depends on a cupy NCCL broadcast which requires ALL
+        # replicas' rollout actors to join the group. Sequentially, only
+        # ep[0]'s workers are ever woken — the other replicas' receivers never
+        # set up, the cupy broadcast hangs, everything deadlocks.
         #
-        # Fix: dispatch all sidecars CONCURRENTLY via asyncio.gather so
-        # all 4 replicas' workers fire update_weights_from_ipc together,
-        # all REP sockets bind, cupy broadcast progresses, sender unblocks.
+        # So dispatch all sidecars CONCURRENTLY via asyncio.gather: every
+        # replica's workers fire update_weights_from_ipc together, all REP
+        # sockets bind, the broadcast progresses, the sender unblocks.
         method_name = method if isinstance(method, str) else method.__name__
         req = {
             "method": method_name,
@@ -2231,12 +2271,15 @@ class DynamoHttpServer:
         return results
 
     # ------------------------------------------------------------------ #
-    # verl interface — lifecycle no-ops (v1) / passthroughs (v2)
+    # verl interface — lifecycle hooks, forwarded to the engine's control
+    # plane (ZMQ sidecar for vllm, /engine/control/* for sglang). The ones
+    # an engine has no route for stay no-ops; each says so.
     # ------------------------------------------------------------------ #
 
     async def wake_up(self, **kwargs):
         # NB: no node_rank guard — each per-node server wakes its OWN local
-        # workers (self._control_endpoints are node-local), so all nodes must run.
+        # workers (control endpoints are node-local on both engines), so all
+        # nodes must run.
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] wake_up: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
@@ -2252,7 +2295,8 @@ class DynamoHttpServer:
 
     async def sleep(self, **kwargs):
         # NB: no node_rank guard — each per-node server sleeps its OWN local
-        # workers (self._control_endpoints are node-local), so all nodes must run.
+        # workers (control endpoints are node-local on both engines), so all
+        # nodes must run.
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] sleep: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
@@ -2276,8 +2320,9 @@ class DynamoHttpServer:
         if not self._control_endpoints:
             logger.info("[DynamoHttpServer] sleep: no control sidecar, skipping")
             return
-        # v1 can't refit weights, so use sleep level 1 (offload weights to CPU +
-        # drop KV); wake_up restores weights from CPU — no refit needed.
+        # Level 1 offloads weights to CPU and drops KV, so wake_up restores the
+        # weights from CPU and a refit is not required to make the engine usable
+        # again. Level 2 would discard them outright.
         kwargs.setdefault("level", 1)
         await self._engine_method_all("sleep", kwargs=kwargs)
 
@@ -2326,6 +2371,9 @@ class DynamoHttpServer:
         return
 
     async def wait_for_requests_to_drain(self):
+        # vllm only. dynamo.sglang's /engine/control/* surface has no drain
+        # route, so this is a no-op there (no control endpoints); the pre-refit
+        # equivalent on that path is abort_all_requests below.
         if not self._control_endpoints:
             return
         await self._engine_method_all("wait_for_requests_to_drain")
@@ -2362,10 +2410,11 @@ class DynamoHttpServer:
         logger.info("[DynamoHttpServer] sglang control plane OK on %s shard(s)", len(clients))
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # dynamo doesn't expose a global abort; v1 returns no-op result so
-        # RolloutReplica.abort_all_requests's gather doesn't blow up.
-        # sglang does: tokenizer_manager.abort_request(abort_all=True), which is
-        # what partial rollout needs before a non-naive weight sync.
+        # dynamo exposes no global abort on the vllm path, so that one returns a
+        # no-op result rather than raising, keeping
+        # RolloutReplica.abort_all_requests's gather intact.
+        # sglang does have one: tokenizer_manager.abort_request(abort_all=True),
+        # which is what partial rollout needs before a non-naive weight sync.
         if self._is_sglang():
             await self._sglang_control_all("abort_request", rid="", abort_all=True)
             if reset_prefix_cache:
@@ -2391,9 +2440,13 @@ class DynamoHttpServer:
         (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
         not a worker-extension RPC. Distinguished by message kind.
 
-        v4a-6 (Iter 7.5): same parallel-dispatch fix as collective_rpc.
-        Sequential iter deadlocked update_weights_from_ipc and now also
-        deadlocks reset_prefix_cache post-refit."""
+        vllm only, and a silent no-op elsewhere: with no control endpoints (the
+        sglang path, or a slave before launch) it returns None, so every caller
+        must route sglang through _sglang_control_all first.
+
+        Dispatches in parallel for the same reason as collective_rpc: sequential
+        iteration deadlocked update_weights_from_ipc, and deadlocks
+        reset_prefix_cache post-refit as well."""
         if not self._control_endpoints:
             return None
 
@@ -2430,32 +2483,24 @@ class DynamoHttpServer:
         await asyncio.gather(*[_call_one(i, ep) for i, ep in enumerate(self._control_endpoints)])
         return None
 
-    # ------------------------------------------------------------------ #
-    # v3 refit: world-size helper for NCCL group setup
-    # ------------------------------------------------------------------ #
-
     def get_num_engine_workers(self) -> int:
-        """Total number of TP worker processes across all dynamo.vllm shards
-        on this node. Used by DynamoRollout.update_weights to compute the
-        NCCL group world_size = 1 (broadcaster) + N (engine workers)."""
+        """Total number of TP worker processes across all engine shards on this
+        node. Used by DynamoRollout.update_weights to compute the NCCL group
+        world_size = 1 (broadcaster) + N (engine workers)."""
         tp = int(self.config.tensor_model_parallel_size)
         n_shards = len(self._engine_control_endpoints) if self._is_sglang() else len(self._control_endpoints)
         return n_shards * tp
 
-    # ------------------------------------------------------------------ #
-    # refit path self-test (v2 — verifies control sidecar reachability)
-    # ------------------------------------------------------------------ #
-
     async def _self_test_refit_path(self):
         """Verify the control-sidecar ⇄ AsyncLLM round-trip is alive.
 
-        Refit (DynamoRollout.update_weights, v2) routes weight bytes through
+        Refit (DynamoRollout.update_weights) routes weight bytes through
         ``collective_rpc("update_weights_from_ipc", ...)`` which depends on
         a working REQ-REP loop to each ``_dynamo_vllm_with_control``
         subprocess. A silent failure here (sidecar didn't start, control
         endpoint port collision, etc.) would let ``update_weights`` appear
-        to succeed while actually losing all updates — that's the exact
-        bug B v4 had pre-fix.
+        to succeed while actually losing every update — which is the failure
+        this self-test exists to catch.
 
         This self-test sends one ``collective_rpc`` request with a
         deliberately invalid method name. A reachable sidecar will reply
@@ -2464,7 +2509,7 @@ class DynamoHttpServer:
 
         Skipped when no control endpoints are registered (slave node / pre-launch).
         Soft-fail by default; set env ``VERL_DYNAMO_REFIT_STRICT=1`` to
-        raise on failure (recommended once v2 is the default).
+        raise on failure (recommended).
 
         For engine=sglang the equivalent probe is an HTTP round-trip to each
         shard's /engine/* plane, and it is **always strict**: unlike the vLLM
@@ -2509,7 +2554,7 @@ class DynamoHttpServer:
             # AttributeError on workers got cached/queued and corrupted the
             # NEXT real engine.collective_rpc call (sleep) — sleep silently
             # failed, vLLM held its full 128 GiB, and the next trainer
-            # all-gather OOM'd. (Observed in B v5 smoke iter 2, job 2463154.)
+            # all-gather OOM'd (job 2463154).
             req = {
                 "kind": "__refit_self_test_probe__",
                 "method": None,
@@ -2572,12 +2617,12 @@ class DynamoHttpServer:
                 setattr(self, attr, None)
 
         # Close log fps; cleanup tmp dirs.
-        for fp in self._vllm_log_fps:
+        for fp in self._engine_log_fps:
             try:
                 fp.close()
             except Exception:
                 pass
-        self._vllm_log_fps = []
+        self._engine_log_fps = []
         if self._frontend_log_fp is not None:
             try:
                 self._frontend_log_fp.close()
@@ -2618,8 +2663,8 @@ class DynamoHttpServer:
             state[attr] = None if not attr.endswith("_processes") else []
         state["_watchdog_task"] = None
         state["_frontend_log_fp"] = None
-        state["_vllm_log_fps"] = []
-        state["_vllm_log_paths"] = []
+        state["_engine_log_fps"] = []
+        state["_engine_log_paths"] = []
         # aiohttp sessions are bound to a live event loop; rebuilt lazily.
         state["_sglang_clients"] = None
         return state
@@ -2641,8 +2686,8 @@ class _DynamoCheckpointEngineWorker(CheckpointEngineWorker):
     ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty
     for a ``num_gpus=0`` actor, so it IndexErrors. Our spawn helper injects
     ``CUDA_VISIBLE_DEVICES`` via ``runtime_env`` to pin the actor to the
-    GPU shared with its paired ``dynamo.vllm`` subprocess (CUDA IPC needs
-    same-GPU pairing), so torch sees that single GPU as device 0.
+    GPU shared with its paired engine subprocess (CUDA IPC needs same-GPU
+    pairing), so torch sees that single GPU as device 0.
     """
 
     def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
@@ -2655,7 +2700,7 @@ class DynamoReplica(RolloutReplica):
     Mirrors vLLMReplica.launch_servers (one DynamoHttpServer actor per node)
     but with a master/slave split:
       - first actor (node_rank=0) starts etcd + nats + frontend in addition
-        to its dynamo.vllm worker subprocesses,
+        to its engine worker subprocesses,
       - other actors only start their workers, pointing at the master via
         get_master_address.
     """
@@ -2702,7 +2747,7 @@ class DynamoReplica(RolloutReplica):
         rollout-side methods. We therefore:
 
         1. Borrow the trainer worker_group only to look up per-GPU placement.
-        2. Spawn dynamo.vllm subprocesses on those GPUs (existing logic).
+        2. Spawn the engine subprocesses on those GPUs (existing logic).
         3. Spawn dedicated CheckpointEngineWorker Ray actors (one per
            rollout rank) colocated on the same GPUs as the subprocess
            workers via env-injected CUDA_VISIBLE_DEVICES.
@@ -2722,7 +2767,7 @@ class DynamoReplica(RolloutReplica):
         num_logical_replicas = len(self.workers) // self.world_size
         await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
 
-        # Now that dynamo.vllm subprocesses are alive on the GPUs identified
+        # Now that the engine subprocesses are alive on the GPUs identified
         # by self._trainer_worker_infos, spawn matching CheckpointEngineWorker
         # actors and adopt them as our framework-facing workers. Naive mode
         # must keep the trainer WorkerDict handles: its refit runs inside
@@ -2964,7 +3009,6 @@ class DynamoReplica(RolloutReplica):
         )
 
     async def launch_servers(self):
-        """Dynamo uses a NeMo-style worker-pool entrypoint instead."""
         raise RuntimeError(
             "DynamoReplica.launch_servers() is disabled because the dynamo "
             "backend uses a single shared worker pool. Call "

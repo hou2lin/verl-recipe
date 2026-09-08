@@ -34,7 +34,7 @@ Two things differ from verl's native sglang path:
    That is wrong here: gathering IPC handles across shards would hand shard 0's
    engine handles created on shard 1's GPUs. This adapter instead builds a
    *shard-local* TP process group using the **same formula the launcher uses** to
-   slice GPUs (``dynamo_async_server._start_vllm_workers``: shard = local_rank // tp,
+   slice GPUs (``dynamo_async_server._start_engine_workers``: shard = local_rank // tp,
    rank_offset = shard * tp), so sender and receiver agree by construction.
 
    Getting this wrong does not raise — it silently trains against mismatched
@@ -255,7 +255,7 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         vLLM no-ops on that; SGLang raises ``KeyError`` inside
         ``weight_updater.resume_memory_occupation`` and kills the scheduler process.
         Aggravated by ``engine_workers.py``'s ``is_sglang = rollout.name == "sglang"``
-        check, which our ``dynamo_sglang`` name fails — see DESIGN D4/D5.
+        check, which our ``dynamo`` rollout name fails.
         """
         await self._init_server_adapter()
         if self._control_client is None or not self.config.free_cache_engine:

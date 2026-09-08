@@ -111,7 +111,7 @@ echo "VERL_USE_EXTERNAL_MODULES=${VERL_USE_EXTERNAL_MODULES}"
 # cache -- sglang's piecewise-cudagraph compiler raised
 #   OSError: [Errno 28] No space left on device
 # from backend.py, which the engine turned into SIGQUIT and the watchdog reported
-# as "dynamo vllm_workers[1] exited rc=-9". Looks like an OOM kill, is a full disk.
+# as "dynamo engine_workers[1] exited rc=-9". Looks like an OOM kill, is a full disk.
 JOB_CACHE_BASE=${VERL_NODE_CACHE_BASE:-/tmp/verl_${USER:-user}_sgl0512_$(hostname)_${SLURM_JOB_ID:-manual}}
 # Reap caches from finished jobs on this node. Guarded by -mmin so a concurrently
 # starting sibling job is never touched.

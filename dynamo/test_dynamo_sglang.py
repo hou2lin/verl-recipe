@@ -159,7 +159,7 @@ def test_sglang_requires_system_port():
     server._cuda_visible_devices = "0"
     server._worker_specs = None
     with pytest.raises(ValueError, match="requires enable_worker_system_metrics"):
-        server._start_vllm_workers()
+        server._start_engine_workers()
 
 
 def test_num_engine_workers_counts_sglang_shards():
@@ -177,7 +177,7 @@ def test_num_engine_workers_counts_sglang_shards():
 def test_trainer_shard_index_matches_launcher_gpu_slicing(local_world_size, tp):
     """Every trainer rank must resolve to the shard that owns its GPU.
 
-    The launcher (``_start_vllm_workers``) gives shard *i* the GPU slice
+    The launcher (``_start_engine_workers``) gives shard *i* the GPU slice
     ``cvd[i*tp:(i+1)*tp]``. The adapter computes ``shard = local_rank // tp``.
     If those two ever drift, weight sync posts CUDA-IPC handles to an engine on a
     different GPU — which does not raise, it just trains against wrong weights.
@@ -722,7 +722,7 @@ def test_sglang_refuses_memory_saver_flag_split():
     server._cuda_visible_devices = "0"
     server._worker_specs = None
     with pytest.raises(ValueError, match="enable_sleep_mode"):
-        server._start_vllm_workers()
+        server._start_engine_workers()
 
 
 def test_facade_imports_without_vllm(monkeypatch):

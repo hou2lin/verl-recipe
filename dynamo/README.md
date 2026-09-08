@@ -161,6 +161,7 @@ conditional install, never a baked image.
 | --- | --- | --- |
 | [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
 | [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
+| [`baseline_qwen3_30b_sglang_native.sh`](baseline_qwen3_30b_sglang_native.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
 ## NIXL weight sync (checkpoint engine)
 
@@ -186,6 +187,14 @@ twice regardless of world size.
 | NIXL | ✅ | ✅ (2×8 GPU validated) |
 
 ### Transport selection (read this before multi-node)
+
+NIXL's default backend is UCX, and UCX picks its transport from `UCX_TLS`.
+The right setting depends on the RDMA fabric:
+
+| fabric | recommendation |
+| --- | --- |
+| RDMA with native RDMA-read (e.g. InfiniBand / RoCE) | `UCX_TLS=cuda_ipc,cuda_copy,rc,tcp` — `rc` gives native RDMA read at line rate. |
+| RDMA without native RDMA-read (send/recv-only protocols) | UCX can only emulate one-sided reads over send/recv — we measured 0.23 GB/s. Use NIXL's **LIBFABRIC** backend instead: `+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nixl.backends=[LIBFABRIC]`, with your fabric's libfabric provider (≥1.18) on `LD_LIBRARY_PATH`. Same 1 GiB cross-node read: **48.5 GB/s**. |
 
 Cross-node measured on 2 nodes × 8×H100 (RDMA fabric), 3-step GRPO,
 step-3 `update_weights`:
@@ -234,15 +243,6 @@ a **multi-turn agent loop** (tool calls, an external environment, a custom
 reward) through the Dynamo frontend. The pieces below are what that adds on top
 of the smoke test; everything is parameterised, so drop in your own model, data,
 and agent loop.
-
-### Trainer: currently no fully_async
-
-Dynamo has no `fully_async` trainer. Run it through `verl.trainer.main_ppo` with
-`trainer.use_v1=False` (see [Quick start](#quick-start)) and
-`actor_rollout_ref.hybrid_engine=True`.
-`DynamoLLMServerManager` is colocated — it forwards the trainer's
-`CUDA_VISIBLE_DEVICES` into the engine shards — so `hybrid_engine=True` is
-required, not optional.
 
 ### Wire in your agent loop
 
@@ -298,11 +298,6 @@ python3 recipe/dynamo/metrics_sidecar.py \
 
 ## ThunderAgent extension
 
-This recipe extends the Dynamo rollout backend with **ThunderAgent**
-(from [verl-recipe PR #110](https://github.com/verl-project/verl-recipe/pull/110)):
-program-aware scheduling for multi-turn agent trajectories. It does not
-modify core `verl` or Dynamo.
-
 ### Required versions
 
 - Dynamo: source commit `59d614641837e593f0567b79d75394aae5f864e0`, including
@@ -320,16 +315,19 @@ With ThunderAgent enabled, verl launches processes in this order:
 etcd -> NATS -> Dynamo vLLM workers -> ThunderAgent router -> frontend
 ```
 
-The frontend uses round-robin only to reach the registered ThunderAgent
-handler. ThunderAgent owns the internal KV router and forwards to the worker
+ThunderAgent owns the internal KV router and forwards to the worker
 endpoint `<namespace>.backend.generate`. Shutdown reverses the consumer side:
 frontend, ThunderAgent, workers, NATS, then etcd.
 
 ### Configuration
 
 The recipe's default config ([`config/dynamo_trainer.yaml`](config/dynamo_trainer.yaml))
-enables ThunderAgent — vLLM path only; it is not enabled for the sglang engine
-(see [Not wired yet](#not-wired-yet)):
+enables ThunderAgent. It is validated on the vLLM path only, and the exclusion of
+the sglang engine is by launcher override rather than by a check in the code:
+every script here, both sglang ones included, passes
+`thunderagent.enabled=false` explicitly, so an sglang run that takes the default
+config unchanged would start the router as well (see
+[Not wired yet](#not-wired-yet)):
 
 ```yaml
 actor_rollout_ref:
@@ -454,38 +452,6 @@ path ships no sidecar. The trade is that `DYN_SYSTEM_PORT` stops being an
 optional metrics extra and becomes the whole control plane —
 `enable_worker_system_metrics=false` is rejected outright for this engine.
 
-### Prerequisites
-
-1. **A container with `dynamo.sglang`.** Two validated routes:
-   - the smoke scripts install the `[sglang]` extra from the **local** 1.3.0
-     wheelhouse into the vLLM image (`ai_dynamo==1.3.0` is not on PyPI, only
-     `.post1`/`1.3.1`; the extra pulls `sglang==0.5.14`). Per-job only, never baked in:
-     it downgrades vLLM's guided-decoding deps (see [Quick start §3](#3-multi-node-30b-rl));
-   - the 30B launchers use an image that already ships sglang (`verl_sgl0512.dev4`:
-     sglang 0.5.12 / transformers 5.3.0) and install the dynamo wheels `--no-deps`.
-2. **The log-prob fidelity fix** —
-   [required for trustworthy rollout log-probs](#engine-log-prob-fidelity-incremental-vs-cumulative-fix-required-fix):
-   a dynamo build that includes upstream #11640, or its log-prob portion
-   backported onto `94accc7389` (three files, described in that section).
-3. **No patching needed for the weight-sync payload.** The CUDA-IPC blobs go on
-   the wire base64-encoded, which is SGLang's own contract:
-   `serialized_named_tensors` is typed `List[Union[str, bytes]]` and
-   `MultiprocessingSerializer.deserialize` b64-decodes any `str`. Verified
-   end-to-end against an unmodified dynamo 1.3.0 + sglang 0.5.14 on an H100.
-   Note a malformed payload does **not** return an error — it
-   kills the worker process.
-4. **`--enable-memory-saver`** is added automatically when
-   `rollout.enable_sleep_mode=true`; without it SGLang's torch_memory_saver
-   never arms and memory release silently frees nothing (the server refuses
-   `free_cache_engine=true` + `enable_sleep_mode=false` for this reason). Also
-   **unset `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`** in the job
-   environment: torch_memory_saver refuses to initialise under it, and the
-   engine then sits on ~31 GB/GPU of weights through every training step.
-5. **transformers 5.x memory.** sglang 0.5.x pins transformers 5.x, which stores
-   MoE experts as one fused tensor and roughly **doubles** the actor-update peak
-   versus 4.x (35.6 → 71.6 GB on Qwen3-30B-A3B). On 4×8 H100 it fits as is; on
-   2×8 use `VERL_DEFER_OPTIMIZER_LOAD=1` (patch below). Do not reach for
-   `_experts_implementation=eager` — it costs a 39× slower update.
 
 ### Run
 
@@ -513,7 +479,8 @@ sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
 
 ### Not wired yet
 
-- **ThunderAgent** — only validated against vLLM; not enabled for the sglang engine.
+- **ThunderAgent** — only validated against vLLM; the sglang launchers turn it off
+  explicitly, and nothing in the code refuses the combination.
 - **`checkpoint_engine.backend=delta_sharded`** — verl gates it on
   `rollout.name == "sglang"` (`verl/checkpoint_engine/base.py`), which the
   `dynamo` rollout name does not satisfy.
@@ -523,110 +490,6 @@ sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
   generation currently goes through the same frontend `/v1/completions` path as
   vLLM. (Only the log-prob portion of #11640 is needed by this recipe, not the
   `/generate` endpoint itself.)
-
-### Engine log-prob fidelity: incremental-vs-cumulative fix (required fix)
-
-**Status: fixed and verified end-to-end (2026-09-01).** Requires the dynamo-side fix below.
-
-**Symptom.** With the sglang engine, the outlier-sensitive rollout-vs-actor
-diagnostics are destroyed, while k1 KL is silently biased but still lands in a
-plausible range — which is exactly why the bug hides:
-
-| metric | dynamo+sglang (broken) | native sglang (21-step mean) |
-| --- | --- | --- |
-| `rollout_actor_probs_pearson_corr` | 0.05 – 0.62 | 0.9993 |
-| `rollout_corr/k3_kl` | up to 1635 | 0.0020 |
-| `rollout_corr/kl` (k1) | 0.0032 – 0.0037 (looks plausible!) | 0.0020 |
-
-A dynamo+vLLM reference run (3 steps) shows the same healthy
-profile as native sglang: pearson 0.9993, k3_kl 0.0019.
-
-In the default recipe config, training itself learns normally despite this —
-gradients use trainer-recomputed log-probs, so only diagnostics were corrupted.
-**Any mode that consumes engine log-probs directly
-(`actor.use_rollout_log_probs=true`, fully-async training) would have trained
-on the corrupted values** and must not run without the patch below.
-
-**Root cause.** sglang streams `meta_info["output_token_logprobs"]`
-**incrementally** (each chunk carries only that chunk's tokens), but dynamo's
-shared extractor `common/backend/logprobs.py::extract_from_sglang_meta` sliced
-it as if it were **cumulative** (`arr[num_output_logprobs_so_far:]`). From
-chunk 2 onward the slice was always empty, so the chunk carried no log-probs
-while token ids kept flowing through `nvext.completion_token_ids`. Measured on
-one request: 12 of 6944 positions (0.17%) had real log-probs; the rest were
-padded. A pad of `0.0` means "probability 1.0", which the exponential in k3
-amplifies to astronomical values while the linear k1 mean barely moves — hence
-the signature above.
-
-**Fix.** Backport of the log-prob portion of upstream
-[ai-dynamo/dynamo#11640](https://github.com/ai-dynamo/dynamo/pull/11640)
-(the PR title does not mention log-probs — the fix ships inside the
-engine-native generate endpoint work; search by file, not by subject). Either
-build dynamo from a commit that already contains #11640, or backport its
-log-prob portion (~20 lines) onto `94accc7389`. Three files: `common/backend/logprobs.py` (slice the chunk head instead of a
-running cursor), `sglang/request_handlers/llm/decode_handler.py` and
-`sglang/llm_engine.py` (pass `num_output_tokens_in_chunk=len(output_ids)`, drop
-the cursor state, fix the comments that still described the old cumulative
-semantics).
-
-**Recipe-side hardening** (already on this branch, in `dynamo_async_server.py`):
-
-- Launch-time fail-fast: starting an sglang engine without
-  `engine_kwargs.dynamo.request_completion_token_ids=true` now raises at startup
-  instead of silently degrading (an explicit `false` is still honored).
-- `_normalize_log_probs` pads missing positions with the sequence mean instead
-  of `0.0`, and reports loudly (first 3 occurrences + every 100th). Padding is a
-  symptom of an engine-side bug: with the patch above the counter stayed at 0
-  for the full verification run, and any nonzero count should be treated as a
-  regression.
-- Each sglang worker gets an explicitly allocated `--nccl-port`
-  (fixes `EADDRINUSE` when several workers share a node).
-
-**Verification** — Qwen3-30B-A3B-Base retool GRPO, 4 nodes × 8 H100,
-CUDA graph on, **no** `--stream-interval` workaround, 100 steps in 2h07
-(65.5 s/step), 0 padding events, 0 OOM. Against a native-sglang run
-(`rollout.name=sglang`, no dynamo) over the native run's full 21 steps:
-
-| metric (steps 1–21 mean) | dynamo+sglang, patched | native sglang |
-| --- | --- | --- |
-| `rollout_actor_probs_pearson_corr` | 0.99920 | 0.99928 |
-| `rollout_corr/k3_kl` | 0.00197 | 0.00204 |
-| `rollout_corr/kl` (k1) | 0.00201 | 0.00204 |
-| `rollout_probs_diff_mean` | 0.00526 | 0.00516 |
-| `critic/score/mean` | -0.760 | -0.750 |
-| `actor/grad_norm` | 0.173 | 0.173 |
-
-Over the full 100 steps (20-step segment means): the k3/k1 ratio stays at ~1
-throughout (0.98 / 1.00 / 1.04 / 1.01 / 1.00) — no re-divergence of the bug;
-pearson declines slowly and smoothly (0.99921 → 0.99744) as the policy moves
-off its initialization, with no discontinuity; score improves −0.77 → −0.18.
-
-Throughput context (not a like-for-like engine comparison): the patched dynamo
-arm ran 100 steps in 2h07 while the native arm hit the 4h wall at step 21.
-dynamo's `free_engine_on_train` releases engine memory during training; with
-it, CUDA graph fit on this footprint. In this recipe's native configuration
-engine memory stays resident through training — the native CUDA-graph attempt
-OOM'd and the arm had to run eager.
-
-**Diagnostic rule of thumb.** Watch the `k3_kl / k1` **ratio**, not k3's
-absolute value. Both estimate the same KL, so when the two log-prob streams
-agree the ratio is ~1 (here 0.98–1.04 throughout). Extreme per-token outliers —
-exactly what bad `0.0` padding produces — explode the exponential k3 but not
-the linear k1 (broken run: ratio ~4.7e5), and unlike k3 itself the ratio does
-not grow with KL magnitude. Two caveats: k1 is a signed mean, so very early in
-training (KL ≈ 0) the ratio is ill-conditioned and can spike without any bug;
-and mean-padded values (the hardening above) do **not** produce outliers, so
-they will not trip this alarm — the padding counter is the alarm for that
-failure mode.
-
-**Known open item.** `actor/entropy` 0.88 vs 1.05 and `response_length/mean`
-941 vs 983 (dynamo vs native, steps 1–21) reproduce across independent dynamo
-runs — though all of those runs share the same confound, so reproduction does
-not disentangle it. The clean fidelity metrics above are consistent with a
-generation-side difference (what the engine samples), which they cannot see by
-construction. Candidates: CUDA graph (on for dynamo, eager for native in all
-data so far) and sampling-parameter passthrough at the OpenAI frontend. Not yet
-root-caused.
 
 ## Changes required in sibling repos
 
