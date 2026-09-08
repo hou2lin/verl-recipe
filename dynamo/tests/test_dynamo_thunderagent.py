@@ -791,6 +791,7 @@ def _make_fully_async_client(lb, handles, threshold: int = 50) -> DynamoFullyAsy
         dynamo_server_handles=handles,
         auto_finalize=True,
         finalize_leak_threshold=threshold,
+        finalize_timeout_s=5.0,
     )
 
 
@@ -815,28 +816,195 @@ async def test_finalize_recovery_retries_then_succeeds() -> None:
     await client._finalize_with_recovery("session-A", routing_key="session-A")
 
     assert server.finalize_calls == ["session-A"]
-    assert client._consecutive_finalize_failures == 0
+    assert client._unresolved_finalize_leaks == 0
 
 
 @pytest.mark.asyncio
-async def test_finalize_recovery_falls_back_to_broadcast() -> None:
+async def test_broadcast_fallback_counts_as_unconfirmed_leak() -> None:
+    # A "successful" broadcast reaches only THIS pool's frontends; the session
+    # may have been served by the other pool (separate_async), where an
+    # unknown-session finalize no-ops with 2xx — cleanup is unconfirmed and
+    # must count as a leak, not reset the counter.
     server = _FakeServer()
     lb = _FakeLoadBalancer(server, fail_times=99)
     client = _make_fully_async_client(lb, [server])
 
     await client._finalize_with_recovery("session-A", routing_key="session-A")
 
-    assert server.finalize_calls == ["session-A"]  # via static-handle broadcast
-    assert client._consecutive_finalize_failures == 0
+    assert server.finalize_calls == ["session-A"]  # broadcast dispatched
+    assert client._unresolved_finalize_leaks == 1  # ...but unconfirmed
 
 
 @pytest.mark.asyncio
-async def test_finalize_leak_threshold_escalates() -> None:
+async def test_leak_counter_is_cumulative_across_successes() -> None:
+    # Leaked programs are permanent: an interleaved successful cleanup for a
+    # DIFFERENT session must not reset the counter (the old consecutive
+    # counter let alternating fail/success accumulate unbounded leaks).
     failing = _FailingFinalizeServer()
-    lb = _FakeLoadBalancer(failing, fail_times=99)
-    client = _make_fully_async_client(lb, [failing], threshold=2)
+    working = _FakeServer()
+    lb_fail = _FakeLoadBalancer(failing, fail_times=99)
+    client = _make_fully_async_client(lb_fail, [failing], threshold=2)
 
-    await client._finalize_with_recovery("s1", routing_key="s1")  # 1st leak: warn only
-    assert client._consecutive_finalize_failures == 1
-    with pytest.raises(RuntimeError, match="consecutive ThunderAgent finalize failures"):
+    await client._finalize_with_recovery("s1", routing_key="s1")
+    assert client._unresolved_finalize_leaks == 1
+
+    client._load_balancer = _FakeLoadBalancer(working)
+    client._dynamo_server_handles = [working]
+    await client._finalize_with_recovery("s-ok", routing_key="s-ok")  # confirmed success
+    assert client._unresolved_finalize_leaks == 1  # NOT reset
+
+    client._load_balancer = _FakeLoadBalancer(failing, fail_times=99)
+    client._dynamo_server_handles = [failing]
+    with pytest.raises(RuntimeError, match="cumulative unconfirmed ThunderAgent finalize"):
         await client._finalize_with_recovery("s2", routing_key="s2")
+
+
+@pytest.mark.asyncio
+async def test_manual_finalize_uses_recorded_routing_key() -> None:
+    # auto_finalize=false multi-turn callers invoke finalize_program with only
+    # the session id; the client must route via the request_id recorded at
+    # generate time, not the session id.
+    server = _FakeServer()
+    lb = _FakeLoadBalancer(server)
+    client = _make_fully_async_client(lb, [server])
+    client._auto_finalize = False
+
+    client._remember_routing_key("sess-X", "req-Y")
+    await client.finalize_program("sess-X")
+
+    assert lb.acquire_keys == ["req-Y"]
+    assert server.finalize_calls == ["sess-X"]
+    assert "sess-X" not in client._session_routing_keys  # popped after success
+
+
+class _TokenServer(_FakeServer):
+    """Fake frontend returning canned TokenOutputs (aborts first, then serves)."""
+
+    def __init__(self, outputs):
+        super().__init__()
+        self._outputs = list(outputs)
+
+    def _generate(self, **kwargs):
+        self.generate_calls.append(kwargs)
+        return self._outputs.pop(0)
+
+
+class _SwitchingLoadBalancer:
+    """First acquire lands on the hybrid server; separate_async then removes
+    it from the pool, so every later acquire (the aborted retry, and any
+    sticky lookup) re-selects the standalone server — verl's real LB deletes
+    the stale sticky entry and re-selects exactly like this."""
+
+    def __init__(self, hybrid, standalone):
+        self._hybrid = hybrid
+        self._standalone = standalone
+        self.acquire_keys: list[str] = []
+        self.acquire_server = _RemoteMethod(self._acquire)
+        self.release_server = SimpleNamespace(remote=lambda **_kwargs: None)
+
+    def _acquire(self, request_id: str):
+        self.acquire_keys.append(request_id)
+        if len(self.acquire_keys) == 1:
+            return ("hybrid", self._hybrid)
+        return ("standalone", self._standalone)
+
+
+@pytest.mark.asyncio
+async def test_cross_pool_retry_finalizes_all_served_frontends() -> None:
+    # final_review 9.2: hybrid serves the first attempt (program created
+    # there), switch_to_trainer removes it from the LB and aborts the
+    # request, the retry re-routes to standalone — finalize must reach BOTH
+    # frontends, not just the one the sticky entry ends up pointing at.
+    from verl.workers.rollout.replica import TokenOutput
+
+    hybrid = _TokenServer([TokenOutput(token_ids=[], log_probs=[], num_preempted=0, stop_reason="aborted")])
+    standalone = _TokenServer([TokenOutput(token_ids=[7], log_probs=[-0.1], num_preempted=0, stop_reason="stop")])
+    lb = _SwitchingLoadBalancer(hybrid, standalone)
+    client = _make_fully_async_client(lb, [standalone])
+
+    output = await client.generate("traj-1", prompt_ids=[1], sampling_params={"max_tokens": 4})
+
+    assert output.token_ids == [7]
+    assert lb.acquire_keys == ["traj-1", "traj-1"]  # same routing key, re-routed
+    assert hybrid.finalize_calls == ["traj-1"]
+    assert standalone.finalize_calls == ["traj-1"]
+    assert client._unresolved_finalize_leaks == 0
+    assert "traj-1" not in client._session_servers  # dropped after confirm-all
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_served_frontend_counts_individual_leak() -> None:
+    # One of the served frontends never acks its finalize: that program is a
+    # permanent frontend-local leak (broadcasting to OTHER frontends cannot
+    # free it) and must count toward the cumulative threshold — while the
+    # confirmable frontend is still cleaned up.
+    failing = _FailingFinalizeServer()
+    working = _FakeServer()
+    client = _make_fully_async_client(_FakeLoadBalancer(working), [working])
+    client._record_served_server("s1", "hybrid", failing)
+    client._record_served_server("s1", "standalone", working)
+
+    await client._finalize_with_recovery("s1", routing_key="s1")
+
+    assert working.finalize_calls == ["s1"]
+    assert client._unresolved_finalize_leaks == 1
+    assert "s1" not in client._session_servers
+
+
+@pytest.mark.asyncio
+async def test_manual_finalize_covers_all_served_frontends() -> None:
+    # auto_finalize=false multi-turn callers: the manual finalize must use the
+    # servers recorded at generate time — not the LB sticky entry, which after
+    # a switch points only at the last pool.
+    hybrid = _FakeServer()
+    standalone = _FakeServer()
+    lb = _FakeLoadBalancer(standalone)
+    client = _make_fully_async_client(lb, [standalone])
+    client._auto_finalize = False
+    client._record_served_server("sess-M", "hybrid", hybrid)
+    client._record_served_server("sess-M", "standalone", standalone)
+
+    await client.finalize_program("sess-M")
+
+    assert hybrid.finalize_calls == ["sess-M"]
+    assert standalone.finalize_calls == ["sess-M"]
+    assert lb.acquire_keys == []  # sticky lookup not consulted
+    assert "sess-M" not in client._session_servers
+
+
+@pytest.mark.asyncio
+async def test_finalize_rpc_is_time_bounded() -> None:
+    # A hung frontend (e.g. paused hybrid whose router stopped answering)
+    # must not park the trajectory for the full request_timeout_s.
+    class _HungServer(_FakeServer):
+        async def _hang(self, **_kwargs):
+            await asyncio.sleep(600)
+
+        def __init__(self):
+            super().__init__()
+            self.finalize_program = _RemoteMethod(self._hang)
+
+    hung = _HungServer()
+    client = _make_fully_async_client(_FakeLoadBalancer(hung), [hung])
+    client._finalize_timeout_s = 0.05
+    client._record_served_server("s-hung", "hybrid", hung)
+
+    await client._finalize_with_recovery("s-hung", routing_key="s-hung")
+
+    assert client._unresolved_finalize_leaks == 1  # timed out -> unconfirmed
+
+
+@pytest.mark.asyncio
+async def test_probe_deadline_caps_hung_requests() -> None:
+    server = _make_bare_server()
+    server.config = SimpleNamespace(
+        engine_kwargs={"dynamo": {"logprob_probe_timeout_s": 1}},
+        calculate_log_probs=True,
+    )
+
+    async def hung_generate(**_kwargs):
+        await asyncio.sleep(600)
+
+    server.generate = hung_generate
+    with pytest.raises(RuntimeError, match="probe timed out"):
+        await server.probe_logprob_channel()
