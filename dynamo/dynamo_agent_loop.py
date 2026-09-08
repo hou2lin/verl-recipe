@@ -92,16 +92,30 @@ class DynamoServerManager:
             **kwargs,
         )
         if not self.thunderagent_enabled:
-            return await self.server.generate.remote(**generate_kwargs)
+            output = await self.server.generate.remote(**generate_kwargs)
+            return self._tag_weight_versions(output)
 
         scope = current_program()
         if scope is None:
             raise RuntimeError("Dynamo generation requires an active ThunderAgent program")
         async with scope.request():
-            return await self.server.generate.remote(
+            output = await self.server.generate.remote(
                 **generate_kwargs,
                 thunderagent_session_id=scope.session_id,
             )
+            return self._tag_weight_versions(output)
+
+    @staticmethod
+    def _tag_weight_versions(output: TokenOutput) -> TokenOutput:
+        """Match LLMServerClient.generate's min/max_global_steps contract.
+
+        V1 sync-mode consumers read these keys unconditionally; leaving them
+        unset crashes trainer staleness accounting downstream.
+        """
+        global_steps = output.extra_fields.get("global_steps")
+        output.extra_fields.setdefault("min_global_steps", global_steps)
+        output.extra_fields.setdefault("max_global_steps", global_steps)
+        return output
 
 
 class DynamoLLMServerManager(LLMServerManager):
@@ -131,10 +145,22 @@ class DynamoLLMServerManager(LLMServerManager):
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
-    async def _init_global_load_balancer(self) -> None:
-        """Dynamo owns routing behind its single shared frontend."""
+    def get_client(self, client_cls=None, **kwargs):
+        """Return an LLM client for the shared Dynamo frontend.
 
-    def get_client(self, client_cls=None, **kwargs) -> DynamoServerManager:
+        V1 trainers pass an explicit ``client_cls`` (FullyAsyncLLMServerClient
+        for colocate_async / separate_async): delegate to the base manager so
+        the client gets the GlobalRequestLoadBalancer (degenerate single-server
+        pass-through — Dynamo's KV router still does the real routing), the
+        abort/resume retry loop, and min/max_global_steps aggregation.
+
+        Legacy V0 callers (ray_trainer / DynamoAgentLoopManager) pass no
+        ``client_cls`` and keep the direct DynamoServerManager, which carries
+        the ThunderAgent program-affinity path.
+        """
+        if client_cls is not None:
+            return super().get_client(client_cls=client_cls, **kwargs)
+
         dynamo_config = (self.rollout_config.engine_kwargs or {}).get("dynamo", {}) or {}
         thunderagent_config = dynamo_config.get("thunderagent", {}) or {}
         servers = list(zip(self.server_addresses, self.server_handles, strict=True))
