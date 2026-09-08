@@ -50,13 +50,11 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
+from recipe.dynamo.dynamo_naming import control_actor_name
+from recipe.dynamo.dynamo_sglang_engine import DynamoSGLangControlClient
 
 from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter as _SGLangServerAdapter
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
-
-from recipe.dynamo.dynamo_naming import control_actor_name
-
-from recipe.dynamo.dynamo_sglang_engine import DynamoSGLangControlClient
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -458,7 +456,8 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         flat = _flatten_floats(values)[: len(expected)]
         if len(flat) != len(expected):
             logger.error(
-                "[dynamo-sglang] verification INCONCLUSIVE (nothing verified): engine returned %s values for %s, expected %s",
+                "[dynamo-sglang] verification INCONCLUSIVE (nothing verified): "
+                "engine returned %s values for %s, expected %s",
                 len(flat),
                 name,
                 len(expected),

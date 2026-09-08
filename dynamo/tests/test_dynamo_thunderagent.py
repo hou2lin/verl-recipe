@@ -240,9 +240,7 @@ async def test_server_manager_returns_direct_thunderagent_client() -> None:
         manager.server_addresses = ["frontend:8000"]
         manager.server_handles = [_FakeServer()]
         manager.global_load_balancer = object()
-        manager.rollout_config = SimpleNamespace(
-            engine_kwargs={"dynamo": {"thunderagent": {"enabled": thunderagent}}}
-        )
+        manager.rollout_config = SimpleNamespace(engine_kwargs={"dynamo": {"thunderagent": {"enabled": thunderagent}}})
         manager.config = SimpleNamespace(trainer={"use_v1": use_v1})
         return manager
 
@@ -637,6 +635,7 @@ def _entrypoint_config(*, use_v1: bool, manager_class=None):
 
 def test_training_entrypoint_dispatches_on_use_v1(monkeypatch) -> None:
     from recipe.dynamo import main_dynamo
+
     from verl.trainer.main_ppo import TaskRunnerV1
     from verl.trainer.main_ppo_v0 import TaskRunner as TaskRunnerV0
 
@@ -734,7 +733,7 @@ def test_extract_log_probs_rejects_cross_provenance() -> None:
 def test_missing_logprob_source_raises_at_response_boundary() -> None:
     server = _make_bare_server()
     data = {"choices": [{"text": "hi", "finish_reason": "stop", "logprobs": {"token_ids": [1, 2]}}]}
-    with pytest.raises(RuntimeError, match="no logprob source"):
+    with pytest.raises(RuntimeError, match="no usable logprob"):
         server._completion_response_to_token_output(data, include_log_probs=True)
 
 

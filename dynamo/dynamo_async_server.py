@@ -311,9 +311,7 @@ class DynamoHttpServer:
         """Which inference engine Dynamo fronts: ``vllm`` (default) or ``sglang``."""
         engine = str(self._dynamo_cfg().get("engine", ENGINE_VLLM)).lower()
         if engine not in _SUPPORTED_ENGINES:
-            raise ValueError(
-                f"rollout.engine_kwargs.dynamo.engine must be one of {_SUPPORTED_ENGINES}, got {engine!r}"
-            )
+            raise ValueError(f"rollout.engine_kwargs.dynamo.engine must be one of {_SUPPORTED_ENGINES}, got {engine!r}")
         return engine
 
     def _is_sglang(self) -> bool:
@@ -339,8 +337,7 @@ class DynamoHttpServer:
 
             timeout_s = float(self._dynamo_cfg().get("request_timeout_s", 600))
             self._sglang_clients = [
-                DynamoSGLangControlClient(url, timeout_s=timeout_s)
-                for url in self._engine_control_endpoints
+                DynamoSGLangControlClient(url, timeout_s=timeout_s) for url in self._engine_control_endpoints
             ]
         return self._sglang_clients
 
@@ -387,8 +384,11 @@ class DynamoHttpServer:
                 if wanted:
                     targets.append((idx, wanted))
             if not targets:
-                logger.info("[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
-                            list(tags), sorted(self._sglang_released_tags))
+                logger.info(
+                    "[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
+                    list(tags),
+                    sorted(self._sglang_released_tags),
+                )
                 return
             outcomes = await self._sglang_control_fanout(
                 "release_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
@@ -400,9 +400,13 @@ class DynamoHttpServer:
                 else:
                     per_shard[idx].update(wanted)
             self._refresh_node_released_view()
-            logger.info("[DynamoHttpServer] sglang released %s on %d/%d shard(s) (now released=%s)",
-                        sorted({t for _, w in targets for t in w}), len(targets) - len(errors), len(targets),
-                        sorted(self._sglang_released_tags))
+            logger.info(
+                "[DynamoHttpServer] sglang released %s on %d/%d shard(s) (now released=%s)",
+                sorted({t for _, w in targets for t in w}),
+                len(targets) - len(errors),
+                len(targets),
+                sorted(self._sglang_released_tags),
+            )
             if errors:
                 # Successful shards are already recorded above, so a retry only
                 # touches the ones that failed instead of double-releasing the rest.
@@ -424,8 +428,11 @@ class DynamoHttpServer:
             per_shard = self._sglang_shard_state()
             targets = [(idx, sorted(released)) for idx, released in enumerate(per_shard) if released]
             if not targets:
-                logger.info("[DynamoHttpServer] sglang resume%s skipped (released=%s)", list(tags),
-                            sorted(self._sglang_released_tags))
+                logger.info(
+                    "[DynamoHttpServer] sglang resume%s skipped (released=%s)",
+                    list(tags),
+                    sorted(self._sglang_released_tags),
+                )
                 return
             # Resume EVERY released tag, not just the requested one. Dynamo's sglang
             # handler re-registers the worker into discovery on the first resume, so a
@@ -443,8 +450,12 @@ class DynamoHttpServer:
             # contents are stale, and the weight sync's flush_cache drops them.
             widened = sorted({t for _, w in targets for t in w})
             if set(widened) != set(tags):
-                logger.info("[DynamoHttpServer] sglang resume%s widened to %s so the shard "
-                            "does not rejoin discovery half-restored", list(tags), widened)
+                logger.info(
+                    "[DynamoHttpServer] sglang resume%s widened to %s so the shard "
+                    "does not rejoin discovery half-restored",
+                    list(tags),
+                    widened,
+                )
             outcomes = await self._sglang_control_fanout(
                 "resume_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
             )
@@ -455,8 +466,13 @@ class DynamoHttpServer:
                 else:
                     per_shard[idx].difference_update(wanted)
             self._refresh_node_released_view()
-            logger.info("[DynamoHttpServer] sglang resumed %s on %d/%d shard(s) (now released=%s)",
-                        widened, len(targets) - len(errors), len(targets), sorted(self._sglang_released_tags))
+            logger.info(
+                "[DynamoHttpServer] sglang resumed %s on %d/%d shard(s) (now released=%s)",
+                widened,
+                len(targets) - len(errors),
+                len(targets),
+                sorted(self._sglang_released_tags),
+            )
             if errors:
                 raise RuntimeError(
                     f"dynamo.sglang resume_memory_occupation failed on shard(s) {errors}; "
@@ -899,8 +915,10 @@ class DynamoHttpServer:
             # free_cache_engine on, release_memory_occupation still runs -- dynamo
             # deregisters the worker from discovery -- but frees nothing, and the
             # trainer OOMs with no log line naming the cause. Refuse the split.
-            if is_sglang and getattr(self.config, "free_cache_engine", True) and not getattr(
-                self.config, "enable_sleep_mode", True
+            if (
+                is_sglang
+                and getattr(self.config, "free_cache_engine", True)
+                and not getattr(self.config, "enable_sleep_mode", True)
             ):
                 raise ValueError(
                     "engine=sglang: rollout.free_cache_engine=true requires "
@@ -1591,8 +1609,7 @@ class DynamoHttpServer:
                 # failing the trajectory. (A clean abort response still
                 # returns partial tokens via finish_reason="abort".)
                 logger.warning(
-                    "[generate] frontend dispatch failed while engines are paused; "
-                    "treating as aborted (request_id=%s)",
+                    "[generate] frontend dispatch failed while engines are paused; treating as aborted (request_id=%s)",
                     request_id,
                 )
                 return self._build_token_output(token_ids=[], stop_reason="aborted", allow_empty=True)
@@ -2337,15 +2354,11 @@ class DynamoHttpServer:
         result.extend([fill] * n_pad)
 
         if n_none or n_pad:
-            DynamoHttpServer._report_logprob_padding(
-                token_count - n_none - n_pad, token_count, n_none, n_pad, fill
-            )
+            DynamoHttpServer._report_logprob_padding(token_count - n_none - n_pad, token_count, n_none, n_pad, fill)
         return result
 
     @staticmethod
-    def _report_logprob_padding(
-        usable: int, total: int, n_none: int, n_pad: int, fill: Optional[float]
-    ) -> None:
+    def _report_logprob_padding(usable: int, total: int, n_none: int, n_pad: int, fill: Optional[float]) -> None:
         cls = DynamoHttpServer
         cls._logprob_padding_events += 1
         n = cls._logprob_padding_events
@@ -2354,8 +2367,11 @@ class DynamoHttpServer:
                 "[logprobs] engine returned %d/%d usable logprobs (None=%d, missing=%d); "
                 "filling with %s. rollout_probs_diff_* / rollout_actor_probs_pearson_corr / "
                 "rollout_corr/k3_kl are NOT trustworthy for these samples. occurrence=%d",
-                usable, total, n_none, n_pad,
-                "sequence mean %.4f" % fill if fill is not None else "nothing (returning None)",
+                usable,
+                total,
+                n_none,
+                n_pad,
+                f"sequence mean {fill:.4f}" if fill is not None else "nothing (returning None)",
                 n,
             )
 
@@ -2604,8 +2620,7 @@ class DynamoHttpServer:
                 await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
         if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
             raise RuntimeError(
-                f"logprob channel probe failed: got log_probs={output.log_probs!r} for "
-                f"{len(output.token_ids)} tokens"
+                f"logprob channel probe failed: got log_probs={output.log_probs!r} for {len(output.token_ids)} tokens"
             )
         finalize = getattr(self, "finalize_program", None)
         if finalize is not None:
@@ -2710,9 +2725,7 @@ class DynamoHttpServer:
                 reply_bytes = await asyncio.wait_for(sock.recv(), timeout=timeout)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
-                    raise RuntimeError(
-                        f"engine_method {method} failed @ {ep}: {reply.get('error')}"
-                    )
+                    raise RuntimeError(f"engine_method {method} failed @ {ep}: {reply.get('error')}")
             finally:
                 sock.close()
 

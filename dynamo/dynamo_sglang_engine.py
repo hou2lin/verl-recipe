@@ -203,9 +203,7 @@ class DynamoSGLangControlClient:
         so the encoding must match what SGLang expects, not what looks symmetric.
         """
         body = {
-            "serialized_named_tensors": [
-                base64.b64encode(b).decode("utf-8") for b in req.serialized_named_tensors
-            ],
+            "serialized_named_tensors": [base64.b64encode(b).decode("utf-8") for b in req.serialized_named_tensors],
             "load_format": req.load_format,
             "flush_cache": req.flush_cache,
         }
@@ -252,9 +250,7 @@ class DynamoSGLangControlClient:
         return await self.call_tokenizer_manager("flush_cache")
 
     async def abort_request(self, rid: str = "", abort_all: bool = False) -> dict:
-        return await self.call_tokenizer_manager(
-            "abort_request", kwargs={"rid": rid, "abort_all": bool(abort_all)}
-        )
+        return await self.call_tokenizer_manager("abort_request", kwargs={"rid": rid, "abort_all": bool(abort_all)})
 
     # ------------------------------------------------------------------ #
     # profiling

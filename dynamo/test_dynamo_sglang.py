@@ -20,7 +20,6 @@ its engine entrypoint at import time. These tests run in the vLLM container too.
 
 import asyncio
 import base64
-import importlib.metadata
 from types import SimpleNamespace
 
 import pytest
@@ -409,7 +408,6 @@ def test_shard_and_tp_group_agree(local_world_size, tp):
         assert tp_group_src % local_world_size == shard * tp
 
 
-
 # --------------------------------------------------------------------------- #
 # engine dispatch lives in ONE place (rollout.name=dynamo + engine=...)
 # --------------------------------------------------------------------------- #
@@ -434,9 +432,9 @@ def test_engine_dispatch_reads_config_not_rollout_name():
 
 def test_registry_exposes_exactly_one_dynamo_name():
     """No second rollout name for the sglang engine."""
-    from verl.workers.rollout.base import _ROLLOUT_REGISTRY
-
     import recipe.dynamo.register  # noqa: F401  (registers on import)
+
+    from verl.workers.rollout.base import _ROLLOUT_REGISTRY
 
     dynamo_names = {name for (name, _mode) in _ROLLOUT_REGISTRY if name.startswith("dynamo")}
     assert dynamo_names == {"dynamo"}, f"unexpected dynamo rollout names: {dynamo_names}"
@@ -615,10 +613,10 @@ def test_release_and_resume_guards_are_symmetric():
     calls = server._sglang_clients[0].calls
 
     async def main():
-        await server.sglang_resume(["weights"])    # never released -> no call
+        await server.sglang_resume(["weights"])  # never released -> no call
         assert calls == []
         await server.sglang_release(["weights"])
-        await server.sglang_release(["weights"])   # already released -> no call
+        await server.sglang_release(["weights"])  # already released -> no call
 
     asyncio.run(main())
     assert [m for m, _ in calls] == ["release_memory_occupation"]

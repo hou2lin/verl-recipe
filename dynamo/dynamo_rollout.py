@@ -50,9 +50,7 @@ class ServerAdapter:
         elif engine == "vllm":
             impl = _load_vllm_adapter()
         else:
-            raise ValueError(
-                f"rollout.engine_kwargs.dynamo.engine must be 'vllm' or 'sglang', got {engine!r}"
-            )
+            raise ValueError(f"rollout.engine_kwargs.dynamo.engine must be 'vllm' or 'sglang', got {engine!r}")
         return impl(*args, **kwargs)
 
 
@@ -85,7 +83,10 @@ def _load_vllm_adapter():
     return VllmDynamoServerAdapter
 
 
-__all__ = ["ServerAdapter", "VllmDynamoServerAdapter"]
+# NB: VllmDynamoServerAdapter / SGLangServerAdapter are PEP 562 lazy
+# re-exports (see __getattr__ below), intentionally NOT in __all__ — putting a
+# name that is undefined at module scope into __all__ breaks star-imports.
+__all__ = ["ServerAdapter"]
 
 
 def __getattr__(name):
