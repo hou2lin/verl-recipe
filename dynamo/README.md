@@ -259,7 +259,12 @@ ThunderAgent under V1: programs are keyed by the caller's stable `request_id`
 and auto-finalized per generate call (`thunderagent.auto_finalize`, default
 true). Multi-turn callers that want cross-turn affinity set
 `auto_finalize: false` and call the client's `finalize_program(session_id)`
-from their trajectory-end hook.
+from their trajectory-end hook. Program tables are frontend-local and
+separate_async re-routes aborted retries across pools, so the client records
+**every server that serves a generation attempt** and finalizes each of them
+(each finalize RPC bounded by `thunderagent.finalize_timeout_s`, default
+60 s); cleanup counts as confirmed only when all ack, and unconfirmed
+cleanups count toward `thunderagent.finalize_leak_threshold`.
 
 ### Legacy V0 path (compatibility only)
 
@@ -324,12 +329,21 @@ modify core `verl` or Dynamo.
 
 ### Required versions
 
-- Dynamo: source commit `59d614641837e593f0567b79d75394aae5f864e0`, including
-  [PR #11185](https://github.com/ai-dynamo/dynamo/pull/11185). This recipe is
-  currently validated against `94accc7389` (the #11185 merge commit) — see
-  [Sibling-repo patches](#patches-for-repos-outside-this-recipe). When in doubt,
-  check out `94accc7389`: it satisfies this section and is the base commit the
-  patches apply to.
+- Dynamo, vLLM engine: PyPI `ai-dynamo>=1.3.0.post1` (ships `dynamo.vllm`,
+`dynamo.frontend`, and `dynamo.thunderagent_router`, including
+[PR #11185](https://github.com/ai-dynamo/dynamo/pull/11185)). Supersedes the
+previous source build at commit `59d614641837e593f0567b79d75394aae5f864e0`.
+- Dynamo, sglang engine: additionally requires the incremental-logprobs fix
+  (dynamo#11640 area) which no stable PyPI release contains yet — use the
+  source build at `94accc7389` (the #11185 merge commit) with the
+  [sibling-repo patches](#patches-for-repos-outside-this-recipe) applied, or
+  an image carrying that backport. Without it ~99.8% of sglang logprobs pad
+  and rollout-correction metrics explode.
+- verl: pinned commit in [REQUIRED_VERL.txt](REQUIRED_VERL.txt).
+- `separate_async` additionally needs `cupy-cuda12x` (verl's nccl
+checkpoint-engine backend registers only when cupy imports); the V1 trainer
+itself needs `TransferQueue` (tested with `0.1.9`).
+
 
 ### Topology
 

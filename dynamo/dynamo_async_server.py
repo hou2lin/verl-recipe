@@ -2572,21 +2572,36 @@ class DynamoHttpServer:
         # can still be propagating (observed: 404 with empty body ~16ms after
         # the health check passes). Retry within a window; deterministic
         # config errors just re-raise after the deadline — still fail-fast
-        # relative to a training-time hang.
-        deadline = time.monotonic() + 60
+        # relative to a training-time hang. Each attempt is HARD-capped with
+        # asyncio.wait_for: without it, a connected-but-unresponsive frontend
+        # holds the probe for the full request_timeout_s (600s default,
+        # 1800s in the recommended config) and the deadline never fires.
+        window_s = float(self._dynamo_cfg().get("logprob_probe_timeout_s", 60))
+        deadline = time.monotonic() + window_s
+        last_error: Optional[BaseException] = None
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if isinstance(last_error, asyncio.TimeoutError):
+                    raise RuntimeError(
+                        f"logprob channel probe timed out after {window_s}s: the frontend accepted "
+                        "connections but never answered the probe request"
+                    ) from last_error
+                raise last_error if last_error is not None else RuntimeError("logprob probe never ran")
             try:
-                output = await self.generate(
-                    prompt_ids=self._fallback_token_ids(),
-                    sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
-                    request_id=probe_id,
-                    thunderagent_session_id=probe_id,
+                output = await asyncio.wait_for(
+                    self.generate(
+                        prompt_ids=self._fallback_token_ids(),
+                        sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
+                        request_id=probe_id,
+                        thunderagent_session_id=probe_id,
+                    ),
+                    timeout=max(1.0, min(15.0, remaining)),
                 )
                 break
-            except RuntimeError:
-                if time.monotonic() >= deadline:
-                    raise
-                await asyncio.sleep(2)
+            except (RuntimeError, asyncio.TimeoutError) as error:
+                last_error = error
+                await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
         if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
             raise RuntimeError(
                 f"logprob channel probe failed: got log_probs={output.log_probs!r} for "
