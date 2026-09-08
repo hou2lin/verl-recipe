@@ -21,6 +21,8 @@ replaces the generic server manager with a direct Dynamo server manager.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import uuid4
@@ -29,12 +31,14 @@ import ray
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager, AgentLoopWorker
 from verl.utils.ray_utils import auto_await
-from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerManager
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.utils import update_prometheus_config
 
 from .thunderagent import current_program
 from .thunderagent import program_scope as bind_program
+
+logger = logging.getLogger(__name__)
 
 
 class DynamoServerManager:
@@ -118,8 +122,71 @@ class DynamoServerManager:
         return output
 
 
+class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
+    """FullyAsyncLLMServerClient with ThunderAgent program affinity.
+
+    ThunderAgent pins all turns of one trajectory to one worker via the
+    ``thunderagent_session_id`` kwarg (the server turns it into an
+    X-Dynamo-Session-ID routing header). Callers with a stable per-trajectory
+    request_id — uni-agent uses its gateway session_id — get affinity with no
+    caller-side changes: when the kwarg is absent we key the program by
+    request_id.
+
+    Program lifecycle: the router's ProgramTable only frees an entry on an
+    explicit session-final request — there is NO passive expiry, so an
+    unfinalized program leaks router capacity for the whole training run and
+    eventually pauses admission. With ``auto_finalize`` (default) every
+    generate call finalizes its program on the way out: correct for
+    single-turn callers, at the cost of cross-turn affinity. Multi-turn
+    callers should set engine_kwargs.dynamo.thunderagent.auto_finalize=false
+    AND call :meth:`finalize_program` from their trajectory-end hook
+    (e.g. uni-agent gateway finalize/abort).
+    """
+
+    def __init__(
+        self,
+        config,
+        load_balancer_handle=None,
+        dynamo_server_handles=None,
+        auto_finalize=True,
+        **kwargs,
+    ):
+        super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
+        self._dynamo_server_handles = list(dynamo_server_handles or [])
+        self._auto_finalize = bool(auto_finalize)
+
+    async def generate(self, request_id, **kwargs):
+        session_id = kwargs.setdefault("thunderagent_session_id", str(request_id))
+        try:
+            return await super().generate(request_id, **kwargs)
+        finally:
+            if self._auto_finalize:
+                try:
+                    await self.finalize_program(session_id)
+                except Exception:
+                    logger.warning(
+                        "ThunderAgent finalize_program failed for session %s; "
+                        "the router entry leaks until shutdown",
+                        session_id,
+                        exc_info=True,
+                    )
+
+    async def finalize_program(self, session_id: str) -> None:
+        """Release the ThunderAgent program for one trajectory."""
+        await asyncio.gather(
+            *[handle.finalize_program.remote(session_id=str(session_id)) for handle in self._dynamo_server_handles]
+        )
+
+
 class DynamoLLMServerManager(LLMServerManager):
     """LLM server manager that launches Dynamo through its shared worker pool."""
+
+    def _thunderagent_config(self) -> dict:
+        dynamo_config = (self.rollout_config.engine_kwargs or {}).get("dynamo", {}) or {}
+        return dynamo_config.get("thunderagent", {}) or {}
+
+    def _thunderagent_enabled(self) -> bool:
+        return bool(self._thunderagent_config().get("enabled", False))
 
     async def _initialize_llm_servers(self, start_rank: int = 0):
         if self.worker_group is None:
@@ -152,14 +219,34 @@ class DynamoLLMServerManager(LLMServerManager):
         for colocate_async / separate_async): delegate to the base manager so
         the client gets the GlobalRequestLoadBalancer (degenerate single-server
         pass-through — Dynamo's KV router still does the real routing), the
-        abort/resume retry loop, and min/max_global_steps aggregation.
+        abort/resume retry loop, and min/max_global_steps aggregation. With
+        ThunderAgent enabled the client is upgraded to the affinity-aware
+        subclass (the server hard-requires a session id per request).
 
         Legacy V0 callers (ray_trainer / DynamoAgentLoopManager) pass no
         ``client_cls`` and keep the direct DynamoServerManager, which carries
-        the ThunderAgent program-affinity path.
+        the ThunderAgent program-affinity path via DynamoAgentLoopWorker.
         """
         if client_cls is not None:
+            if self._thunderagent_enabled() and issubclass(DynamoFullyAsyncLLMServerClient, client_cls):
+                return super().get_client(
+                    client_cls=DynamoFullyAsyncLLMServerClient,
+                    dynamo_server_handles=self.server_handles,
+                    auto_finalize=bool(self._thunderagent_config().get("auto_finalize", True)),
+                    **kwargs,
+                )
             return super().get_client(client_cls=client_cls, **kwargs)
+
+        if self._thunderagent_enabled() and bool(self.config.trainer.get("use_v1", False)):
+            # V1 sync mode reaches here (base get_client() passes no client_cls).
+            # Its AgentLoopWorkerTQ never establishes a ProgramScope, so the
+            # legacy DynamoServerManager below would fail on every generate.
+            raise ValueError(
+                "engine_kwargs.dynamo.thunderagent.enabled=true is only supported under V1 for "
+                "trainer_mode colocate_async/separate_async (their clients are upgraded to "
+                "DynamoFullyAsyncLLMServerClient). For trainer_mode=sync disable thunderagent, "
+                "or use the legacy path with trainer.use_v1=false."
+            )
 
         dynamo_config = (self.rollout_config.engine_kwargs or {}).get("dynamo", {}) or {}
         thunderagent_config = dynamo_config.get("thunderagent", {}) or {}
@@ -196,4 +283,10 @@ class DynamoAgentLoopManager(AgentLoopManager):
         await super()._init_agent_loop_workers()
 
 
-__all__ = ["DynamoAgentLoopManager", "DynamoAgentLoopWorker", "DynamoLLMServerManager", "DynamoServerManager"]
+__all__ = [
+    "DynamoAgentLoopManager",
+    "DynamoAgentLoopWorker",
+    "DynamoFullyAsyncLLMServerClient",
+    "DynamoLLMServerManager",
+    "DynamoServerManager",
+]

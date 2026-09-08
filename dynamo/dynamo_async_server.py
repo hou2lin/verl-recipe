@@ -1871,7 +1871,22 @@ class DynamoHttpServer:
         if tokenizer is None:
             raise RuntimeError("model_config.tokenizer is required for Dynamo frontend generation")
         self._log_engine_data_token_ids_status(choice, data)
+        finish_reason = choice.get("finish_reason")
+        is_aborted = finish_reason in ("abort", "cancelled")
+
+        def _aborted_empty():
+            # Aborted with no trustworthy partial data: return an empty output
+            # with stop_reason "aborted" so FullyAsyncLLMServerClient retries
+            # the same prompt after resume — never pad fallback tokens here.
+            return self._build_token_output(
+                token_ids=[],
+                log_probs=[] if include_log_probs else None,
+                stop_reason="aborted",
+                allow_empty=True,
+            )
+
         token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
+        used_text_fallback = token_ids is None
         if token_ids is None:
             if self._request_completion_token_ids():
                 # Token ids were explicitly requested and the frontend still returned
@@ -1894,19 +1909,37 @@ class DynamoHttpServer:
                 )
             token_ids = normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
         if not token_ids:
-            if choice.get("finish_reason") in ("abort", "cancelled"):
-                # Aborted before emitting anything: return an empty output with
-                # stop_reason "aborted" so FullyAsyncLLMServerClient retries the
-                # same prompt after resume — never pad fallback tokens here.
-                return self._build_token_output(
-                    token_ids=[],
-                    log_probs=[] if include_log_probs else None,
-                    stop_reason="aborted",
-                    allow_empty=True,
-                )
+            if is_aborted:
+                return _aborted_empty()
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
-        log_probs = self._extract_completion_log_probs(choice, len(token_ids), data) if include_log_probs else None
-        finish_reason = choice.get("finish_reason")
+
+        log_probs = None
+        if include_log_probs:
+            if used_text_fallback:
+                if is_aborted:
+                    return _aborted_empty()
+                # Re-encoded text token ids have no correspondence with the
+                # sampled tokens the frontend logprobs describe — aligning them
+                # would be silent data corruption. Point at the config instead.
+                raise RuntimeError(
+                    "calculate_log_probs=True requires a real token-id channel, but this response "
+                    "had no parseable token ids (text re-encode fallback). Enable "
+                    "engine_kwargs.dynamo.request_engine_data (or return_tokens_as_token_ids), "
+                    "or disable calculate_log_probs."
+                )
+            try:
+                # vLLM engine_data is exact -> strict; sglang is known to short
+                # one logprob (dynamo#11640 area) -> loud mean-pad until the
+                # patched channel is verified exact.
+                log_probs = self._extract_completion_log_probs(
+                    choice, len(token_ids), data, strict=not self._is_sglang()
+                )
+            except RuntimeError:
+                if is_aborted:
+                    # Partial data from an aborted request with inconsistent
+                    # logprobs is untrusted — drop it and let the client retry.
+                    return _aborted_empty()
+                raise
         if finish_reason == "stop" or finish_reason == "length":
             stop_reason = "completed"
         elif finish_reason in ("abort", "cancelled"):
@@ -1965,11 +1998,11 @@ class DynamoHttpServer:
             token_ids = token_ids or self._fallback_token_ids()
         else:
             token_ids = token_ids or []
-        if log_probs is not None:
-            if len(log_probs) < len(token_ids):
-                log_probs = log_probs + [0.0] * (len(token_ids) - len(log_probs))
-            elif len(log_probs) > len(token_ids):
-                log_probs = log_probs[: len(token_ids)]
+        if log_probs is not None and len(log_probs) != len(token_ids):
+            raise RuntimeError(
+                f"log_probs/token_ids length mismatch ({len(log_probs)} vs {len(token_ids)}); "
+                "refusing to pad/truncate (fake logprobs would corrupt training data)."
+            )
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
@@ -2157,6 +2190,7 @@ class DynamoHttpServer:
         choice: dict[str, Any],
         token_count: int,
         response: Optional[dict[str, Any]] = None,
+        strict: bool = True,
     ) -> Optional[list[float]]:
         """Extract selected-token logprobs from OpenAI completions response."""
         for nvext in ((response or {}).get("nvext"), choice.get("nvext")):
@@ -2167,7 +2201,16 @@ class DynamoHttpServer:
                 continue
             values = engine_data.get("completion_logprobs")
             if isinstance(values, list):
-                return DynamoHttpServer._normalize_log_probs(values, token_count)
+                return DynamoHttpServer._normalize_log_probs(values, token_count, strict=strict)
+            if isinstance(engine_data.get("completion_token_ids"), list):
+                # dynamo's handler omits completion_logprobs when its own
+                # token/logprob accounting misaligned (documented degradation).
+                # The frontend-aggregated token_logprobs come from a different
+                # accumulator — even a length match would be untrustworthy.
+                raise RuntimeError(
+                    "dynamo omitted engine_data.completion_logprobs (server-side token/logprob "
+                    "misalignment, see worker log); refusing cross-provenance frontend logprobs."
+                )
 
         logprobs = choice.get("logprobs")
         if not isinstance(logprobs, dict):
@@ -2177,7 +2220,7 @@ class DynamoHttpServer:
             values = logprobs.get("logprobs")
         if values is None:
             return None
-        return DynamoHttpServer._normalize_log_probs(values, token_count)
+        return DynamoHttpServer._normalize_log_probs(values, token_count, strict=strict)
 
     # Count of responses whose logprobs had to be padded. Class-level because
     # _normalize_log_probs is a staticmethod shared by every replica in the process.
@@ -2206,14 +2249,37 @@ class DynamoHttpServer:
         return sum(observed) / len(observed)
 
     @staticmethod
-    def _normalize_log_probs(values: list[Any], token_count: int) -> Optional[list[float]]:
-        """Pad/truncate selected-token logprobs to match token ids.
+    def _normalize_log_probs(values: list[Any], token_count: int, strict: bool = True) -> Optional[list[float]]:
+        """Validate (strict) or loudly pad (non-strict) selected-token logprobs.
 
-        Padding is LOUD and non-catastrophic. See _logprob_fill_value for why the pad
-        value is the sequence mean and not 0.0. The padding itself is a symptom: the
-        engine returns one fewer logprob than token ids, and the real
-        fix belongs on the dynamo side.
+        Per-engine policy:
+        - strict=True (vLLM): fail fast on length mismatch or None entries. A
+          padded value is a fake logprob that silently poisons
+          rollout_log_probs -- under rollout_correction bypass_mode it feeds
+          the policy-loss ratio directly. The vLLM engine_data channel is
+          exact, so any mismatch is a real defect upstream.
+        - strict=False (sglang): the engine is known to return one fewer
+          logprob than token ids (dynamo#11640 area); pad LOUDLY with the
+          sequence mean (see _logprob_fill_value for why not 0.0) and report.
+          Returns None when nothing usable was observed. Tighten to strict
+          once the sglang channel is verified exact under the patched image.
         """
+        if strict:
+            if len(values) != token_count:
+                raise RuntimeError(
+                    f"Dynamo returned {len(values)} logprobs for {token_count} tokens; "
+                    "refusing to pad/truncate (fake logprobs would corrupt training data)."
+                )
+            checked: list[float] = []
+            for index, value in enumerate(values):
+                if value is None:
+                    raise RuntimeError(
+                        f"Dynamo returned a None logprob at position {index}/{token_count}; "
+                        "refusing to substitute 0.0 (probability 1.0) for a real value."
+                    )
+                checked.append(float(value))
+            return checked
+
         raw = list(values[:token_count])
         observed = [float(v) for v in raw if v is not None]
         fill = DynamoHttpServer._logprob_fill_value(observed)
