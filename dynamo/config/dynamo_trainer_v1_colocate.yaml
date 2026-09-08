@@ -41,6 +41,13 @@ actor_rollout_ref:
     engine_kwargs:
       dynamo:
         thunderagent:
-          # ThunderAgent program affinity is not yet wired through the V1
-          # FullyAsyncLLMServerClient path (planned: Phase 2 / G10).
+          # Supported under V1 colocate_async/separate_async via
+          # DynamoFullyAsyncLLMServerClient (programs keyed by the caller's
+          # stable request_id). NOT supported under trainer_mode=sync.
+          # auto_finalize (default true) releases each program when its
+          # generate call returns — the router has no passive expiry, so this
+          # is required unless a multi-turn caller wires finalize_program
+          # into its trajectory-end hook and sets auto_finalize: false.
+          # Default off: single-turn TQ gains nothing from affinity.
           enabled: false
+          # auto_finalize: true
