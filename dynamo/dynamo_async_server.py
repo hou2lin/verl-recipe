@@ -2628,15 +2628,24 @@ class DynamoHttpServer:
         logger.info("[DynamoHttpServer] logprob channel probe OK")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # sglang: tokenizer_manager.abort_request(abort_all=True) — what her
-        # V0 non-naive weight sync needs. Left semantically untouched by the
-        # V1 merge; wiring the resume gate into this branch is part of the
-        # dedicated sglang-async work (needs its own design + validation).
+        # sglang: pause-equivalent semantics for V1 partial rollout, built
+        # from validated primitives — the engine-agnostic resume gate blocks
+        # new and client-retried generate() calls at the actor (they get
+        # aborted-empty, never park), and tokenizer_manager.abort_request
+        # (abort_all=True) clears the in-flight ones. Gate closes FIRST so
+        # nothing slips into the engine between abort and the weight sync.
+        # flush_cache stays after abort: sglang's flush no-ops while requests
+        # are running. resume_generation() reopens the gate (choreography
+        # step 8 in both the V0 and V1 weight-sync paths).
+        # (sglang's native pause_generation/continue_generation via typed
+        # call_tokenizer_manager transport is a possible later upgrade; the
+        # gate+abort combination avoids depending on untested typed routes.)
         if self._is_sglang():
+            self._generation_resumed.clear()
             await self._sglang_control_all("abort_request", rid="", abort_all=True)
             if reset_prefix_cache:
                 await self._sglang_control_all("flush_cache")
-            return {"aborted_count": -1, "request_ids": []}
+            return {"aborted_count": -1, "request_ids": [], "paused": True}
         """Abort all in-flight requests on this node's dynamo.vllm shards.
 
         Bridges vLLM AsyncLLM.pause_generation (vLLM >= 0.12) through each
