@@ -25,6 +25,7 @@ import yaml
 from recipe.dynamo import dynamo_async_server, dynamo_thunderagent, register
 from recipe.dynamo.dynamo_agent_loop import (
     DynamoAgentLoopWorker,
+    DynamoFullyAsyncLLMServerClient,
     DynamoLLMServerManager,
     DynamoServerManager,
 )
@@ -35,6 +36,7 @@ from recipe.dynamo.dynamo_thunderagent import (
 )
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 RECIPE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = RECIPE_ROOT.parent
@@ -228,18 +230,40 @@ async def test_agent_loop_worker_closes_scope_when_parent_fails(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_server_manager_returns_direct_thunderagent_client() -> None:
-    assert "_init_global_load_balancer" in DynamoLLMServerManager.__dict__
-    manager = object.__new__(DynamoLLMServerManager)
-    manager.server_addresses = ["frontend:8000"]
-    manager.server_handles = [_FakeServer()]
-    manager.rollout_config = SimpleNamespace(engine_kwargs={"dynamo": {"thunderagent": {"enabled": True}}})
+    # The V1 migration removed the recipe's no-op _init_global_load_balancer
+    # override: the BASE load balancer is required so client_cls callers get
+    # retry/version-aggregation semantics.
+    assert "_init_global_load_balancer" not in DynamoLLMServerManager.__dict__
 
-    await manager._init_global_load_balancer()
-    client = manager.get_client()
+    def make_manager(*, use_v1: bool, thunderagent: bool = True) -> DynamoLLMServerManager:
+        manager = object.__new__(DynamoLLMServerManager)
+        manager.server_addresses = ["frontend:8000"]
+        manager.server_handles = [_FakeServer()]
+        manager.global_load_balancer = object()
+        manager.rollout_config = SimpleNamespace(
+            engine_kwargs={"dynamo": {"thunderagent": {"enabled": thunderagent}}}
+        )
+        manager.config = SimpleNamespace(trainer={"use_v1": use_v1})
+        return manager
 
+    # Legacy V0 callers (no client_cls) keep the direct ThunderAgent manager.
+    client = make_manager(use_v1=False).get_client()
     assert isinstance(client, DynamoServerManager)
-    assert client.thunderagent_enabled is True
-    assert not hasattr(manager, "global_load_balancer")
+
+    # V1 async trainers pass client_cls and get the affinity-aware subclass
+    # wired with this pool's handles and auto-finalize.
+    v1_client = make_manager(use_v1=True).get_client(client_cls=FullyAsyncLLMServerClient)
+    assert isinstance(v1_client, DynamoFullyAsyncLLMServerClient)
+    assert v1_client._auto_finalize is True
+    assert len(v1_client._dynamo_server_handles) == 1
+
+    # Without thunderagent the requested class is honored unchanged.
+    plain = make_manager(use_v1=True, thunderagent=False).get_client(client_cls=FullyAsyncLLMServerClient)
+    assert type(plain) is FullyAsyncLLMServerClient
+
+    # V1 sync mode (no client_cls) has no ProgramScope provider: fail fast.
+    with pytest.raises(ValueError, match="only supported under V1"):
+        make_manager(use_v1=True).get_client()
 
 
 def test_thunderagent_command_derives_endpoint_model_and_block_size() -> None:
@@ -497,6 +521,7 @@ async def test_llm_server_manager_constructs_thunderagent_replica(monkeypatch) -
     monkeypatch.setattr(dynamo_async_server, "DynamoReplica", reject_base_replica)
     manager = object.__new__(DynamoLLMServerManager)
     manager.worker_group = "worker-group"
+    manager.start_rank = 0
     manager.rollout_config = SimpleNamespace(
         n_gpus_per_node=8,
         prometheus=SimpleNamespace(enable=False),
@@ -516,15 +541,78 @@ async def test_llm_server_manager_constructs_thunderagent_replica(monkeypatch) -
     ]
 
 
-def test_recipe_config_enables_thunderagent_agent_loop() -> None:
-    config = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_trainer.yaml").read_text())
-    rollout = config["actor_rollout_ref"]["rollout"]
+@pytest.mark.asyncio
+async def test_llm_server_manager_standalone_pool(monkeypatch) -> None:
+    calls = []
 
-    assert rollout["agent"]["agent_loop_manager_class"] == ("recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager")
-    assert rollout["engine_kwargs"]["dynamo"]["thunderagent"] == {
+    class FakeReplica:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs["replica_rank"]))
+            self._server_handle = object()
+            self._server_address = "frontend:8001"
+
+        async def init_standalone_pool(self):
+            calls.append(("standalone", None))
+
+        async def init_hybrid_worker_pool(self, worker_group):
+            raise AssertionError("standalone manager must not use the hybrid worker pool")
+
+    monkeypatch.setattr(dynamo_thunderagent, "DynamoThunderAgentReplica", FakeReplica)
+    manager = object.__new__(DynamoLLMServerManager)
+    manager.worker_group = None
+    manager.start_rank = 1  # offset past the hybrid pool (separate_async)
+    manager.rollout_config = SimpleNamespace(
+        n_gpus_per_node=1,
+        prometheus=SimpleNamespace(enable=False),
+        name="dynamo",
+    )
+    manager.model_config = SimpleNamespace(local_path="test-model")
+
+    await manager._initialize_llm_servers()
+
+    assert calls == [("init", 1), ("standalone", None)]
+    assert manager.server_addresses == ["frontend:8001"]
+
+
+def test_recipe_config_enables_thunderagent_agent_loop() -> None:
+    # ThunderAgent defaults live in the shared fragment (hydra.searchpath is
+    # only legal in PRIMARY configs, so the deltas were split out).
+    base = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_base.yaml").read_text())
+    assert base["actor_rollout_ref"]["rollout"]["engine_kwargs"]["dynamo"]["thunderagent"] == {
         "enabled": True,
         "router_block_size": 16,
     }
+
+    # The legacy entry keeps the V0 manager AND pins use_v1=false: the legacy
+    # manager violates the V1 TransferQueue contract.
+    legacy = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_trainer.yaml").read_text())
+    assert legacy["actor_rollout_ref"]["rollout"]["agent"]["agent_loop_manager_class"] == (
+        "recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager"
+    )
+    assert legacy["trainer"]["use_v1"] is False
+
+
+def test_v1_presets_compose_expectations() -> None:
+    colocate = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_trainer_v1_colocate.yaml").read_text())
+    assert colocate["trainer"]["use_v1"] is True
+    assert colocate["trainer"]["v1"]["trainer_mode"] == "colocate_async"
+    assert colocate["actor_rollout_ref"]["rollout"]["agent"]["agent_loop_manager_class"] is None
+    assert colocate["actor_rollout_ref"]["rollout"]["free_cache_engine"] is True
+    assert colocate["actor_rollout_ref"]["rollout"]["engine_kwargs"]["dynamo"]["thunderagent"]["enabled"] is False
+
+    separate = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_trainer_v1_separate.yaml").read_text())
+    assert separate["trainer"]["v1"]["trainer_mode"] == "separate_async"
+    assert separate["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] == "nccl"
+    assert separate["actor_rollout_ref"]["rollout"]["nnodes"] >= 1
+    assert separate["actor_rollout_ref"]["actor"]["fsdp_config"]["strategy"] == "fsdp2"
+
+    # Both V1 presets must be PRIMARY configs (own hydra.searchpath) and pull
+    # the shared fragment via defaults; the fragment must stay hydra-free.
+    for name in ("dynamo_trainer_v1_colocate.yaml", "dynamo_trainer_v1_separate.yaml", "dynamo_trainer.yaml"):
+        raw = yaml.safe_load((RECIPE_ROOT / "config" / name).read_text())
+        assert "searchpath" in raw.get("hydra", {}), name
+        assert "dynamo_base" in raw.get("defaults", []), name
+    assert "hydra" not in yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_base.yaml").read_text())
 
 
 def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
@@ -533,20 +621,222 @@ def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
     repository_readme = (REPOSITORY_ROOT / "README.md").read_text()
 
     assert "MODE=pinned_commit" in required_verl
+    # Pin carried forward from the sglang branch (V1 interfaces verified there).
     assert "COMMIT=6cbca9ce7208100d11b4d1b06eccf098cc9e76aa" in required_verl
+    assert "COMMIT=d82d2777" not in required_verl
     assert "59d614641837e593f0567b79d75394aae5f864e0" in readme
     assert "dynamo/REQUIRED_VERL.txt" in repository_readme
 
 
-def test_training_entrypoint_supports_pinned_and_current_verl_runner(monkeypatch) -> None:
+def _entrypoint_config(*, use_v1: bool, manager_class=None):
+    return SimpleNamespace(
+        trainer=SimpleNamespace(use_v1=use_v1),
+        actor_rollout_ref=SimpleNamespace(rollout={"agent": {"agent_loop_manager_class": manager_class}}),
+    )
+
+
+def test_training_entrypoint_dispatches_on_use_v1(monkeypatch) -> None:
     from recipe.dynamo import main_dynamo
+    from verl.trainer.main_ppo import TaskRunnerV1
+    from verl.trainer.main_ppo_v0 import TaskRunner as TaskRunnerV0
 
     calls = []
     monkeypatch.setattr(main_dynamo, "auto_set_device", lambda _config: None)
     monkeypatch.setattr(main_dynamo, "migrate_legacy_reward_impl", lambda config: config)
-    monkeypatch.setattr(main_dynamo, "run_ppo", lambda config, **kwargs: calls.append((config, kwargs)))
+    monkeypatch.setattr(main_dynamo, "validate_config", lambda **_kwargs: None)
+    monkeypatch.setattr(main_dynamo, "need_reference_policy", lambda _config: False)
+    monkeypatch.setattr(main_dynamo, "need_critic", lambda _config: False)
+    monkeypatch.setattr(main_dynamo, "run_ppo", lambda config, **kwargs: calls.append(kwargs))
 
-    main_dynamo.main.__wrapped__("config")
+    main_dynamo.main.__wrapped__(_entrypoint_config(use_v1=True))
+    main_dynamo.main.__wrapped__(_entrypoint_config(use_v1=False))
 
-    expected_kwargs = {} if main_dynamo.TaskRunner is None else {"task_runner_class": main_dynamo.TaskRunner}
-    assert calls == [("config", expected_kwargs)]
+    assert calls[0] == {"task_runner_class": TaskRunnerV1}
+    assert calls[1] == {"task_runner_class": TaskRunnerV0}
+
+
+def test_training_entrypoint_rejects_v1_with_legacy_manager(monkeypatch) -> None:
+    from recipe.dynamo import main_dynamo
+
+    monkeypatch.setattr(main_dynamo, "auto_set_device", lambda _config: None)
+    monkeypatch.setattr(main_dynamo, "migrate_legacy_reward_impl", lambda config: config)
+    monkeypatch.setattr(main_dynamo, "validate_config", lambda **_kwargs: None)
+    monkeypatch.setattr(main_dynamo, "need_reference_policy", lambda _config: False)
+    monkeypatch.setattr(main_dynamo, "need_critic", lambda _config: False)
+    monkeypatch.setattr(main_dynamo, "run_ppo", lambda config, **kwargs: None)
+
+    config = _entrypoint_config(
+        use_v1=True,
+        manager_class="recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager",
+    )
+    with pytest.raises(ValueError, match="does not write TransferQueue"):
+        main_dynamo.main.__wrapped__(config)
+
+
+# --------------------------------------------------------------------------- #
+# V1 migration behavior tests: generation gate, logprob strictness, finalize
+# recovery. CPU-only — servers/clients are constructed bare (object.__new__).
+# --------------------------------------------------------------------------- #
+
+
+def _make_bare_server() -> DynamoHttpServer:
+    server = object.__new__(DynamoHttpServer)
+    server.config = SimpleNamespace(engine_kwargs={})
+    server.model_config = SimpleNamespace(
+        local_path="/models/test-model",
+        tokenizer=SimpleNamespace(encode=lambda text, add_special_tokens=False: [0]),
+    )
+    server.global_steps = 7
+    server._generation_resumed = asyncio.Event()
+    server._generation_resumed.set()
+    server._control_endpoints = []
+    server._logged_engine_data_token_ids = False
+    server._logged_missing_engine_data = False
+    server.node_rank = 0
+    return server
+
+
+@pytest.mark.asyncio
+async def test_generation_gate_returns_untagged_aborted_empty() -> None:
+    server = _make_bare_server()
+
+    aborted = await server.abort_all_requests()
+    assert aborted["paused"] is False  # no sidecars in this bare setup
+    assert not server._generation_resumed.is_set()
+
+    out = await server.generate(prompt_ids=[1], sampling_params={"max_tokens": 4}, request_id="r1")
+    assert out.stop_reason == "aborted"
+    assert out.token_ids == []
+    # Empty attempts must NOT carry a version tag (trajectory-span metrics).
+    assert "global_steps" not in out.extra_fields
+
+    await server.resume_generation()
+    assert server._generation_resumed.is_set()
+
+
+def test_normalize_log_probs_rejects_mismatch_and_none() -> None:
+    with pytest.raises(RuntimeError, match="refusing to pad"):
+        DynamoHttpServer._normalize_log_probs([0.1], 2)
+    with pytest.raises(RuntimeError, match="None logprob"):
+        DynamoHttpServer._normalize_log_probs([0.1, None], 2)
+    assert DynamoHttpServer._normalize_log_probs([0.125, 0.25], 2) == [0.125, 0.25]
+
+
+def test_extract_log_probs_rejects_cross_provenance() -> None:
+    choice = {
+        "nvext": {"engine_data": {"completion_token_ids": [1, 2]}},
+        "logprobs": {"token_logprobs": [-0.1, -0.2]},
+    }
+    with pytest.raises(RuntimeError, match="cross-provenance"):
+        DynamoHttpServer._extract_completion_log_probs(choice, 2, {})
+
+
+def test_missing_logprob_source_raises_at_response_boundary() -> None:
+    server = _make_bare_server()
+    data = {"choices": [{"text": "hi", "finish_reason": "stop", "logprobs": {"token_ids": [1, 2]}}]}
+    with pytest.raises(RuntimeError, match="no logprob source"):
+        server._completion_response_to_token_output(data, include_log_probs=True)
+
+
+def test_aborted_responses_degrade_or_keep_partials() -> None:
+    server = _make_bare_server()
+
+    # cancelled (dynamo's normalization of vLLM "abort") + untrusted logprobs
+    # degrades to an aborted-empty retry instead of crashing the trajectory.
+    broken = {"choices": [{"text": "x", "finish_reason": "cancelled", "logprobs": {"token_ids": [1]}}]}
+    out = server._completion_response_to_token_output(broken, include_log_probs=True)
+    assert out.stop_reason == "aborted" and out.token_ids == []
+
+    # cancelled with a consistent logprob source keeps the partial tokens.
+    good = {
+        "choices": [
+            {
+                "text": "ab",
+                "finish_reason": "cancelled",
+                "logprobs": {"token_ids": [1, 2], "token_logprobs": [-0.1, -0.2]},
+            }
+        ]
+    }
+    out = server._completion_response_to_token_output(good, include_log_probs=True)
+    assert out.stop_reason == "aborted"
+    assert out.token_ids == [1, 2]
+    assert out.log_probs == [-0.1, -0.2]
+
+
+class _FakeLoadBalancer:
+    def __init__(self, server, fail_times: int = 0):
+        self._server = server
+        self.fail_times = fail_times
+        self.acquire_keys: list[str] = []
+        self.acquire_server = _RemoteMethod(self._acquire)
+        self.release_server = SimpleNamespace(remote=lambda **_kwargs: None)
+
+    def _acquire(self, request_id: str):
+        self.acquire_keys.append(request_id)
+        if self.fail_times > 0:
+            self.fail_times -= 1
+            raise RuntimeError("lb transient failure")
+        return ("srv0", self._server)
+
+
+class _FailingFinalizeServer(_FakeServer):
+    def _finalize_program(self, session_id: str) -> None:
+        raise RuntimeError("finalize transport down")
+
+
+def _make_fully_async_client(lb, handles, threshold: int = 50) -> DynamoFullyAsyncLLMServerClient:
+    return DynamoFullyAsyncLLMServerClient(
+        config=SimpleNamespace(actor_rollout_ref=SimpleNamespace(rollout=SimpleNamespace(name="dynamo"))),
+        load_balancer_handle=lb,
+        dynamo_server_handles=handles,
+        auto_finalize=True,
+        finalize_leak_threshold=threshold,
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_routes_by_request_id_not_session_id() -> None:
+    server = _FakeServer()
+    lb = _FakeLoadBalancer(server)
+    client = _make_fully_async_client(lb, [server])
+
+    await client.finalize_program("session-A", routing_key="request-B")
+
+    assert lb.acquire_keys == ["request-B"]  # sticky lookup uses the routing key
+    assert server.finalize_calls == ["session-A"]  # program key stays the session
+
+
+@pytest.mark.asyncio
+async def test_finalize_recovery_retries_then_succeeds() -> None:
+    server = _FakeServer()
+    lb = _FakeLoadBalancer(server, fail_times=2)
+    client = _make_fully_async_client(lb, [server])
+
+    await client._finalize_with_recovery("session-A", routing_key="session-A")
+
+    assert server.finalize_calls == ["session-A"]
+    assert client._consecutive_finalize_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_recovery_falls_back_to_broadcast() -> None:
+    server = _FakeServer()
+    lb = _FakeLoadBalancer(server, fail_times=99)
+    client = _make_fully_async_client(lb, [server])
+
+    await client._finalize_with_recovery("session-A", routing_key="session-A")
+
+    assert server.finalize_calls == ["session-A"]  # via static-handle broadcast
+    assert client._consecutive_finalize_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_finalize_leak_threshold_escalates() -> None:
+    failing = _FailingFinalizeServer()
+    lb = _FakeLoadBalancer(failing, fail_times=99)
+    client = _make_fully_async_client(lb, [failing], threshold=2)
+
+    await client._finalize_with_recovery("s1", routing_key="s1")  # 1st leak: warn only
+    assert client._consecutive_finalize_failures == 1
+    with pytest.raises(RuntimeError, match="consecutive ThunderAgent finalize failures"):
+        await client._finalize_with_recovery("s2", routing_key="s2")

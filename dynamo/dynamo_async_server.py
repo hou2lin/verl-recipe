@@ -1897,7 +1897,9 @@ class DynamoHttpServer:
                 allow_empty=True,
             )
 
-        token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
+        token_ids = self._extract_completion_token_ids(
+            choice, data, tokenizer, allow_text_mapping=not include_log_probs
+        )
         used_text_fallback = token_ids is None
         if token_ids is None:
             if self._request_completion_token_ids():
@@ -1946,6 +1948,19 @@ class DynamoHttpServer:
                 log_probs = self._extract_completion_log_probs(
                     choice, len(token_ids), data, strict=not self._is_sglang()
                 )
+                if log_probs is None:
+                    # No trustworthy logprob source at all (no engine_data
+                    # channel, no frontend token_logprobs, or — sglang
+                    # non-strict path — zero usable values after padding).
+                    # Deferring this produces log_probs=None TokenOutputs that
+                    # starve or crash the training consumer far from the root
+                    # cause.
+                    raise RuntimeError(
+                        "calculate_log_probs is enabled but the response carries no usable logprob "
+                        "source (neither nvext.engine_data.completion_logprobs nor "
+                        "choice.logprobs.token_logprobs yielded values). Enable "
+                        "engine_kwargs.dynamo.request_engine_data or fix the frontend config."
+                    )
             except RuntimeError:
                 if is_aborted:
                     # Partial data from an aborted request with inconsistent
@@ -2015,11 +2030,17 @@ class DynamoHttpServer:
                 f"log_probs/token_ids length mismatch ({len(log_probs)} vs {len(token_ids)}); "
                 "refusing to pad/truncate (fake logprobs would corrupt training data)."
             )
+        # Empty (aborted-before-first-token) outputs carry NO version tag:
+        # the client aggregates min/max_global_steps per attempt regardless of
+        # token count, so tagging a token-less attempt inflates trajectory
+        # version-span metrics. FullyAsyncLLMServerClient only registers
+        # non-None versions, so omitting the key skips the attempt cleanly.
+        extra_fields = {"global_steps": self.global_steps or 0} if token_ids else {}
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
-            extra_fields={"global_steps": self.global_steps or 0},
+            extra_fields=extra_fields,
         )
 
     def _fallback_token_ids(self) -> list[int]:
@@ -2074,8 +2095,15 @@ class DynamoHttpServer:
         choice: dict[str, Any],
         response: Optional[dict[str, Any]] = None,
         tokenizer: Optional[Any] = None,
+        allow_text_mapping: bool = True,
     ) -> Optional[list[int]]:
-        """Extract vLLM OpenAI extension token ids when available."""
+        """Extract vLLM OpenAI extension token ids when available.
+
+        ``allow_text_mapping=False`` disables the per-token text→id mapping
+        channel: it is CONTENT-dependent (tokens like "" don't round-trip),
+        so ids recovered through it cannot be trusted to align with logprobs.
+        The exact ``token_id:N`` string parse stays available either way.
+        """
         from verl.utils.tokenizer import normalize_token_ids
 
         candidates: list[Any] = [
@@ -2150,7 +2178,7 @@ class DynamoHttpServer:
             token_ids_from_strings = DynamoHttpServer._parse_token_id_strings(token_strings)
             if token_ids_from_strings is not None:
                 return token_ids_from_strings
-            if tokenizer is not None:
+            if tokenizer is not None and allow_text_mapping:
                 return DynamoHttpServer._encode_logprob_token_strings(token_strings, tokenizer)
         return None
 
@@ -2530,6 +2558,44 @@ class DynamoHttpServer:
                     "will silently use stale weights."
                 )
         logger.info("[DynamoHttpServer] sglang control plane OK on %s shard(s)", len(clients))
+
+    async def probe_logprob_channel(self):
+        """Startup probe: verify a trustworthy logprob source end-to-end.
+
+        With calculate_log_probs on, a missing token-id/logprob channel only
+        surfaces as per-request errors — the trainer then waits forever for
+        trajectories that never arrive (silent hang). One probe request at
+        launch turns that into an immediate, actionable startup failure.
+        """
+        probe_id = f"logprob-probe-{time.time_ns()}"
+        # Right after "workers registered" the frontend's model registration
+        # can still be propagating (observed: 404 with empty body ~16ms after
+        # the health check passes). Retry within a window; deterministic
+        # config errors just re-raise after the deadline — still fail-fast
+        # relative to a training-time hang.
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                output = await self.generate(
+                    prompt_ids=self._fallback_token_ids(),
+                    sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
+                    request_id=probe_id,
+                    thunderagent_session_id=probe_id,
+                )
+                break
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(2)
+        if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
+            raise RuntimeError(
+                f"logprob channel probe failed: got log_probs={output.log_probs!r} for "
+                f"{len(output.token_ids)} tokens"
+            )
+        finalize = getattr(self, "finalize_program", None)
+        if finalize is not None:
+            await finalize(probe_id)
+        logger.info("[DynamoHttpServer] logprob channel probe OK")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
         # sglang: tokenizer_manager.abort_request(abort_all=True) — what her
@@ -3225,6 +3291,8 @@ class DynamoReplica(RolloutReplica):
 
         await master.wait_frontend_ready.remote(expected_workers=expected_workers)
         await master._self_test_refit_path.remote()
+        if bool(getattr(self.config, "calculate_log_probs", False)):
+            await master.probe_logprob_channel.remote()
         self._server_handle = master
         self._server_address = f"[{fe_host}]:{fe_port}" if is_valid_ipv6_address(fe_host) else f"{fe_host}:{fe_port}"
         logger.info(
