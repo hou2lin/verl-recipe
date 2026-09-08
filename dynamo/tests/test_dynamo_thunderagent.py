@@ -1059,3 +1059,23 @@ async def test_sglang_abort_skips_flush_when_not_requested() -> None:
 
     assert calls == ["abort_request"]
     assert result["paused"] is True
+
+
+def test_v1_sglang_preset_hard_requirements() -> None:
+    # The sglang engine refuses to start without these three switches; the
+    # preset must carry them so users cannot hit the runtime rejections.
+    preset = yaml.safe_load((RECIPE_ROOT / "config" / "dynamo_trainer_v1_colocate_sglang.yaml").read_text())
+    assert preset["trainer"]["use_v1"] is True
+    assert preset["trainer"]["v1"]["trainer_mode"] == "colocate_async"
+    rollout = preset["actor_rollout_ref"]["rollout"]
+    assert rollout["enable_sleep_mode"] is True  # --enable-memory-saver
+    assert rollout["free_cache_engine"] is True
+    dynamo_kwargs = rollout["engine_kwargs"]["dynamo"]
+    assert dynamo_kwargs["engine"] == "sglang"
+    assert dynamo_kwargs["request_completion_token_ids"] is True
+    assert dynamo_kwargs["enable_worker_system_metrics"] is True
+    assert dynamo_kwargs["thunderagent"]["enabled"] is False
+    # Must be a PRIMARY config (own hydra.searchpath) pulling the shared fragment.
+    assert "searchpath" in preset.get("hydra", {})
+    raw_defaults = preset.get("defaults", [])
+    assert "dynamo_base" in raw_defaults
