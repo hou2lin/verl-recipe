@@ -114,9 +114,13 @@ class DynamoServerManager:
         """Match LLMServerClient.generate's min/max_global_steps contract.
 
         V1 sync-mode consumers read these keys unconditionally; leaving them
-        unset crashes trainer staleness accounting downstream.
+        unset crashes trainer staleness accounting downstream. Pass through
+        outputs without extra_fields untouched (duck-typed test doubles).
         """
-        global_steps = output.extra_fields.get("global_steps")
+        extra_fields = getattr(output, "extra_fields", None)
+        if extra_fields is None:
+            return output
+        global_steps = extra_fields.get("global_steps")
         output.extra_fields.setdefault("min_global_steps", global_steps)
         output.extra_fields.setdefault("max_global_steps", global_steps)
         return output
@@ -149,11 +153,14 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         load_balancer_handle=None,
         dynamo_server_handles=None,
         auto_finalize=True,
+        finalize_leak_threshold=50,
         **kwargs,
     ):
         super().__init__(config=config, load_balancer_handle=load_balancer_handle, **kwargs)
         self._dynamo_server_handles = list(dynamo_server_handles or [])
         self._auto_finalize = bool(auto_finalize)
+        self._finalize_leak_threshold = int(finalize_leak_threshold)
+        self._consecutive_finalize_failures = 0
 
     async def generate(self, request_id, **kwargs):
         session_id = kwargs.setdefault("thunderagent_session_id", str(request_id))
@@ -161,32 +168,27 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             return await super().generate(request_id, **kwargs)
         finally:
             if self._auto_finalize:
-                try:
-                    await self.finalize_program(session_id)
-                except Exception:
-                    logger.warning(
-                        "ThunderAgent finalize_program failed for session %s; "
-                        "the router entry leaks until shutdown",
-                        session_id,
-                        exc_info=True,
-                    )
+                # The LB sticky cache is keyed by the OUTER request_id (the
+                # routing key every generate attempt used), which may differ
+                # from an explicitly passed session_id — route the finalize
+                # with the same key the requests used.
+                await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 
-    async def finalize_program(self, session_id: str) -> None:
+    async def finalize_program(self, session_id: str, routing_key: str = None) -> None:
         """Release the ThunderAgent program for one trajectory.
 
         Routes the finalize to the frontend that actually served this session:
-        the load balancer's sticky cache maps the stable request_id to that
-        server (covers BOTH pools in separate_async, where the hybrid frontend
-        is registered into this manager's LB). Falls back to broadcasting to
-        this pool's static handles when no LB is wired. If the sticky entry
-        was evicted the finalize may land on the wrong frontend — a no-op
-        there — and the real program is then bounded by shutdown; with
-        auto_finalize the finalize follows its generate immediately, so
-        eviction in that window is not a practical concern.
+        the load balancer's sticky cache maps ``routing_key`` (the request_id
+        used for generation; defaults to ``session_id``, which is identical on
+        the uni-agent path) to that server — covering BOTH pools in
+        separate_async, where the hybrid frontend is registered into this
+        manager's LB. Falls back to broadcasting to this pool's static handles
+        when no LB is wired.
         """
         session_id = str(session_id)
+        key = str(routing_key) if routing_key is not None else session_id
         if self._load_balancer is not None:
-            server_id, handle = await self._load_balancer.acquire_server.remote(request_id=session_id)
+            server_id, handle = await self._load_balancer.acquire_server.remote(request_id=key)
             try:
                 await handle.finalize_program.remote(session_id=session_id)
             finally:
@@ -195,6 +197,50 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         await asyncio.gather(
             *[handle.finalize_program.remote(session_id=session_id) for handle in self._dynamo_server_handles]
         )
+
+    async def _finalize_with_recovery(self, session_id: str, routing_key: str) -> None:
+        """Bounded retry → static-handle broadcast → leak-threshold escalation.
+
+        The router has no passive program expiry, so a swallowed finalize
+        failure leaks capacity until admission pauses. A single failure must
+        not destroy an already-successful trajectory, but sustained failures
+        mean the run is drifting toward a hang — fail fast past the threshold
+        (engine_kwargs.dynamo.thunderagent.finalize_leak_threshold).
+        """
+        delay = 0.2
+        for attempt in range(3):
+            try:
+                await self.finalize_program(session_id, routing_key=routing_key)
+                self._consecutive_finalize_failures = 0
+                return
+            except Exception:
+                logger.warning(
+                    "finalize_program attempt %d/3 failed for session %s",
+                    attempt + 1,
+                    session_id,
+                    exc_info=(attempt == 2),
+                )
+                await asyncio.sleep(delay)
+                delay *= 2
+        try:
+            await asyncio.gather(
+                *[h.finalize_program.remote(session_id=str(session_id)) for h in self._dynamo_server_handles]
+            )
+            self._consecutive_finalize_failures = 0
+            return
+        except Exception:
+            logger.error(
+                "finalize_program broadcast fallback failed for session %s; router entry leaks",
+                session_id,
+                exc_info=True,
+            )
+        self._consecutive_finalize_failures += 1
+        if self._consecutive_finalize_failures >= self._finalize_leak_threshold:
+            raise RuntimeError(
+                f"{self._consecutive_finalize_failures} consecutive ThunderAgent finalize failures — "
+                "the router ProgramTable is leaking toward admission pause. Investigate frontend/"
+                "router health (threshold: engine_kwargs.dynamo.thunderagent.finalize_leak_threshold)."
+            )
 
 
 class DynamoLLMServerManager(LLMServerManager):
@@ -261,6 +307,7 @@ class DynamoLLMServerManager(LLMServerManager):
                     client_cls=DynamoFullyAsyncLLMServerClient,
                     dynamo_server_handles=self.server_handles,
                     auto_finalize=bool(self._thunderagent_config().get("auto_finalize", True)),
+                    finalize_leak_threshold=int(self._thunderagent_config().get("finalize_leak_threshold", 50)),
                     **kwargs,
                 )
             return super().get_client(client_cls=client_cls, **kwargs)
