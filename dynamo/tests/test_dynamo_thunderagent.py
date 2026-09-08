@@ -1007,3 +1007,55 @@ async def test_probe_deadline_caps_hung_requests() -> None:
     server.generate = hung_generate
     with pytest.raises(RuntimeError, match="probe timed out"):
         await server.probe_logprob_channel()
+
+
+@pytest.mark.asyncio
+async def test_sglang_abort_closes_gate_then_aborts_and_flushes() -> None:
+    # V1 partial rollout on sglang: pause-equivalent semantics = close the
+    # engine-agnostic gate FIRST (nothing slips in between abort and weight
+    # sync), then abort in-flight via tokenizer_manager, then flush the radix
+    # cache (sglang's flush no-ops while requests run, so order matters).
+    server = _make_bare_server()
+    server.config = SimpleNamespace(engine_kwargs={"dynamo": {"engine": "sglang"}})
+    calls = []
+
+    async def control_all(method, **kwargs):
+        # The gate must already be closed when the engine-side abort fires.
+        assert not server._generation_resumed.is_set()
+        calls.append(method)
+
+    server._sglang_control_all = control_all
+
+    result = await server.abort_all_requests()
+
+    assert result["paused"] is True
+    assert calls == ["abort_request", "flush_cache"]
+    assert not server._generation_resumed.is_set()
+
+    # Retried/new generate() calls answer aborted-empty at the actor without
+    # touching the frontend, and carry no version tag.
+    out = await server.generate(prompt_ids=[1], sampling_params={"max_tokens": 4}, request_id="r1")
+    assert out.stop_reason == "aborted" and out.token_ids == []
+    assert "global_steps" not in out.extra_fields
+
+    # resume_generation reopens the gate; no ZMQ sidecars on the sglang path.
+    server._control_endpoints = []
+    await server.resume_generation()
+    assert server._generation_resumed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_sglang_abort_skips_flush_when_not_requested() -> None:
+    server = _make_bare_server()
+    server.config = SimpleNamespace(engine_kwargs={"dynamo": {"engine": "sglang"}})
+    calls = []
+
+    async def control_all(method, **kwargs):
+        calls.append(method)
+
+    server._sglang_control_all = control_all
+
+    result = await server.abort_all_requests(reset_prefix_cache=False)
+
+    assert calls == ["abort_request"]
+    assert result["paused"] is True
