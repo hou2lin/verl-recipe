@@ -250,7 +250,33 @@ class DynamoSGLangControlClient:
         return await self.call_tokenizer_manager("flush_cache")
 
     async def abort_request(self, rid: str = "", abort_all: bool = False) -> dict:
+        """DO NOT use for abort-all: tokenizer_manager.abort_request is a SYNC
+        method returning None, and dynamo's call_tokenizer_manager handler
+        awaits the result unconditionally -> HTTP 500 "object NoneType can't
+        be used in 'await' expression" (observed on ai-dynamo 1.3.0.post1,
+        first sglang colocate_async run). Kept for per-rid aborts should a
+        future dynamo build stop awaiting sync results; the working abort-all
+        path is pause_generation(mode="abort") below.
+        """
         return await self.call_tokenizer_manager("abort_request", kwargs={"rid": rid, "abort_all": bool(abort_all)})
+
+    async def pause_generation(self, mode: str = "abort") -> dict:
+        """Abort in-flight requests and pause intake, via sglang's native
+        async tokenizer_manager.pause_generation — the same call verl's
+        native V1 sglang server uses for partial rollout. Being async, it
+        survives dynamo's unconditional-await passthrough.
+        """
+        return await self.call_tokenizer_manager(
+            "pause_generation",
+            args=[{"io_struct.PauseGenerationReqInput": {"mode": mode}}],
+        )
+
+    async def continue_generation(self) -> dict:
+        """Counterpart to pause_generation; reopens engine intake."""
+        return await self.call_tokenizer_manager(
+            "continue_generation",
+            args=[{"io_struct.ContinueGenerationReqInput": {}}],
+        )
 
     # ------------------------------------------------------------------ #
     # profiling

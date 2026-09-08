@@ -1029,7 +1029,9 @@ async def test_sglang_abort_closes_gate_then_aborts_and_flushes() -> None:
     result = await server.abort_all_requests()
 
     assert result["paused"] is True
-    assert calls == ["abort_request", "flush_cache"]
+    # pause_generation, NOT abort_request: sglang's abort_request is sync and
+    # dynamo's passthrough awaits results unconditionally (500 on NoneType).
+    assert calls == ["pause_generation", "flush_cache"]
     assert not server._generation_resumed.is_set()
 
     # Retried/new generate() calls answer aborted-empty at the actor without
@@ -1038,9 +1040,11 @@ async def test_sglang_abort_closes_gate_then_aborts_and_flushes() -> None:
     assert out.stop_reason == "aborted" and out.token_ids == []
     assert "global_steps" not in out.extra_fields
 
-    # resume_generation reopens the gate; no ZMQ sidecars on the sglang path.
+    # resume_generation reopens engine intake (continue_generation) and the
+    # gate; no ZMQ sidecars on the sglang path.
     server._control_endpoints = []
     await server.resume_generation()
+    assert calls == ["pause_generation", "flush_cache", "continue_generation"]
     assert server._generation_resumed.is_set()
 
 
@@ -1057,7 +1061,7 @@ async def test_sglang_abort_skips_flush_when_not_requested() -> None:
 
     result = await server.abort_all_requests(reset_prefix_cache=False)
 
-    assert calls == ["abort_request"]
+    assert calls == ["pause_generation"]
     assert result["paused"] is True
 
 

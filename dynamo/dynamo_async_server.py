@@ -2628,21 +2628,20 @@ class DynamoHttpServer:
         logger.info("[DynamoHttpServer] logprob channel probe OK")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # sglang: pause-equivalent semantics for V1 partial rollout, built
-        # from validated primitives — the engine-agnostic resume gate blocks
-        # new and client-retried generate() calls at the actor (they get
-        # aborted-empty, never park), and tokenizer_manager.abort_request
-        # (abort_all=True) clears the in-flight ones. Gate closes FIRST so
-        # nothing slips into the engine between abort and the weight sync.
-        # flush_cache stays after abort: sglang's flush no-ops while requests
-        # are running. resume_generation() reopens the gate (choreography
-        # step 8 in both the V0 and V1 weight-sync paths).
-        # (sglang's native pause_generation/continue_generation via typed
-        # call_tokenizer_manager transport is a possible later upgrade; the
-        # gate+abort combination avoids depending on untested typed routes.)
+        # sglang: native pause for V1 partial rollout. The engine-agnostic
+        # resume gate closes FIRST (new and client-retried generate() calls
+        # answer aborted-empty at the actor, never park), then sglang's
+        # async tokenizer_manager.pause_generation(mode="abort") clears the
+        # in-flight requests and pauses intake — the same call verl's native
+        # V1 sglang server uses. NOT abort_request: that one is a sync method
+        # returning None and dynamo's passthrough awaits results
+        # unconditionally (HTTP 500 "can't await NoneType", first
+        # colocate_async run). flush_cache stays after the pause: sglang's
+        # flush no-ops while requests are running. resume_generation()
+        # reopens intake + the gate (choreography step 8 in V0 and V1 alike).
         if self._is_sglang():
             self._generation_resumed.clear()
-            await self._sglang_control_all("abort_request", rid="", abort_all=True)
+            await self._sglang_control_all("pause_generation", mode="abort")
             if reset_prefix_cache:
                 await self._sglang_control_all("flush_cache")
             return {"aborted_count": -1, "request_ids": [], "paused": True}
@@ -2680,6 +2679,11 @@ class DynamoHttpServer:
 
     async def resume_generation(self):
         """Resume request intake after abort_all_requests."""
+        if self._is_sglang():
+            # Counterpart to pause_generation(mode="abort"): without it the
+            # engine stays paused and every post-sync generation queues
+            # forever behind a closed intake.
+            await self._sglang_control_all("continue_generation")
         if self._control_endpoints:
             await self._engine_method_all("resume_generation", timeout=120)
         self._generation_resumed.set()
