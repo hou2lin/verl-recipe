@@ -1079,3 +1079,20 @@ def test_v1_sglang_preset_hard_requirements() -> None:
     assert "searchpath" in preset.get("hydra", {})
     raw_defaults = preset.get("defaults", [])
     assert "dynamo_base" in raw_defaults
+
+
+def test_control_actor_naming_standalone_override() -> None:
+    # V1 separate_async: standalone CheckpointEngineWorkers resolve the
+    # control actor by the POOL's replica_rank (offset past the hybrid
+    # pool); hybrid keeps the shared_pool key. Both engine adapters delegate
+    # here (importing the sglang adapter would pull the sglang package, so
+    # the naming contract is tested at its single source of truth).
+    from recipe.dynamo.dynamo_naming import control_actor_name
+
+    engine_kwargs = {"dynamo": {"engine": "sglang"}}
+    assert control_actor_name(engine_kwargs, 1) == "dynamo_server_0_1"
+    assert control_actor_name(engine_kwargs, 1, replica_rank=3) == "dynamo_server_3_1"
+    # shared_pool key only applies when no explicit replica_rank is given
+    pooled = {"dynamo": {"shared_pool_replica_rank": 2}}
+    assert control_actor_name(pooled, 0) == "dynamo_server_2_0"
+    assert control_actor_name(pooled, 0, replica_rank=5) == "dynamo_server_5_0"
