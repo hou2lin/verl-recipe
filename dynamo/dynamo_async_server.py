@@ -918,6 +918,11 @@ class DynamoHttpServer:
             env.update(self._dynamo_env_vars())
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
             env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
+            # verl's base vLLMColocateWorkerExtension._get_zmq_handle consumes
+            # this natively (int(base) + dp-resolved local rank; dynamo shards
+            # run dp=1 so the resolver is the identity) — the recipe no longer
+            # overrides _get_zmq_handle.
+            env["VERL_ZMQ_BASE_TRAINER_RANK"] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
             # Match verl's native vLLM colocated path: both trainer-side
             # BucketedWeightSender and vLLM-side BucketedWeightReceiver include
