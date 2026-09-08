@@ -169,6 +169,40 @@ class DynamoHttpServer:
         # Set by ServerAdapter.update_weights to tag generations.
         self.global_steps: Optional[int] = None
 
+        # Partial-rollout gate: abort_all_requests() clears it and pauses the
+        # engines; resume_generation() resumes the engines and sets it.
+        # generate() waits on it so new / client-retried requests queue here
+        # instead of reaching a paused vLLM engine.
+        self._generation_resumed = asyncio.Event()
+        self._generation_resumed.set()
+
+        # Sleep/wake around training follows verl's rollout.free_cache_engine.
+        # An explicit engine_kwargs.dynamo.free_engine_on_train may only
+        # restate it — a contradiction between the two switches used to no-op
+        # silently (OOM in colocate training); now it fails at startup.
+        verl_free_cache_engine = bool(getattr(self.config, "free_cache_engine", False))
+        explicit_free_engine = self._dynamo_cfg().get("free_engine_on_train")
+        if (
+            explicit_free_engine is not None
+            and self._dynamo_cfg_bool("free_engine_on_train", verl_free_cache_engine) != verl_free_cache_engine
+        ):
+            raise ValueError(
+                f"engine_kwargs.dynamo.free_engine_on_train={explicit_free_engine!r} contradicts "
+                f"rollout.free_cache_engine={verl_free_cache_engine}. This switch now mirrors "
+                "rollout.free_cache_engine and is no longer independently tunable. To keep engines "
+                "resident during training (the old free_engine_on_train=false behavior), set "
+                "rollout.free_cache_engine=false as well."
+            )
+        if verl_free_cache_engine and not bool(getattr(self.config, "enable_sleep_mode", True)):
+            # vLLM sleep() silently no-ops without sleep mode — the trainer
+            # would believe memory was freed while nothing happened (OOM later).
+            raise ValueError(
+                "rollout.free_cache_engine=true requires rollout.enable_sleep_mode=true for the "
+                "dynamo backend: vLLM sleep() is a silent no-op without sleep mode, so training "
+                "would OOM with no error at the sleep site."
+            )
+        self._free_engine_on_train_flag = verl_free_cache_engine
+
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port: Optional[int] = None  # = frontend_port once ready
 
@@ -474,8 +508,13 @@ class DynamoHttpServer:
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _free_engine_on_train(self) -> bool:
-        """Opt-in sleep/wake of colocated vLLM workers around training."""
-        return self._dynamo_cfg_bool("free_engine_on_train", False)
+        """Sleep/wake of colocated vLLM workers around training.
+
+        Mirrors verl's rollout.free_cache_engine (validated in __init__), so
+        the trainer-side release/resume gating and the dynamo-side engine
+        sleep/wake can never silently diverge.
+        """
+        return self._free_engine_on_train_flag
 
     def _enable_rl_mode(self) -> bool:
         """Enable Dynamo's RL/TITO-friendly vLLM mode."""
@@ -1475,17 +1514,35 @@ class DynamoHttpServer:
         image_data=None,
         video_data=None,
         priority: int = 0,
+        audio_data=None,
+        mm_processor_kwargs=None,
+        **kwargs,
     ):
         """Dispatch generation through the Dynamo frontend HTTP router.
 
         the actor manages the
         subprocess stack, while token generation goes through the OpenAI-style
         frontend so Dynamo can route across registered workers.
+
+        Remaining kwargs from verl clients (e.g. priority scheduling hints)
+        are accepted and ignored; Dynamo's KV router owns request scheduling.
+        Multimodal inputs are rejected loudly — silently dropping them would
+        train on text-only prompts while reporting success.
         """
-        if image_data is not None or video_data is not None:
+        if image_data is not None or video_data is not None or audio_data is not None or mm_processor_kwargs:
             return self._build_token_output(
                 stop_reason="error: Dynamo frontend generate does not support multimodal inputs",
             )
+
+        # Partial rollout: while the engines are paused (abort_all_requests),
+        # answer immediately with an empty aborted output instead of parking
+        # the coroutine. FullyAsyncLLMServerClient polls with a 1s retry loop,
+        # so parked coroutines would only pin this actor's max_concurrency
+        # slots — with every in-flight trajectory parked, the control calls
+        # that eventually open the gate (resume_generation) could never be
+        # scheduled, deadlocking the first on_step_end.
+        if not self._generation_resumed.is_set():
+            return self._build_token_output(token_ids=[], stop_reason="aborted", allow_empty=True)
 
         if self._use_direct_generate():
             return await self._generate_direct(prompt_ids, sampling_params, request_id)
@@ -1514,6 +1571,19 @@ class DynamoHttpServer:
                 )
             return self._completion_response_to_token_output(json.loads(body_text), include_log_probs=include_log_probs)
         except Exception:
+            if not self._generation_resumed.is_set():
+                # The engines are paused (abort_all_requests): an in-flight
+                # request whose frontend response errored out was almost
+                # certainly killed by the pause. Report it as aborted-empty so
+                # FullyAsyncLLMServerClient retries after resume instead of
+                # failing the trajectory. (A clean abort response still
+                # returns partial tokens via finish_reason="abort".)
+                logger.warning(
+                    "[generate] frontend dispatch failed while engines are paused; "
+                    "treating as aborted (request_id=%s)",
+                    request_id,
+                )
+                return self._build_token_output(token_ids=[], stop_reason="aborted", allow_empty=True)
             logger.exception("[generate] frontend dispatch failed (request_id=%s)", request_id)
             raise
 
@@ -1709,10 +1779,17 @@ class DynamoHttpServer:
             if not token_ids:
                 raise RuntimeError(f"direct_generate @ {endpoint} returned no tokens: {result}")
             log_probs = result.get("log_probs") if include_log_probs else None
+            direct_finish_reason = result.get("finish_reason")
+            if direct_finish_reason in ("abort", "cancelled"):
+                direct_stop_reason = "aborted"
+            elif direct_finish_reason:
+                direct_stop_reason = "completed"
+            else:
+                direct_stop_reason = None
             return self._build_token_output(
                 token_ids=token_ids,
                 log_probs=log_probs,
-                stop_reason="completed" if result.get("finish_reason") else None,
+                stop_reason=direct_stop_reason,
             )
         except Exception:
             logger.exception("[generate] direct sidecar request failed (request_id=%s)", request_id)
@@ -1817,12 +1894,27 @@ class DynamoHttpServer:
                 )
             token_ids = normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
         if not token_ids:
+            if choice.get("finish_reason") in ("abort", "cancelled"):
+                # Aborted before emitting anything: return an empty output with
+                # stop_reason "aborted" so FullyAsyncLLMServerClient retries the
+                # same prompt after resume — never pad fallback tokens here.
+                return self._build_token_output(
+                    token_ids=[],
+                    log_probs=[] if include_log_probs else None,
+                    stop_reason="aborted",
+                    allow_empty=True,
+                )
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
         log_probs = self._extract_completion_log_probs(choice, len(token_ids), data) if include_log_probs else None
         finish_reason = choice.get("finish_reason")
         if finish_reason == "stop" or finish_reason == "length":
             stop_reason = "completed"
-        elif finish_reason == "abort":
+        elif finish_reason in ("abort", "cancelled"):
+            # ai-dynamo's handlers normalize vLLM's "abort" to "cancelled"
+            # (dynamo.common.utils.engine_response.normalize_finish_reason)
+            # before the Rust frontend serializes the response — treat both
+            # as aborted so partial-rollout resume triggers instead of a
+            # truncated trajectory silently entering training as completed.
             stop_reason = "aborted"
         else:
             stop_reason = finish_reason
@@ -1864,11 +1956,15 @@ class DynamoHttpServer:
         token_ids: Optional[list[int]] = None,
         log_probs: Optional[list[float]] = None,
         stop_reason: Optional[str] = None,
+        allow_empty: bool = False,
     ):
         """Build a verl TokenOutput while preserving AgentLoop shape invariants."""
         from verl.workers.rollout.replica import TokenOutput
 
-        token_ids = token_ids or self._fallback_token_ids()
+        if not allow_empty:
+            token_ids = token_ids or self._fallback_token_ids()
+        else:
+            token_ids = token_ids or []
         if log_probs is not None:
             if len(log_probs) < len(token_ids):
                 log_probs = log_probs + [0.0] * (len(token_ids) - len(log_probs))
@@ -2247,8 +2343,9 @@ class DynamoHttpServer:
             logger.info("[DynamoHttpServer] wake_up: no control sidecar, skipping")
             return
         # bridge to engine.wake_up via control sidecar (engine method,
-        # not collective_rpc — handled in sidecar).
-        await self._engine_method_all("wake_up", kwargs=kwargs)
+        # not collective_rpc — handled in sidecar). Weight/KV re-onlining can
+        # exceed the default 120s on large models.
+        await self._engine_method_all("wake_up", kwargs=kwargs, timeout=600)
 
     async def sleep(self, **kwargs):
         # NB: no node_rank guard — each per-node server sleeps its OWN local
@@ -2279,7 +2376,7 @@ class DynamoHttpServer:
         # v1 can't refit weights, so use sleep level 1 (offload weights to CPU +
         # drop KV); wake_up restores weights from CPU — no refit needed.
         kwargs.setdefault("level", 1)
-        await self._engine_method_all("sleep", kwargs=kwargs)
+        await self._engine_method_all("sleep", kwargs=kwargs, timeout=600)
 
     async def clear_kv_cache(self):
         if self._is_sglang():
@@ -2362,18 +2459,53 @@ class DynamoHttpServer:
         logger.info("[DynamoHttpServer] sglang control plane OK on %s shard(s)", len(clients))
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # dynamo doesn't expose a global abort; v1 returns no-op result so
-        # RolloutReplica.abort_all_requests's gather doesn't blow up.
-        # sglang does: tokenizer_manager.abort_request(abort_all=True), which is
-        # what partial rollout needs before a non-naive weight sync.
+        # sglang: tokenizer_manager.abort_request(abort_all=True) — what her
+        # V0 non-naive weight sync needs. Left semantically untouched by the
+        # V1 merge; wiring the resume gate into this branch is part of the
+        # dedicated sglang-async work (needs its own design + validation).
         if self._is_sglang():
             await self._sglang_control_all("abort_request", rid="", abort_all=True)
             if reset_prefix_cache:
                 await self._sglang_control_all("flush_cache")
             return {"aborted_count": -1, "request_ids": []}
-        return {"aborted_count": 0, "request_ids": []}
+        """Abort all in-flight requests on this node's dynamo.vllm shards.
+
+        Bridges vLLM AsyncLLM.pause_generation (vLLM >= 0.12) through each
+        shard's control sidecar: aborts in-flight requests (the frontend
+        returns their partial tokens with finish_reason "abort"), drains,
+        optionally clears caches, and leaves the engines paused. New and
+        client-retried generate() calls block on the resume gate until
+        resume_generation().
+        """
+        if self._use_direct_generate():
+            # The debug direct-generate path holds the sidecar's single
+            # in-flight REP slot for the whole generation, so the pause
+            # request would queue behind every running generation and time
+            # out. Incompatible with abort semantics — fail fast.
+            raise RuntimeError(
+                "engine_kwargs.dynamo.direct_generate=true is incompatible with abort_all_requests "
+                "(V1 async trainers pause engines every step); disable direct_generate."
+            )
+        self._generation_resumed.clear()
+        if not self._control_endpoints:
+            logger.info("[DynamoHttpServer] abort_all_requests: no control sidecar, skipping")
+            return {"aborted_count": 0, "request_ids": [], "paused": False}
+        # Pause failures must raise: sleeping (weight-offloading) an engine
+        # that still has active requests is undefined behavior.
+        await self._engine_method_all(
+            "pause_generation",
+            kwargs={"wait_for_inflight_requests": False, "clear_cache": reset_prefix_cache},
+            timeout=600,
+        )
+        logger.info("[DynamoHttpServer] abort_all_requests: engines paused (node=%s)", self.node_rank)
+        return {"aborted_count": None, "request_ids": [], "paused": True}
 
     async def resume_generation(self):
+        """Resume request intake after abort_all_requests."""
+        if self._control_endpoints:
+            await self._engine_method_all("resume_generation", timeout=120)
+        self._generation_resumed.set()
+        logger.info("[DynamoHttpServer] resume_generation: gate open (node=%s)", self.node_rank)
         return None
 
     async def start_profile(self, **kwargs):
@@ -2386,10 +2518,15 @@ class DynamoHttpServer:
             await self._sglang_control_all("stop_profile")
         return None
 
-    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None):
+    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None, timeout: float = 600):
         """Like collective_rpc but invokes a top-level AsyncLLM method
-        (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
-        not a worker-extension RPC. Distinguished by message kind.
+        (wake_up / sleep / pause_generation / resume_generation /
+        reset_prefix_cache / wait_for_requests_to_drain), not a
+        worker-extension RPC. Distinguished by message kind.
+
+        Raises RuntimeError when any shard reports failure — a silently
+        skipped sleep/pause leaves the engine in a state the trainer no
+        longer agrees with (e.g. sleeping an engine with active requests).
 
         v4a-6 (Iter 7.5): same parallel-dispatch fix as collective_rpc.
         Sequential iter deadlocked update_weights_from_ipc and now also
@@ -2407,6 +2544,7 @@ class DynamoHttpServer:
             "kind": "engine_method",
             "method": method,
             "kwargs": kwargs or {},
+            "timeout": timeout,
         }
 
         async def _call_one(idx: int, ep: str) -> None:
@@ -2415,14 +2553,11 @@ class DynamoHttpServer:
             try:
                 sock.connect(ep)
                 await sock.send(pickle.dumps(req))
-                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=600)
+                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=timeout)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
-                    logger.warning(
-                        "[DynamoHttpServer] engine_method %s failed @ %s: %s",
-                        method,
-                        ep,
-                        reply.get("error"),
+                    raise RuntimeError(
+                        f"engine_method {method} failed @ {ep}: {reply.get('error')}"
                     )
             finally:
                 sock.close()
@@ -2689,6 +2824,17 @@ class DynamoReplica(RolloutReplica):
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
+
+    async def sleep(self):
+        """Drain in-flight requests before the weight-offloading sleep.
+
+        Mirrors vLLMReplica.sleep: the base class would sleep immediately,
+        which is undefined behavior when requests are still active (e.g. the
+        colocated-reward-model validation path sleeps without an abort).
+        Unlike vLLM, dynamo servers are per-node — drain every one of them.
+        """
+        await asyncio.gather(*[server.wait_for_requests_to_drain.remote() for server in self.servers])
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
     async def init_hybrid_worker_pool(self, worker_group):
         """Initialize Dynamo as worker pool for all rollout GPUs.
