@@ -129,6 +129,12 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         # "Invalid device_uuid=..." — killing the scheduler process.
         self._node_rank_global = global_rank // self._local_world_size
 
+        # Standalone CheckpointEngineWorkers (V1 separate_async) pass an
+        # explicit POOL-level replica_rank; hybrid workers leave the default
+        # -1. sglang needs no ZMQ socket rebuild (weights travel over the
+        # HTTP control route), only the control-actor naming below.
+        self._dynamo_standalone = kwargs.get("replica_rank", -1) >= 0
+
         self._shard_tp_group = None
         self._shard_tp_src_global_rank: Optional[int] = None
         self._control_client: Optional[DynamoSGLangControlClient] = None
@@ -148,8 +154,14 @@ class SGLangServerAdapter(_SGLangServerAdapter):
 
     def _get_control_actor_name(self) -> str:
         """Shared per-node Dynamo actor; the name format lives in ``dynamo_naming``."""
-        # _node_rank_global, not self.node_rank — see __init__.
-        return control_actor_name(self.config.engine_kwargs, self._node_rank_global)
+        # _node_rank_global, not self.node_rank — see __init__. Standalone
+        # pools name their servers by THIS pool's replica_rank (offset past
+        # the hybrid pool), mirroring VllmDynamoServerAdapter.
+        return control_actor_name(
+            self.config.engine_kwargs,
+            self._node_rank_global,
+            replica_rank=self.replica_rank if self._dynamo_standalone else None,
+        )
 
     def _build_shard_tp_group(self):
         """Create the contiguous TP-sized process group this rank belongs to.
