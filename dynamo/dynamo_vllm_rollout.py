@@ -54,6 +54,31 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
         self._dynamo_node_rank = rank // local_world_size
         self._dynamo_node_local_rank = rank % local_world_size
+        # Standalone CheckpointEngineWorkers pass an explicit POOL-level
+        # replica_rank (hybrid engine workers leave the default -1). The base
+        # class then skips its per-logical-replica derivation, so the ZMQ
+        # pairing socket must be rebuilt on the shared contract both sides
+        # use: replica component = pool offset + pool-local logical replica
+        # index (matches the engine-side VERL_REPLICA_RANK injected in
+        # _launch_shared_worker_pool), rank component = the base formula
+        # (within-replica rank modulo node size, matching the engine-side
+        # VERL_DYNAMO_RANK_OFFSET + tp-local rank).
+        self._dynamo_standalone = kwargs.get("replica_rank", -1) >= 0
+        if self._dynamo_standalone:
+            rollout_world_size = (
+                self.config.tensor_model_parallel_size
+                * self.config.data_parallel_size
+                * self.config.pipeline_model_parallel_size
+            )
+            self._dynamo_pool_offset = self.replica_rank
+            logical_replica_rank = rank // rollout_world_size
+            self._dynamo_global_replica_rank = self._dynamo_pool_offset + logical_replica_rank
+            within_replica_local_rank = (rank % rollout_world_size) % local_world_size
+            job_id = ray.get_runtime_context().get_job_id()
+            self.zmq_handle = (
+                f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self._dynamo_global_replica_rank}"
+                f"-rank-{within_replica_local_rank}.sock"
+            )
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
@@ -64,6 +89,7 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             self.config.engine_kwargs,
             self._dynamo_node_rank,
             prefix=self._get_server_name_prefix(),
+            replica_rank=self.replica_rank if self._dynamo_standalone else None,
         )
 
     def _is_node_control_rank(self) -> bool:
@@ -111,7 +137,13 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
         return future if non_block else await future
 
     @torch.no_grad()
-    async def update_weights(self, weights, global_steps=None, **kwargs):
+    async def update_weights(self, weights, global_steps=None, wire_format: str = "named_tensors", **kwargs):
+        # Consumed here (checkpoint-engine workers pass it unconditionally);
+        # never forward it into the update_weights_from_ipc RPC kwargs — the
+        # engine extension's signature would reject it.
+        assert wire_format == "named_tensors", (
+            f"dynamo vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        )
         import asyncio
         import time as _time
 

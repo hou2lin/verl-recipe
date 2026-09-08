@@ -28,6 +28,7 @@ def control_actor_name(
     *,
     prefix: str = DEFAULT_SERVER_NAME_PREFIX,
     name_suffix: str = "",
+    replica_rank: Optional[int] = None,
 ) -> str:
     """Name of the per-node Dynamo server actor that owns the control plane.
 
@@ -45,6 +46,12 @@ def control_actor_name(
             adapters rely on that, and a non-empty value would otherwise make them
             miss the actor entirely.
     """
+    if replica_rank is not None:
+        # Standalone pools (V1 separate_async) name their servers by THIS
+        # pool's replica_rank (offset past the hybrid pool by
+        # LLMServerManager.start_rank); the shared_pool key only describes
+        # hybrid colocated pools.
+        return f"{prefix}server_{int(replica_rank)}_{node_rank}{name_suffix}"
     dynamo_cfg = (engine_kwargs or {}).get("dynamo", {}) or {}
     shared_replica_rank = int(dynamo_cfg.get("shared_pool_replica_rank", 0))
     return f"{prefix}server_{shared_replica_rank}_{node_rank}{name_suffix}"

@@ -188,9 +188,9 @@ class DynamoLLMServerManager(LLMServerManager):
     def _thunderagent_enabled(self) -> bool:
         return bool(self._thunderagent_config().get("enabled", False))
 
-    async def _initialize_llm_servers(self, start_rank: int = 0):
-        if self.worker_group is None:
-            raise ValueError("Dynamo rollout requires hybrid mode with an actor rollout worker group")
+    async def _initialize_llm_servers(self, start_rank: int = None):
+        if start_rank is None:
+            start_rank = self.start_rank
 
         from recipe.dynamo.dynamo_thunderagent import DynamoThunderAgentReplica
 
@@ -200,7 +200,13 @@ class DynamoLLMServerManager(LLMServerManager):
             model_config=self.model_config,
             gpus_per_node=self.rollout_config.n_gpus_per_node,
         )
-        await replica.init_hybrid_worker_pool(self.worker_group)
+        if self.worker_group is None:
+            # separate_async standalone pool: own resource pool + one
+            # CheckpointEngineWorker per rollout GPU (nccl first hop),
+            # dynamo stack launched on the pool nodes.
+            await replica.init_standalone_pool()
+        else:
+            await replica.init_hybrid_worker_pool(self.worker_group)
 
         self.rollout_replicas = [replica]
         self.server_handles = [replica._server_handle]
@@ -229,6 +235,18 @@ class DynamoLLMServerManager(LLMServerManager):
         """
         if client_cls is not None:
             if self._thunderagent_enabled() and issubclass(DynamoFullyAsyncLLMServerClient, client_cls):
+                trainer_mode = str(self.config.trainer.get("v1", {}).get("trainer_mode", ""))
+                if trainer_mode == "separate_async":
+                    # separate_async registers the hybrid pool's frontend in
+                    # this manager's load balancer too, but finalize_program
+                    # would only reach THIS pool's servers — programs routed
+                    # to the hybrid frontend would leak until admission pauses.
+                    # Fail fast until dual-pool finalize is wired.
+                    raise ValueError(
+                        "engine_kwargs.dynamo.thunderagent.enabled=true is not yet supported with "
+                        "trainer_mode=separate_async (programs routed to the hybrid-pool frontend "
+                        "are never finalized). Disable thunderagent for separate_async."
+                    )
                 return super().get_client(
                     client_cls=DynamoFullyAsyncLLMServerClient,
                     dynamo_server_handles=self.server_handles,

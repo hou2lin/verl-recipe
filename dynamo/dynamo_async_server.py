@@ -1282,6 +1282,13 @@ class DynamoHttpServer:
             return
         env = os.environ.copy()
         env.update(self._dynamo_env_vars())
+        # In RL mode the frontend binds an extra "RL worker discovery" listener
+        # on DYN_RL_PORT (default 8001, dynamo service_v2.rs). With two pools
+        # on one node (separate_async: hybrid on trainer GPUs + standalone on
+        # rollout GPUs) the fixed default collides and the second frontend
+        # exits rc=1 — allocate a free port per pool.
+        if "DYN_RL_PORT" not in env:
+            env["DYN_RL_PORT"] = str(self._allocate_tcp_port(bind_wildcard=True))
 
         cmd = [
             sys.executable,
@@ -2456,37 +2463,32 @@ class DynamoHttpServer:
         self.global_steps = global_steps
 
     async def release_kv_cache(self):
-        """Release only kv_cache GPU memory, keeping model weights intact.
+        """Pre-weight-sync hook, per engine.
 
-        Called by CheckpointEngineManager before backends like NCCL or NIXL
-        rebuild process groups. Dynamo's per-node sidecars route this through
-        the standard reset_prefix_cache path; the engine keeps weights
-        resident (sleep_level=1 from DynamoRollout) so the trainer can write
-        through to live tensors.
+        vLLM: parity no-op — the KV cache contents were already invalidated by
+        abort_all_requests (pause_generation with clear_cache=True) one step
+        earlier in the CheckpointEngineManager choreography, and the KV pool
+        GPU memory stays resident, same as upstream vLLM's stub (TODO
+        upstream: true KV release).
 
-        SGLang is the exception: it releases KV memory *for real* via
-        release_memory_occupation(tags=["kv_cache"]), so resume_kv_cache() below
-        has actual work to do on that path.
+        SGLang releases KV memory *for real* via
+        release_memory_occupation(tags=["kv_cache"]), so resume_kv_cache()
+        below has actual work to do on that path.
         """
         if self._is_sglang():
             await self.sglang_release(["kv_cache"])
-            return
-        if not self._control_endpoints:
-            return
-        await self._engine_method_all("reset_prefix_cache")
+        return None
 
     async def resume_kv_cache(self):
-        """Restore kv_cache GPU memory after a weight sync.
+        """Post-weight-sync counterpart to release_kv_cache.
 
-        Counterpart to release_kv_cache(). On the vLLM path Dynamo never truly
-        releases KV memory (sleep_level=1 keeps weights resident; reset_prefix_cache
-        only drops the cache contents), so there is nothing to resume. SGLang does
-        really release it, and also unregisters the worker from discovery, so the
-        resume is what puts the shard back into the routing pool.
+        vLLM: parity stub. SGLang really released the memory and also
+        unregistered the worker from discovery, so the resume is what puts
+        the shard back into the routing pool.
         """
         if self._is_sglang():
             await self.sglang_resume(["kv_cache"])
-        return
+        return None
 
     async def wait_for_requests_to_drain(self):
         if not self._control_endpoints:
@@ -3034,6 +3036,51 @@ class DynamoReplica(RolloutReplica):
             actors.append(actor)
         return actors
 
+    async def init_standalone_pool(self):
+        """Standalone shared worker pool over rollout.nnodes × n_gpus_per_node.
+
+        Mirrors verl's RolloutReplica.init_standalone but at POOL granularity:
+        one resource pool + one CheckpointEngineWorker per rollout GPU (they
+        receive weights over the checkpoint-engine first hop and forward them
+        node-locally via CUDA-IPC), then the same shared master/slave dynamo
+        stack as hybrid — one etcd/nats/frontend for the whole pool.
+        """
+        from verl.single_controller.ray import RayWorkerGroup, ResourcePoolManager
+        from verl.utils.device import get_device_name
+
+        self.rollout_mode = RolloutMode.STANDALONE
+        pool_nnodes = self.config.nnodes
+        pool_gpus_per_node = self.config.n_gpus_per_node
+        assert pool_nnodes > 0 and pool_gpus_per_node > 0, (
+            "standalone dynamo pool requires rollout.nnodes > 0 and rollout.n_gpus_per_node > 0"
+        )
+
+        resource_pool_name = f"dynamo_rollout_pool_{self.replica_rank}{self.name_suffix}"
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec={resource_pool_name: [pool_gpus_per_node] * pool_nnodes},
+            mapping=None,
+            max_colocate_count=2,
+        )
+        resource_pool_manager.create_resource_pool()
+        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+
+        worker_group = RayWorkerGroup(
+            resource_pool=self.resource_pool,
+            ray_cls_with_init=self.get_ray_class_with_init_args(),
+            bin_pack=False,
+            name_prefix=f"dynamo_rollout_standalone_{self.replica_rank}{self.name_suffix}",
+            use_gpu=True,
+            device_name=get_device_name(),
+        )
+        self.workers = worker_group.workers
+
+        assert len(self.workers) % self.world_size == 0, (
+            f"standalone pool size {len(self.workers)} must be divisible by "
+            f"dynamo logical replica world_size {self.world_size}"
+        )
+        num_logical_replicas = len(self.workers) // self.world_size
+        await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
+
     async def _launch_shared_worker_pool(self, num_logical_replicas: int):
         """Launch a single frontend backed by all logical replica workers."""
         from verl.utils.device import get_resource_name
@@ -3090,12 +3137,20 @@ class DynamoReplica(RolloutReplica):
                 )
                 for shard_idx in range(len(gpu_ids) // tp):
                     shard_gpus = gpu_ids[shard_idx * tp : (shard_idx + 1) * tp]
+                    # POOL-global replica id (self.replica_rank carries the
+                    # LLMServerManager start_rank offset): the engine-side ZMQ
+                    # socket is named replica-{VERL_REPLICA_RANK}-rank-{...}
+                    # and must (a) match the CE-sender side, which derives the
+                    # same pool-global id, and (b) never collide with the other
+                    # pool's engines when hybrid + standalone share a node in
+                    # separate_async.
+                    global_replica_rank = self.replica_rank + logical_replica_rank
                     node_to_specs[node_id].append(
                         {
-                            "replica_rank": logical_replica_rank,
+                            "replica_rank": global_replica_rank,
                             "cuda_visible_devices": ",".join(shard_gpus),
                             "rank_offset": shard_idx * tp,
-                            "label": f"replica{logical_replica_rank}_shard{shard_idx}",
+                            "label": f"replica{global_replica_rank}_shard{shard_idx}",
                         }
                     )
 
@@ -3176,12 +3231,12 @@ class DynamoReplica(RolloutReplica):
         )
 
     async def launch_servers(self):
-        """Dynamo uses a NeMo-style worker-pool entrypoint instead."""
+        """Dynamo uses NeMo-style worker-pool entrypoints instead."""
         raise RuntimeError(
             "DynamoReplica.launch_servers() is disabled because the dynamo "
             "backend uses a single shared worker pool. Call "
-            "DynamoReplica.init_hybrid_worker_pool(worker_group) via "
-            "AgentLoopManager instead."
+            "DynamoReplica.init_hybrid_worker_pool(worker_group) or "
+            "init_standalone_pool() via DynamoLLMServerManager instead."
         )
 
 
