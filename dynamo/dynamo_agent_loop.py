@@ -172,9 +172,28 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                     )
 
     async def finalize_program(self, session_id: str) -> None:
-        """Release the ThunderAgent program for one trajectory."""
+        """Release the ThunderAgent program for one trajectory.
+
+        Routes the finalize to the frontend that actually served this session:
+        the load balancer's sticky cache maps the stable request_id to that
+        server (covers BOTH pools in separate_async, where the hybrid frontend
+        is registered into this manager's LB). Falls back to broadcasting to
+        this pool's static handles when no LB is wired. If the sticky entry
+        was evicted the finalize may land on the wrong frontend — a no-op
+        there — and the real program is then bounded by shutdown; with
+        auto_finalize the finalize follows its generate immediately, so
+        eviction in that window is not a practical concern.
+        """
+        session_id = str(session_id)
+        if self._load_balancer is not None:
+            server_id, handle = await self._load_balancer.acquire_server.remote(request_id=session_id)
+            try:
+                await handle.finalize_program.remote(session_id=session_id)
+            finally:
+                self._load_balancer.release_server.remote(server_id=server_id)
+            return
         await asyncio.gather(
-            *[handle.finalize_program.remote(session_id=str(session_id)) for handle in self._dynamo_server_handles]
+            *[handle.finalize_program.remote(session_id=session_id) for handle in self._dynamo_server_handles]
         )
 
 
@@ -235,18 +254,9 @@ class DynamoLLMServerManager(LLMServerManager):
         """
         if client_cls is not None:
             if self._thunderagent_enabled() and issubclass(DynamoFullyAsyncLLMServerClient, client_cls):
-                trainer_mode = str(self.config.trainer.get("v1", {}).get("trainer_mode", ""))
-                if trainer_mode == "separate_async":
-                    # separate_async registers the hybrid pool's frontend in
-                    # this manager's load balancer too, but finalize_program
-                    # would only reach THIS pool's servers — programs routed
-                    # to the hybrid frontend would leak until admission pauses.
-                    # Fail fast until dual-pool finalize is wired.
-                    raise ValueError(
-                        "engine_kwargs.dynamo.thunderagent.enabled=true is not yet supported with "
-                        "trainer_mode=separate_async (programs routed to the hybrid-pool frontend "
-                        "are never finalized). Disable thunderagent for separate_async."
-                    )
+                # separate_async is covered too: finalize_program routes via
+                # the LB sticky cache, reaching whichever pool's frontend
+                # served the session (hybrid or standalone).
                 return super().get_client(
                     client_cls=DynamoFullyAsyncLLMServerClient,
                     dynamo_server_handles=self.server_handles,
