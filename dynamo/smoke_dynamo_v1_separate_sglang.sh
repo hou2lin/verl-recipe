@@ -37,7 +37,7 @@ python3 -m recipe.dynamo.main_dynamo \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_completion_token_ids=true \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.enable_worker_system_metrics=true \
-    actor_rollout_ref.rollout.enable_sleep_mode=true \
+    "+actor_rollout_ref.rollout.enable_sleep_mode=true" \
     algorithm.adv_estimator=grpo \
     algorithm.rollout_correction.bypass_mode=true \
     data.train_files="${TRAIN_FILE}" \
