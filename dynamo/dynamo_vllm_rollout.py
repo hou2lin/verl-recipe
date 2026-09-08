@@ -30,15 +30,14 @@ from typing import Any, Optional
 
 import ray
 import torch
+from recipe.dynamo.dynamo_naming import control_actor_name
 
 from verl.workers.rollout.vllm_rollout.vllm_rollout import (
     ServerAdapter as _VllmServerAdapter,
 )
 
-from recipe.dynamo.dynamo_naming import control_actor_name
-
-
 logger = logging.getLogger(__name__)
+
 
 class VllmDynamoServerAdapter(_VllmServerAdapter):
     """Per-rank dynamo client for the vLLM engine.
@@ -169,8 +168,10 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             non_block=True,
             kwargs={**kwargs, "use_shm": self.use_shm},
         )
-        logger.debug(f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
-            f"future={'present' if future is not None else 'None (non-rank-0)'}")
+        logger.debug(
+            f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
+            f"future={'present' if future is not None else 'None (non-rank-0)'}"
+        )
 
         # Build sender (every rank has its own zmq_handle to its paired
         # engine worker; receiver setup on engine side is triggered by
@@ -214,8 +215,10 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
                     return_when=asyncio.ALL_COMPLETED,
                 )
                 if more_pending:
-                    logger.warning(f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
-                        f"after 600s +{_time.time() - t_enter:.2f}s")
+                    logger.warning(
+                        f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
+                        f"after 600s +{_time.time() - t_enter:.2f}s"
+                    )
                     for p in more_pending:
                         p.cancel()
                     raise RuntimeError("dynamo-vllm weight sync hung: tasks still pending after 660s total")

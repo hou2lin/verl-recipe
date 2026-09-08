@@ -270,9 +270,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         session_id = str(session_id)
         served = self._session_servers.get(session_id)
         if served:
-            await asyncio.gather(
-                *[self._finalize_on_handle(handle, session_id) for handle in dict(served).values()]
-            )
+            await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in dict(served).values()])
             self._drop_session(session_id)
             return
         if routing_key is None:
@@ -286,9 +284,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 self._load_balancer.release_server.remote(server_id=server_id)
             self._drop_session(session_id)
             return
-        await asyncio.gather(
-            *[self._finalize_on_handle(handle, session_id) for handle in self._dynamo_server_handles]
-        )
+        await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in self._dynamo_server_handles])
         self._drop_session(session_id)
 
     def _raise_if_leak_threshold(self) -> None:
@@ -329,7 +325,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
 
         results = await asyncio.gather(*[finalize_one(sid, handle) for sid, handle in served.items()])
         self._drop_session(session_id)
-        unconfirmed = [sid for sid, confirmed in zip(served.keys(), results) if not confirmed]
+        unconfirmed = [sid for sid, confirmed in zip(served.keys(), results, strict=True) if not confirmed]
         if not unconfirmed:
             return
         logger.error(
@@ -386,10 +382,9 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 session_id,
             )
         except Exception:
-            logger.error(
+            logger.exception(
                 "finalize_program broadcast fallback failed for session %s; router entry leaks",
                 session_id,
-                exc_info=True,
             )
         self._drop_session(str(session_id))
         self._unresolved_finalize_leaks += 1
