@@ -8,7 +8,13 @@ set -xeuo pipefail
 #               + frontend and serves one completion. Proves M1.
 #   STAGE=train 2-step GRPO — additionally exercises the weight-sync path
 #               (control/update_weights_from_tensor) and sleep/wake via
-#               release/resume_memory_occupation. Proves M2.
+#               release/resume_memory_occupation. Proves M2. Fails unless the
+#               rollout-vs-actor logprob agreement (pearson) reaches MIN_PEARSON.
+#
+# Env: MODEL_PATH / TRAIN_FILE / TEST_FILE / RAY_DATA_HOME; NNODES / NGPUS_PER_NODE / TP
+#      (NGPUS_PER_NODE=2 TP=1 puts two shards behind one frontend, so the KV router
+#      and session affinity actually have something to route); DYNAMO_SRC (Dynamo
+#      source overlay, see below); MIN_PEARSON (default 0.99); SMOKE_LOG.
 #
 # Prerequisite the script checks for you: `python -m dynamo.sglang` must be
 # importable. Install it per-job from the local wheel (see below) — no dynamo
@@ -28,6 +34,26 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-0.5B-Instruct"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+MIN_PEARSON=${MIN_PEARSON:-0.99}
+SMOKE_LOG=${SMOKE_LOG:-"${TMPDIR:-/tmp}/smoke_dynamo_sglang_${STAGE}_$$.log"}
+
+# --- Dynamo source overlay --------------------------------------------------
+# The prebuilt wheel (ai_dynamo 1.3.0 @ 94accc7389) predates upstream #11640: its
+# common/backend/logprobs.py slices sglang's per-chunk logprobs as if they were
+# cumulative, so every chunk after the first carries none and the recipe fills
+# them in ("[logprobs] engine returned N/M usable logprobs" in the log). The run
+# still exits 0 with a full metric set; only rollout_actor_probs_pearson_corr
+# (0.07-0.15 instead of >0.999) gives it away -- which is why STAGE=train now
+# gates on it. Point DYNAMO_SRC at a checkout carrying the fix and it is put in
+# front of the wheel, the same way train_qwen3_30b_sglang.sh does.
+DYNAMO_SRC=${DYNAMO_SRC:-}
+if [[ -n "${DYNAMO_SRC}" ]]; then
+    [[ -d "${DYNAMO_SRC}/components/src/dynamo" ]] || {
+        echo "FAIL: DYNAMO_SRC=${DYNAMO_SRC} has no components/src/dynamo" >&2
+        exit 1
+    }
+    export PYTHONPATH="${DYNAMO_SRC}/components/src${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 # --- preflight -------------------------------------------------------------
 # NB: install from the LOCAL wheel, not PyPI — ai_dynamo==1.3.0 is not published
@@ -57,6 +83,8 @@ Do not pre-install it into the container image.
 MSG
     exit 1
 }
+# Say which logprobs.py this run is about to trust (wheel vs. overlay).
+python3 -c 'import dynamo.common.backend.logprobs as m; print("dynamo.common.backend.logprobs:", m.__file__)'
 
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 
@@ -104,16 +132,13 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True
     actor_rollout_ref.rollout.name=dynamo
     actor_rollout_ref.rollout.mode=async
-    actor_rollout_ref.rollout.calculate_log_probs=False
+    actor_rollout_ref.rollout.calculate_log_probs=True
     actor_rollout_ref.rollout.tensor_model_parallel_size="${TP}"
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5
     actor_rollout_ref.rollout.max_model_len=$((max_prompt_length + max_response_length))
     actor_rollout_ref.rollout.n=1
     actor_rollout_ref.rollout.enforce_eager=True
     actor_rollout_ref.rollout.multi_turn.enable=False
-    # verl chunks the batch across agent-loop workers and asserts an equal split
-    # ("only support equal chunk. Got size of DataProto 1 and chunk 8"). The default
-    # is 8 workers, which cannot divide a smoke-sized batch of 1.
     actor_rollout_ref.rollout.agent.num_workers=1
     # '++' not '+': config/dynamo_trainer.yaml already defines this key, so a
     # bare '+' (append) errors with "An item is already at ...".
@@ -121,7 +146,8 @@ COMMON_ARGS=(
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_engine_data=true
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_completion_token_ids=true
-    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=round-robin
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=kv
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_session_affinity_ttl_secs=600
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=false
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.enable_worker_system_metrics=true
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_timeout_s=1800
@@ -148,8 +174,6 @@ if [[ "${STAGE}" == "gen" ]]; then
         "$@"
     echo "PASS: Dynamo x SGLang generation smoke completed"
 else
-    # free_cache_engine drives release/resume_memory_occupation, which is the
-    # only part of the sleep/wake path that a generation-only run never touches.
     python3 -m verl.trainer.main_ppo \
         --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
         trainer.use_v1=False \
@@ -159,6 +183,20 @@ else
         ++actor_rollout_ref.rollout.engine_kwargs.dynamo.sglang.verify_weight_sync=true \
         trainer.val_before_train=False \
         trainer.total_training_steps=2 \
-        "$@"
-    echo "PASS: Dynamo x SGLang 2-step training smoke completed"
+        "$@" 2>&1 | tee "${SMOKE_LOG}"
+    # Exit code alone is not enough: both logprob incidents exited 0. Gate on the
+    # last reported rollout-vs-actor pearson (native sglang and a correct dynamo
+    # stack both give >0.999; the broken wheel gives ~0.1).
+    pearson=$(grep -a -o "training/rollout_actor_probs_pearson_corr:[0-9.eE+-]*" "${SMOKE_LOG}" | tail -1 | cut -d: -f2 || true)
+    if [[ -z "${pearson}" ]]; then
+        echo "FAIL: no training/rollout_actor_probs_pearson_corr in ${SMOKE_LOG} (calculate_log_probs must stay on)" >&2
+        exit 1
+    fi
+    if ! awk -v p="${pearson}" -v m="${MIN_PEARSON}" 'BEGIN { exit !(p + 0 >= m + 0) }'; then
+        echo "FAIL: rollout/actor logprob pearson=${pearson} < MIN_PEARSON=${MIN_PEARSON}." >&2
+        echo "      The rollout logprobs do not match the trainer's. Known cause: dynamo wheel without" >&2
+        echo "      upstream #11640 (set DYNAMO_SRC to a fixed checkout). Log: ${SMOKE_LOG}" >&2
+        exit 1
+    fi
+    echo "PASS: Dynamo x SGLang 2-step training smoke completed (pearson=${pearson} >= ${MIN_PEARSON})"
 fi

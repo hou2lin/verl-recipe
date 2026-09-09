@@ -21,6 +21,7 @@ its engine entrypoint at import time. These tests run in the vLLM container too.
 import asyncio
 import base64
 import importlib.metadata
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -102,7 +103,6 @@ def test_sglang_cmd_core_mapping():
         "--enable-prefix-caching",
         "--enable-sleep-mode",
         "--worker-extension-cls",
-        "--kv-events-config",
     ):
         assert vllm_flag not in cmd, f"{vllm_flag} leaked into the sglang command line"
     assert cmd[cmd.index("--tp-size") + 1] == "4"
@@ -139,6 +139,67 @@ def test_page_size_falls_back_to_thunderagent_block_size():
     # explicit sglang.page_size wins
     cmd = _cmd({"sglang": {"page_size": 16}, "thunderagent": {"router_block_size": 32}})
     assert cmd[cmd.index("--page-size") + 1] == "16"
+
+
+def test_attention_backend_defaults_to_flashinfer():
+    """Mirror verl's native sglang server: SGLang's Hopper default (fa3) decodes ~8%
+    slower per step with the router page size, and fa3 + cuda graph is broken on
+    sglang>=0.5.12. Explicit config or an extra_args flag must still win."""
+    cmd = _cmd()
+    assert cmd[cmd.index("--attention-backend") + 1] == "flashinfer"
+    cmd = _cmd({"sglang": {"attention_backend": "fa3"}})
+    assert cmd[cmd.index("--attention-backend") + 1] == "fa3"
+    cmd = _cmd({"sglang": {"extra_args": ["--attention-backend", "triton"]}})
+    assert cmd.count("--attention-backend") == 1
+    assert cmd[cmd.index("--attention-backend") + 1] == "triton"
+
+
+def test_sglang_cmd_publishes_kv_events_like_vllm():
+    """KV events feed the KV router's index. dynamo.sglang derives use_kv_events from
+    --kv-events-config alone (dynamo/sglang/args.py), so without the flag the router
+    only ever sees predict-on-route entries (100-step 30B run before 2026-09-09:
+    router-estimated prefix hit 0.865 vs engine-measured 0.627)."""
+    server = _make_server({"engine": "sglang"})
+    assert server._kv_events_enabled() is True
+    assert _make_server({"engine": "sglang", "enable_kv_events": False})._kv_events_enabled() is False
+    js = DynamoHttpServer._build_kv_events_config_json(5557)
+    # the JSON dynamo's own sglang docs use (docs/integrations/flexkv-integration.md)
+    assert json.loads(js) == {
+        "publisher": "zmq",
+        "topic": "kv-events",
+        "endpoint": "tcp://*:5557",
+        "enable_kv_cache_events": True,
+    }
+    cmd = server._build_sglang_cmd("test-model", 1, kv_events_config_json=js)
+    assert cmd[cmd.index("--kv-events-config") + 1] == js
+    # no config -> no flag (the worker then registers use_kv_events=False)
+    assert "--kv-events-config" not in server._build_sglang_cmd("test-model", 1)
+
+
+def _router_args(dynamo_cfg: dict, mode: str) -> list[str]:
+    server = _make_server(dynamo_cfg)
+    server._router_mode = mode
+    return server._frontend_router_args()
+
+
+def test_session_affinity_flag_off_by_default_and_in_every_router_mode():
+    for mode in ("kv", "round-robin"):
+        assert "--router-session-affinity-ttl-secs" not in _router_args({"engine": "sglang"}, mode)
+        args = _router_args({"engine": "sglang", "router_session_affinity_ttl_secs": 600}, mode)
+        assert args[args.index("--router-session-affinity-ttl-secs") + 1] == "600"
+    for off in (None, 0, "None", "null", ""):
+        cfg = {"engine": "sglang", "router_session_affinity_ttl_secs": off}
+        assert "--router-session-affinity-ttl-secs" not in _router_args(cfg, "kv")
+    with pytest.raises(ValueError):
+        _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": "soon"})._session_affinity_ttl_secs()
+    with pytest.raises(ValueError):
+        _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": 31_536_001})._session_affinity_ttl_secs()
+
+
+def test_session_header_only_when_affinity_configured():
+    assert _make_server({"engine": "sglang"})._frontend_headers("traj-1") == {"X-Request-Id": "traj-1"}
+    on = _make_server({"engine": "sglang", "router_session_affinity_ttl_secs": 600})._frontend_headers("traj-1")
+    assert on == {"X-Request-Id": "traj-1", "x-dynamo-session-id": "traj-1"}
 
 
 def test_extra_args_forwarded():
@@ -488,6 +549,42 @@ def test_missing_token_ids_is_loud_not_silent(caplog):
     assert "request_completion_token_ids" in caplog.text, (
         "the log must name the flag that fixes it, not merely report the symptom"
     )
+
+
+def _completion_response(token_ids, usage_tokens, finish_reason="stop"):
+    return {
+        "choices": [{"text": "4", "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 30, "completion_tokens": usage_tokens},
+        "nvext": {"completion_token_ids": list(token_ids)},
+    }
+
+
+def _token_output_server():
+    server = _make_server({"engine": "sglang", "request_completion_token_ids": True})
+    server.model_config.tokenizer = SimpleNamespace(eos_token_id=151645, pad_token_id=151643)
+    # instance state that __init__ normally sets and the response path reads
+    server._logged_engine_data_token_ids = False
+    server._logged_missing_engine_data = False
+    server.global_steps = 0
+    return server
+
+
+def test_token_count_mismatch_is_loud():
+    """Guard for ai-dynamo/dynamo#14302 (dynamo>=1.4.1 strips the stop token from
+    completion_token_ids while usage still counts it). Off by one here means the
+    trainer never sees EOS and nothing else in the metrics says so."""
+    server = _token_output_server()
+    out = server._completion_response_to_token_output(_completion_response([19, 151645], 2))
+    assert list(out.token_ids) == [19, 151645]
+    with pytest.raises(RuntimeError, match="14302"):
+        server._completion_response_to_token_output(_completion_response([19], 2))
+    # aborted responses are legitimately partial -- no guard
+    out = server._completion_response_to_token_output(_completion_response([19], 2, finish_reason="abort"))
+    assert list(out.token_ids) == [19]
+    # no usage in the response -> nothing to compare against
+    resp = _completion_response([19], 2)
+    del resp["usage"]
+    assert list(server._completion_response_to_token_output(resp).token_ids) == [19]
 
 
 def test_fallback_keeps_logging_on_a_long_run(caplog):

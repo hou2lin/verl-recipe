@@ -1,6 +1,5 @@
 #!/bin/bash
-# Qwen3-30B retool RL through Dynamo + SGLang on 4 nodes.
-#SBATCH --job-name=verl-dyn-sglang-i100
+#SBATCH --job-name=verl-dynamo-sglang
 #SBATCH --account=CHANGE_ME
 #SBATCH --partition=batch
 #SBATCH --nodes=4
@@ -10,72 +9,65 @@
 #SBATCH --cpus-per-task=112
 #SBATCH --mem=1800G
 #SBATCH --time=04:00:00
-#SBATCH --output=/workspace/verl/slurm/logs/train_30b_rl_dynamo_sglang_%j.log
+#SBATCH --output=train_30b_rl_dynamo_sglang_%j.log
 #
-# Qwen3-30B retool RL through Dynamo + SGLang — 4x8 H100.
+# Qwen3-30B-A3B-Base retool RL through Dynamo + SGLang, 4 x 8 H100. The vLLM
+# equivalent is train_30b_rl_dynamo_kv_metrics.sh; everything that is not
+# engine-specific is kept identical between the two.
 #
-# Env knobs (defaults = the verified 100-step run, job 17562481, pearson 0.9994):
-#   TOTAL_STEPS=100            training steps
-#   ENFORCE_EAGER=False        False = CUDA graph on (sglang: ~8x faster generation than eager)
-#   DISABLE_PIECEWISE=0        1 adds --disable-piecewise-cuda-graph
-#   STREAM_INTERVAL=           empty = engine default (only a workaround before the logprob patch)
-#   VERL_DEFER_OPTIMIZER_LOAD=0  1 = Adam on CPU through fwd/bwd (needed on 2x8, not on 4x8)
-#   USE_FUSED_KERNELS=0 FUSED_KERNELS_BACKEND=torch EAGER_EXPERTS=0 PPO_MAX_TOKEN_LEN=18432
-#   ULYSSES_SP / ROLLOUT_TP / RESUME_MODE / RESET_CHECKPOINT / CONTAINER / WANDB_KEY_FILE
-#   e.g. sbatch --export=ALL,TOTAL_STEPS=3 train_qwen3_30b_sglang.sh
+#   export WORKSPACE=/path/to/workspace
+#   sbatch -A <account> -p <partition> --export=ALL recipe/dynamo/train_qwen3_30b_sglang.sh
 #
-# Derived from the proven Dynamo+vLLM run (now train_30b_rl_dynamo_kv_metrics.sh). Everything that is not engine-specific is kept byte-identical to that
-# script: SBATCH block, Ray bring-up, sandbox-fusion, datasets, and every
-# trainer/actor hyper-parameter. The deltas below are the ones the engine swap
-# actually forces, each with the reason it cannot be avoided.
+# Account, partition and the cpu/mem request above are site-specific. WORKSPACE is
+# the host directory bind-mounted at /workspace and must provide:
+#   images/verl_sgl0512.dev4.sqsh   built from verlai/verl:sgl0512.dev4 (or set CONTAINER)
+#   verl_dynamo/verl                this verl checkout (holds recipe/dynamo)
+#   dynamo                          Dynamo source, used as a components/src overlay
+#   dynamo_wheels_1.3.0_<sha>/      ai_dynamo + runtime wheels (or set DYNAMO_WHEELHOUSE)
+#   hf_models/Qwen3-30B-A3B-Base    policy checkpoint
+#   dynamorl_workspace/datasets/    BytedTsinghua-SIA/DAPO-Math-17k, yentinglin/aime_2025
+# Optional under WORKSPACE: SandboxFusion/ (pre-staged clone), .wandb_key (0600).
+# WORKSPACE must be writable from the compute nodes, which also need outbound network
+# for the bootstrap installs.
 #
-#   1. CONTAINER -> official verlai/verl:sgl0512.dev4.
-#      The proven image (verl_vllm020.sqsh) has no SGLang. Do NOT try to add it
-#      with the ai_dynamo[sglang] extra either: that extra hard-pins
-#      transformers==5.8.1 and drags vLLM's guided-decoding stack down with it.
-#      An image that already ships a self-consistent sglang+transformers set is
-#      the only clean way in.
+# Env knobs (defaults shown):
+#   TOTAL_STEPS=100  SAVE_FREQ=-1  TEST_FREQ=999  RESUME_MODE=disable
+#   RESET_CHECKPOINT=0  EXPERIMENT_NAME  CONTAINER  WANDB_API_KEY  WANDB_KEY_FILE
+#   ENFORCE_EAGER=False             False keeps CUDA graphs on: sglang generates
+#                                   ~8x faster than eager, and fits at gpu_mem_util=0.6
+#   DISABLE_PIECEWISE=0             1 adds --disable-piecewise-cuda-graph
+#   SESSION_AFFINITY_TTL_SECS=1800  frontend session affinity, 0 = off; later turns of
+#                                   a trajectory stick to the worker holding their prefix
+#   STREAM_INTERVAL=                empty = engine default
+#   VERL_DEFER_OPTIMIZER_LOAD=0     1 keeps Adam on CPU through fwd/bwd (needed on 2x8)
+#   EAGER_EXPERTS=0  USE_FUSED_KERNELS=0  FUSED_KERNELS_BACKEND=torch
+#   PPO_MAX_TOKEN_LEN=18432  ULYSSES_SP=4  ROLLOUT_TP=2
+#   Rarely needed, in-container path overrides: VERL_SRC_IN_CONTAINER, DYNAMO_SRC,
+#   DYNAMO_WHEELHOUSE, VERL_NODE_CACHE_BASE, VERL_DYNAMO_FE_READY_TIMEOUT
 #
-#   2. NO `pip install "transformers>=4.56,<5"`.
-#      The proven script pins it because vLLM 0.20.2 rejects transformers 5.x.
-#      SGLang 0.5.x requires transformers==5.8.1, so the pin is not merely
-#      unnecessary here, it is unsatisfiable. Consequence to keep in mind: the
-#      transformers 5.x Qwen3-MoE path uses grouped_mm experts, which needs more
-#      activation memory than 4.x's looped path — hence _experts_implementation
-#      below.
-#
-#   3. VERL_SRC_IN_CONTAINER -> /workspace/verl_dynamo/verl.
-#      recipe/dynamo/dynamo_sglang_{engine,rollout}.py only exist in that
-#      checkout. Entry point is verl.trainer.main_ppo with trainer.use_v1=False:
-#      the V1 TaskRunner on this checkout (6cbca9ce) hands a TensorDict to
-#      agent_loop.generate_sequences and dies with AttributeError, so we pin the
-#      v0 TaskRunner. --config-path loads the recipe's dynamo_trainer config
-#      (resolved relative to verl/trainer/, i.e. CWD-independent).
-#
-#   4. Dynamo wheels installed --no-deps from the prebuilt wheelhouse instead of
-#      being compiled in-container. The wheels are portable (py3-none-any and
-#      cp310-abi3) and --no-deps keeps the image's sglang/transformers exactly as
-#      shipped. The proven script's in-container Rust build exists to produce
-#      those same wheels; reusing them skips ~20 min of rustup/maturin per job.
-#
-#   5. Engine-specific hydra args: engine=sglang, sglang.enable_rl=true, and the
-#      vLLM-only extra_args (--generation-config vllm, --stream-interval) dropped.
-#      enable_rl is what registers call_tokenizer_manager, the only way to flush
-#      the radix cache on this path (control/flush_cache returns 404).
-#
-#   6. transformers 5.x MoE memory. Consequence of (2): 5.x stores the experts as
-#      one fused 3D tensor and picks grouped_mm, which roughly DOUBLES the actor
-#      update's peak memory versus 4.x (35.6 -> 71.6 GB on this footprint). The
-#      EAGER_EXPERTS=1 knob below trades that for a 39x slower update and is off;
-#      on 4x8 H100 the fused path fits as is.
+# Engine-specific constraints, none of them optional:
+#   * CONTAINER must already ship a self-consistent sglang + transformers pair (sglang
+#     0.5.x requires transformers 5.x). Do not add sglang with the ai_dynamo[sglang]
+#     extra: it drags vLLM's guided-decoding stack down with it. The Dynamo wheels are
+#     installed --no-deps below for the same reason.
+#   * Entry point is verl.trainer.main_ppo with trainer.use_v1=False; the V1 TaskRunner
+#     hands a TensorDict to agent_loop.generate_sequences and dies with AttributeError.
+#     hydra resolves --config-path relative to verl/trainer/, not to CWD.
+#   * sglang.enable_rl=true registers call_tokenizer_manager, the only way to flush the
+#     radix cache on this path (control/flush_cache returns 404).
+#   * transformers 5.x stores Qwen3-MoE experts as one fused 3D tensor and picks
+#     grouped_mm, roughly doubling the actor update's peak memory versus 4.x. It fits
+#     on 4x8 H100; EAGER_EXPERTS=1 trades that for a much slower update.
+#   * Do not port the vLLM launcher's extra_args: --generation-config vllm is vLLM-only
+#     and sglang rejects it at engine start.
 set -ex
-WORKSPACE=/workspace
+WORKSPACE="${WORKSPACE:?set WORKSPACE to the host directory bind-mounted at /workspace}"
 CONTAINER="${CONTAINER:-${WORKSPACE}/images/verl_sgl0512.dev4.sqsh}"
-# WANDB_API_KEY is intentionally NOT hardcoded here (the proven script has a live
-# key in plaintext). Export it before sbatch to enable the wandb logger; the
-# driver falls back to console-only when it is unset.
+# WANDB_API_KEY is not hardcoded. Export it before sbatch (--export=ALL) so the raylets
+# carry it and the Ray-actor trainer inherits it; WANDB_KEY_FILE is read in the driver
+# and only switches the logger on. Console-only logging when neither is set.
 
-echo "=== Qwen3-30B Dynamo+SGLang retool — multi-node (${SLURM_NNODES:-?}x8 H100) ==="
+echo "=== Qwen3-30B Dynamo+SGLang retool: multi-node (${SLURM_NNODES:-?}x8 H100) ==="
 echo "Node: $(hostname), $(date -Iseconds)"
 test -f "$CONTAINER" || { echo "[fatal] container not found: $CONTAINER" >&2; exit 2; }
 
@@ -91,55 +83,39 @@ read -r -d '' BOOTSTRAP <<'BOOT' || true
 set -ex
 export PIP_CACHE_DIR=/workspace/.cache/pip
 export HF_HOME=/workspace/.cache/huggingface
-# The official verl images ship a PEP 668 "externally managed" Python, so every
-# plain `pip install` aborts with externally-managed-environment. The proven
-# script never hit this because verl_vllm020.sqsh predates the marker. We are
-# installing into a throwaway container, so overriding is the intended escape.
+# The verl images ship a PEP 668 "externally managed" Python; this is a throwaway
+# container, so overriding the marker is the intended escape.
 export PIP_BREAK_SYSTEM_PACKAGES=1
-# The sglang recipe (dynamo_sglang_rollout.py etc.) lives in the verl_dynamo
-# checkout, not the one the proven vLLM script uses.
+# recipe/dynamo/dynamo_sglang_{engine,rollout}.py live in this verl checkout.
 export VERL_SRC_IN_CONTAINER="${VERL_SRC_IN_CONTAINER:-/workspace/verl_dynamo/verl}"
 export PYTHONPATH="${VERL_SRC_IN_CONTAINER}:${PYTHONPATH:-}"
 export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 echo "Container verl source: ${VERL_SRC_IN_CONTAINER}"
 echo "VERL_USE_EXTERNAL_MODULES=${VERL_USE_EXTERNAL_MODULES}"
 
-# Per-job cache root. The job id is load-bearing (added 2026-08-31): without it
-# every sglang job on a node writes into the same /tmp tree and nothing ever
-# reclaims it. Three runs on 2026-08-31 (17014038/17015852/17016074) filled the
-# node-local /tmp, and the fourth died with a failure that names neither disk nor
-# cache -- sglang's piecewise-cudagraph compiler raised
-#   OSError: [Errno 28] No space left on device
-# from backend.py, which the engine turned into SIGQUIT and the watchdog reported
-# as "dynamo engine_workers[1] exited rc=-9". Looks like an OOM kill, is a full disk.
+# Per-job cache root. The job id is load-bearing: without it every sglang job on a
+# node shares one /tmp tree and nothing ever reclaims it. The eventual ENOSPC does
+# not name the disk -- the piecewise-cudagraph compiler dies and the watchdog
+# reports "engine_workers[1] exited rc=-9", which reads as an OOM kill.
 JOB_CACHE_BASE=${VERL_NODE_CACHE_BASE:-/tmp/verl_${USER:-user}_sgl0512_$(hostname)_${SLURM_JOB_ID:-manual}}
-# Reap caches from finished jobs on this node. Guarded by -mmin so a concurrently
-# starting sibling job is never touched.
+# Reap caches left by finished jobs on this node. The mtime guard is the only thing
+# keeping a running sibling's cache out of it, and +180 is BELOW the 4 h --time above:
+# raise it past the wall clock before relying on it.
 find /tmp -maxdepth 1 -name "verl_${USER:-user}_sgl0512_*" -mmin +180 \
   -not -path "$JOB_CACHE_BASE" -exec rm -rf {} + 2>/dev/null || true
 df -h /tmp | tail -1
-# HOME must move too (2026-08-31). The container mounts only ${WORKSPACE}:/workspace,
-# so the default HOME=/root lives in the container's writable layer -- a few GB, shared
-# with everything else the image writes. Dynamo's model-discovery cache does NOT honour
-# XDG_CACHE_HOME: it writes $HOME/.cache/dynamo/mdc/ directly, so setting XDG alone left
-# it on the small layer. Job 17017698 filled it and the frontend logged
-#   Error adding model from discovery ... symlinking /root/.cache/dynamo/mdc/... :
-#   No space left on device (os error 28)
-# 260 times, never once "added model" -- so /v1/completions returned 404 for every
-# rollout request even though the engines were up and weight sync had completed
-# (32 ranks, buckets=57). The control plane (/engine/control/*, its own port) was fine;
-# only the data plane never got a route. df -h /tmp reported 37T free the whole time,
-# which is why the earlier "disk is full" reading looked wrong -- wrong filesystem.
+# HOME must move too. The container mounts only ${WORKSPACE}:/workspace, so the default
+# HOME=/root lives in the image's small writable layer -- and Dynamo's model-discovery
+# cache writes $HOME/.cache/dynamo/mdc/ directly, ignoring XDG_CACHE_HOME. Filling that
+# layer makes the frontend log "No space left on device" while registering models and
+# then 404 every /v1/completions, while df on /tmp still reports terabytes free: the
+# right symptom read against the wrong filesystem.
 export HOME=${JOB_CACHE_BASE}/home
 mkdir -p "$HOME"
-# Carry the image's credentials into the relocated HOME. wandb authenticates from
-# ~/.netrc, NOT from WANDB_API_KEY here: the export below happens in the outer
-# script process and never reaches the Ray-actor trainer, so every prior run was
-# in fact authenticating via the image's /root/.netrc. Moving HOME without this
-# copy broke that -- job 17018473 got all the way through engine start, frontend
-# registration (16 models, 0x 404) and into the trainer, then died on
-#   wandb.errors.errors.UsageError: No API key configured.
-# Copy only credentials; /root/.cache is exactly what we are moving away from.
+# wandb authenticates from ~/.netrc, not from a WANDB_API_KEY exported in this outer
+# script (that export never reaches the Ray-actor trainer), so carry any existing
+# credentials into the relocated HOME. Credentials only: /root/.cache is exactly what
+# we are moving away from.
 for _cred in .netrc .netrc.gpg; do
   [ -f "/root/$_cred" ] && cp -p "/root/$_cred" "$HOME/$_cred" 2>/dev/null || true
 done
@@ -153,25 +129,17 @@ export FLASHINFER_JIT_CACHE_DIR=${FLASHINFER_JIT_CACHE_DIR:-${FLASHINFER_CACHE_D
 export FLASHINFER_WORKSPACE_BASE=${FLASHINFER_WORKSPACE_BASE:-${JOB_CACHE_BASE}/flashinfer_workspace}
 export FLASHINFER_CUBIN_DIR=${FLASHINFER_CUBIN_DIR:-${JOB_CACHE_BASE}/flashinfer_cubins}
 export VERL_DYNAMO_FE_READY_TIMEOUT=${VERL_DYNAMO_FE_READY_TIMEOUT:-1800}
-# The proven vLLM script sets expandable_segments:True here to cut cross-step
-# fragmentation. It MUST NOT be set on the sglang path: sglang's memory saver
-# refuses to initialise under it —
-#   RuntimeError: TorchMemorySaver is disabled for the current process because
-#                 expandable_segments is not supported yet.   [job 16512212]
-# and torch_memory_saver is exactly what release_memory_occupation/​resume use to
-# hand GPU memory back to the trainer during the update. Losing the allocator
-# tweak is survivable; losing memory release is not — the engine would sit on
-# ~31 GB of weights per GPU through every training step.
-# Unset rather than merely skip: the surrounding environment may already carry it.
+# expandable_segments cuts cross-step fragmentation on the vLLM path but MUST NOT be
+# set here: sglang's memory saver refuses to initialise under it ("TorchMemorySaver is
+# disabled ... expandable_segments is not supported yet"), and torch_memory_saver is
+# exactly what release/resume_memory_occupation use to hand GPU memory back to the
+# trainer during the update. Unset rather than skip: the environment may already carry it.
 unset PYTORCH_ALLOC_CONF PYTORCH_CUDA_ALLOC_CONF 2>/dev/null || true
 export HYDRA_FULL_ERROR=1
 # Adam state is ~15-30 GB/GPU and verl loads it on train-mode entry, so it sits on the
-# card through all of forward_backward_batch even though only optimizer_step() needs
-# it. Step 1 already peaks at ~72 GB of 79 with no optimizer state allocated (Adam is
-# lazy until the first .step()), which is why every run so far cleared step 1 and OOMed
-# in step 2's backward. Exported here, not in the driver, so both raylets carry it and
-# the Ray workers inherit it.
-# Off by default: the verified 4x8 run did not need it. Set 1 on 2x8.
+# card through all of forward_backward_batch even though only optimizer_step() needs it.
+# Exported here rather than in the driver so both raylets carry it and the Ray workers
+# inherit it. Off by default: not needed on 4x8; set 1 on 2x8.
 export VERL_DEFER_OPTIMIZER_LOAD=${VERL_DEFER_OPTIMIZER_LOAD:-0}
 echo "VERL_DEFER_OPTIMIZER_LOAD=${VERL_DEFER_OPTIMIZER_LOAD}"
 unset ROCR_VISIBLE_DEVICES 2>/dev/null
@@ -181,11 +149,10 @@ mkdir -p "$HOME" "$HOME/.cache" "$PIP_CACHE_DIR" "$HF_HOME" "$XDG_CACHE_HOME" "$
 # the next engine startup fail.
 pkill -u "$(id -u)" -f "recipe.dynamo._dynamo_vllm_with_control" 2>/dev/null || true
 pkill -u "$(id -u)" -f "python3 -m dynamo.frontend" 2>/dev/null || true
-# Anchor on the module invocation, NOT the bare string "dynamo.sglang": pkill -f
-# matches the whole argv and "." is a regex wildcard, so the loose pattern also
-# matches this very script when its path contains "dynamo_sglang" — the bootstrap
-# SIGTERMs itself and the job dies at ~70s with exit code 15 (job 16510322).
-# The proven script documents the same hazard for its own patterns.
+# Anchor on the module invocation, NOT the bare string "dynamo.sglang": pkill -f matches
+# the whole argv and "." is a regex wildcard, so a loose pattern also matches this very
+# script when its path contains "dynamo_sglang" -- the bootstrap SIGTERMs itself and the
+# job dies during startup with exit code 15.
 pkill -u "$(id -u)" -f "python3 -m dynamo\.sglang" 2>/dev/null || true
 pkill -u "$(id -u)" -f "nats-server -p" 2>/dev/null || true
 pkill -u "$(id -u)" -f "etcd --listen-client-urls" 2>/dev/null || true
@@ -204,9 +171,8 @@ for pkg in ("torch", "transformers", "sglang", "verl"):
 PY
 python3 -c "import sglang; print('sglang import OK')" || { echo "[fatal] image has no sglang" >&2; exit 2; }
 pip install setuptools sandbox-fusion 2>&1 | tail -1
-# verl's wandb logger imports wandb at construction time; the sgl0512 image is not
-# guaranteed to ship it, and a missing import would kill the run only after the ~10 min
-# engine bring-up. Install it here rather than discover it late.
+# verl's wandb logger imports wandb at construction time; a missing import would only
+# surface after the ~10 min engine bring-up, so install it here rather than find out late.
 python3 -c "import wandb" 2>/dev/null || pip install wandb 2>&1 | tail -1
 python3 -c "import wandb; print('wandb', wandb.__version__)" 2>&1 | tail -1
 
@@ -221,15 +187,12 @@ DYNAMO_RUNTIME_WHEEL=$(ls "$DYNAMO_WHEELHOUSE"/ai_dynamo_runtime-*.whl | sort | 
 DYNAMO_API_WHEEL=$(ls "$DYNAMO_WHEELHOUSE"/ai_dynamo-*.whl | sort | tail -1)
 python3 -m pip install --force-reinstall --no-deps "$DYNAMO_RUNTIME_WHEEL" "$DYNAMO_API_WHEEL" 2>&1 | tail -3
 
-# Same overlay assertion as the proven script, against the sglang handler. The
-# published wheel's handlers do not necessarily return completion_token_ids; when
-# they do not, dynamo hands back text with no token ids, verl's
-# _fallback_token_ids() substitutes a single EOS, and training silently runs on
-# 1-token responses with every metric still looking healthy. Fail here instead.
-# Installing the wheels --no-deps keeps the image's sglang/transformers intact but
-# also skips dynamo's own runtime deps. blake3 is the one the sglang handler pulls
-# in (via request_handlers/multimodal/encode_worker_handler.py); without it the
-# engine worker dies with ModuleNotFoundError ~10 min into the job (16511576).
+# Assert the local Dynamo overlay is what gets imported. A published wheel's handlers do
+# not necessarily return completion_token_ids; without them dynamo returns text with no
+# token ids, verl's _fallback_token_ids() substitutes a single EOS, and training silently
+# runs on 1-token responses with every metric still looking healthy. Fail here instead.
+# --no-deps keeps the image's sglang/transformers intact but also skips dynamo's own
+# runtime deps; blake3 is the one the sglang handler pulls in.
 python3 -c "import blake3" 2>/dev/null || pip install blake3 2>&1 | tail -1
 
 python3 - <<'PY'
@@ -240,10 +203,8 @@ print(f"ai-dynamo {version('ai-dynamo')}")
 print(f"ai-dynamo-runtime {version('ai-dynamo-runtime')}")
 import dynamo, dynamo.runtime, dynamo.llm
 
-# Actually IMPORT the handler package rather than find_spec it. find_spec only
-# locates the file, so a missing transitive dep (blake3) sails through here and
-# resurfaces much later as a dead engine worker. Importing makes the bootstrap
-# the place that fails, which is ~10 minutes earlier and names the real cause.
+# Import rather than find_spec: find_spec only locates the file, so a missing
+# transitive dep sails through and resurfaces later as a dead engine worker.
 mod = importlib.import_module("dynamo.sglang.request_handlers.handler_base")
 path = mod.__file__
 print(f"dynamo.sglang handler_base: {path}")
@@ -288,14 +249,13 @@ export PATH="$DYN_BIN_DIR:$PATH"
 etcd --version | head -1
 nats-server --version
 
-# Weight-sync bucket bump, same as the proven run.
+# Weight-sync bucket size bump, same as the vLLM launcher.
 VERL_PKG_DIR=$(python3 -c "import verl,os; print(os.path.dirname(verl.__file__))")
 grep -rl "bucket_size_mb" "$VERL_PKG_DIR" --include="*.py" 2>/dev/null | xargs -r sed -i "s/bucket_size_mb=2048/bucket_size_mb=4096/g; s/bucket_size_mb: int = 512/bucket_size_mb: int = 4096/g"
 
-# Detached+named sandbox actors: without lifetime=detached the rate limiter dies
-# with whichever ExecutionWorker created it, and node 2's rollout workers then
-# fail with ActorDiedError. Upstream moved this file out of verl/tools into the
-# recipe, so patch whichever copy exists.
+# Detached+named sandbox actors: without lifetime=detached the rate limiter dies with
+# whichever ExecutionWorker created it and the other nodes' rollout workers then fail
+# with ActorDiedError. Upstream moved this file, so patch whichever copy exists.
 for SF_PY in "$VERL_PKG_DIR/tools/sandbox_fusion_tools.py" \
              "${VERL_SRC_IN_CONTAINER}/verl/tools/sandbox_fusion_tools.py" \
              "${VERL_SRC_IN_CONTAINER}/recipe/retool/sandbox_fusion_tool.py"; do
@@ -318,8 +278,7 @@ python3 -c "import verl; print(f'verl {verl.__version__}')"
 # === LOCAL sandbox-fusion server on this node =============================== #
 echo "=== Setting up sandbox-fusion server on $(hostname) ==="
 cd /tmp && rm -rf SandboxFusion
-# Prefer the lustre clone (compute nodes are not guaranteed outbound network);
-# fall back to a fresh clone, as the proven script does.
+# Prefer a pre-staged copy: compute nodes are not guaranteed outbound network.
 if [ -d /workspace/SandboxFusion ]; then
   cp -r /workspace/SandboxFusion /tmp/SandboxFusion
 else
@@ -350,7 +309,7 @@ RESULT=$(curl -s -X POST "http://localhost:${SF_PORT}/run_code" -H "Content-Type
 echo "Quick test: $RESULT"
 BOOT
 
-# Driver — runs ONLY on node_1, after the Ray cluster is up.
+# Driver: runs ONLY on node_1, after the Ray cluster is up.
 read -r -d '' DRIVER <<'DRV' || true
 set -ex
 rm -rf /tmp/verl_ckpt
@@ -362,9 +321,9 @@ export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.reg
 echo "VERL_USE_EXTERNAL_MODULES=${VERL_USE_EXTERNAL_MODULES}"
 
 project_name=retool_30b_dynamo_sglang
-experiment_name=${EXPERIMENT_NAME:-e2_30b_dynamo_sglang_4n_${SLURM_JOB_ID:-manual}}
-# No ${SLURM_JOB_ID} suffix: a 50-step campaign spans several 4h jobs, and resume_mode=auto
-# looks for global_step_* under this exact path. experiment_name already carries the job id
+experiment_name=${EXPERIMENT_NAME:-qwen3_30b_dynamo_sglang_4n_${SLURM_JOB_ID:-manual}}
+# No ${SLURM_JOB_ID} suffix: a multi-job run under resume_mode=auto looks for global_step_*
+# under this exact path. experiment_name already carries the job id
 # when EXPERIMENT_NAME is unset, so one-off runs still get their own directory.
 default_local_dir=/workspace/dynamorl_workspace/checkpoint/${experiment_name}
 if [[ "${RESET_CHECKPOINT:-0}" == "1" ]]; then
@@ -388,9 +347,8 @@ nohup python3 recipe/dynamo/metrics_sidecar.py --targets-glob "$PROM_FILE" \
 disown
 echo "metrics sidecar started -> ${SIDECAR_JSONL}"
 
-# `set -x` is active here, so anything that touches WANDB_API_KEY on a traced line
-# prints the key into a group-readable log on lustre. Read it with tracing off, from a
-# 0600 file, and never echo the value -- only whether one was found.
+# Tracing is on here, so read the key with tracing off and never echo the value --
+# otherwise it lands in the job log.
 set +x
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-/workspace/.wandb_key}"
 if [ -z "${WANDB_API_KEY:-}" ] && [ -r "$WANDB_KEY_FILE" ]; then
@@ -411,10 +369,10 @@ if [ -n "${WANDB_API_KEY:-}" ]; then
   fi
   export WANDB_DIR="${WANDB_DIR:-/workspace/dynamorl_workspace/slurm/wandb_${SLURM_JOB_ID:-manual}}"
   mkdir -p "$WANDB_DIR"
-  # Segments of one campaign must append to a single wandb run, not create three.
+  # Segments of one multi-job run must append to a single wandb run, not one per job.
   export WANDB_RUN_ID="${WANDB_RUN_ID:-$experiment_name}"
   export WANDB_RESUME="${WANDB_RESUME:-allow}"
-  echo "wandb: key loaded (${#WANDB_API_KEY} chars), project=$project_name run=$experiment_name dir=$WANDB_DIR"
+  echo "wandb: key loaded, project=$project_name run=$experiment_name dir=$WANDB_DIR"
 else
   TRAINER_LOGGER="[\"console\"]"
   echo "wandb: no key at $WANDB_KEY_FILE and WANDB_API_KEY unset -> console logger only"
@@ -424,32 +382,24 @@ set -x
 dapo_math_17k=/workspace/dynamorl_workspace/datasets/BytedTsinghua-SIA/DAPO-Math-17k
 aime_2025=/workspace/dynamorl_workspace/datasets/yentinglin/aime_2025
 
-# Rollout dump: chasing a degenerate response_length through aggregate metrics
-# alone produced three wrong hypotheses in a row on this stack; one raw sample
-# settles it immediately.
+# Dump raw rollouts: aggregate metrics alone cannot tell a degenerate response_length
+# from broken length accounting, and one raw sample settles it immediately.
 ROLLOUT_DUMP=/workspace/dynamorl_workspace/slurm/rollouts_sglang_${SLURM_JOB_ID:-manual}
 mkdir -p "$ROLLOUT_DUMP"
 
-# NB ppo_max_token_len_per_gpu is multiplied by ulysses_sequence_parallel_size
-# inside verl (workers/engine/utils.py: max_token_len = per_gpu * sp_size), so
-# 18432 * 4 = 73728 tokens per micro-batch — matching log_prob's 73728, which is
-# NOT multiplied because the ref path runs at sp=1. Both numbers are copied from
-# the proven run; 18432 itself is the floor (max_prompt + max_response), since a
-# micro-batch must hold at least one whole sequence.
+# ppo_max_token_len_per_gpu is multiplied by ulysses_sequence_parallel_size inside verl
+# (workers/engine/utils.py), so 18432 * 4 = 73728 tokens per micro-batch -- matching
+# log_prob's 73728, which is NOT multiplied because the ref path runs at sp=1. 18432 is
+# also the floor (max_prompt + max_response): a micro-batch must hold a whole sequence.
 # use_fused_kernels routes the LM head through FusedLinearForPPO, which walks the
-# sequence in 512-token chunks and never materialises the full [T, 151936] logits
-# (nor its fp32 upcast). That tensor is what blew up step 1 here: job 16513027 died
-# in prepare_model_outputs trying to allocate 2.79 GiB with 69.98 GiB already held.
-# Qwen3-MoE has no dedicated fused forward, so it takes the generic dense_common one
-# via monkey_patch's else-branch. Off by default: it changes how log_probs/entropy
-# are computed, so a run that uses it is not numerically identical to one that does not.
+# sequence in 512-token chunks instead of materialising the full [T, 151936] logits and
+# its fp32 upcast. Off by default: it changes how log_probs/entropy are computed, so a
+# run that uses it is not numerically identical to one that does not.
 FUSED_ARGS=()
-# _experts_implementation=eager forces the 128-expert Python loop (48 layers x 128,
-# paid again on every gradient-checkpoint recompute) instead of transformers 5.x's
-# batched grouped_mm. It was added here to cut activation memory, but job 16442420
-# ran grouped_mm on transformers 5.8.1 with update_actor=52s and a 72.13 GB peak,
-# while this eager path measured 2810s in job 16517408 -- a 54x tax for memory that
-# use_fused_kernels now saves more cheaply. Default off; set EAGER_EXPERTS=1 to restore.
+# _experts_implementation=eager forces the 128-expert Python loop (48 layers x 128, paid
+# again on every gradient-checkpoint recompute) instead of transformers 5.x's batched
+# grouped_mm. It buys activation memory at roughly a 40x cost in update_actor time --
+# memory that use_fused_kernels saves more cheaply. Default off.
 if [[ "${EAGER_EXPERTS:-0}" == "1" ]]; then
   FUSED_ARGS+=( "+actor_rollout_ref.model.override_config._experts_implementation=eager" )
 fi
@@ -459,29 +409,16 @@ if [[ "${USE_FUSED_KERNELS:-0}" == "1" ]]; then
 fi
 echo "FUSED_ARGS: ${FUSED_ARGS[*]:-<none>}"
 
-# --disable-piecewise-cuda-graph（2026-08-31）：sglang 的 piecewise-cudagraph 编译器
-# 把图写盘，两次跑（17016074/17016916）都在这里 OSError: [Errno 28] No space left。
-# 注意 `df -h /tmp` 当时报 37T 可用，所以写入目标并不是 /tmp，而是编译器自己的路径；
-# 与其继续找那个路径，不如按 sglang 自己的报错建议关掉它 —— 本脚本已经
-# enforce_eager=True / disable_cuda_graph=True，本来就不打算用 cuda graph，
-# piecewise 是一个独立的开关，之前漏掉了。
-# stream_interval 实测无效，已撤除（2026-08-27）：dynamo 侧尾部饱和层
-# interval 1 -> 100 的 per_token 均值变化 2.6981 -> 2.6982。注入方式本身是对的
-# (dynamo 走 extra_args 进 CLI，native 走 engine_kwargs.sglang 进 ServerArgs)，
-# 两侧都验证过真的到达引擎，所以这不是"设了没生效"。
-
 # sglang engine extra CLI args, assembled as a JSON array for hydra.
-# STREAM_INTERVAL (2026-08-31): the Dynamo frontend aggregates streamed chunks back
-# into one non-streaming response, but keeps only the FIRST chunk's logprobs while
-# token ids accumulate correctly -- measured live on job 4803: 7 usable logprobs out
-# of 1647 tokens (0.425%), the rest padded to 0.0 which verl reads as probability
-# 1.0. That is the whole of the pearson=0.05 / probs_diff=0.27 anomaly.
-# Setting the interval to the full response length makes the response a single chunk,
-# so nothing is left to drop. Empty by default = engine default (1).
-# DISABLE_PIECEWISE=1 adds --disable-piecewise-cuda-graph. It was added to dodge the
-# compiler's ENOSPC, which turned out to be the container writable layer
-# filling up and is fixed by relocating HOME. The verified 100-step run
-# (17562481) ran with it OFF, so 0 is the default.
+# STREAM_INTERVAL: the Dynamo frontend re-aggregates streamed chunks into one response,
+# but some builds keep only the FIRST chunk's logprobs and pad the rest to 0.0, which
+# verl reads as probability 1.0. Setting the interval to the full response length makes
+# the response a single chunk. Empty = engine default; only needed on such a build. The
+# symptom is the rollout-vs-recompute logprob correlation collapsing while the token ids
+# still look correct.
+# DISABLE_PIECEWISE=1 adds --disable-piecewise-cuda-graph, an independent switch from
+# enforce_eager. The ENOSPC it dodges is the container writable layer filling, which
+# relocating HOME above already fixes -- check that first; the default is off.
 SGLANG_EXTRA=()
 if [[ "${DISABLE_PIECEWISE:-0}" == "1" ]]; then
   SGLANG_EXTRA+=( "--disable-piecewise-cuda-graph" )
@@ -545,6 +482,7 @@ python3 -m verl.trainer.main_ppo \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.stable_kv_event_ports=true \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.free_engine_on_train=true \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=false \
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_session_affinity_ttl_secs=${SESSION_AFFINITY_TTL_SECS:-1800} \
     ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP:-2} \
     actor_rollout_ref.rollout.multi_turn.enable=True \
@@ -587,9 +525,8 @@ echo ">>> Sandbox-Fusion log (last 20 lines):"
 tail -20 "$SANDBOX_LOG" 2>/dev/null
 DRV
 
-# Materialise per-role scripts and run them as FILES, not `bash -c "<text>"`:
-# the bootstrap contains pkill patterns, and with -c that text lands in the bash
-# process's own argv, so pkill -f matches and SIGTERMs the script itself.
+# Run the per-role scripts as FILES, not `bash -c "<text>"`: with -c the bootstrap text
+# lands in the shell's own argv, and its pkill -f patterns then match and kill it.
 RUN_DIR_HOST="${WORKSPACE}/verl/slurm/run_dynsgl_${SLURM_JOB_ID:-manual}"
 RUN_DIR_CTR="/workspace/verl/slurm/run_dynsgl_${SLURM_JOB_ID:-manual}"
 mkdir -p "$RUN_DIR_HOST"
@@ -611,8 +548,7 @@ mkdir -p "$RUN_DIR_HOST"
 } > "$RUN_DIR_HOST/head.sh"
 
 # 1. Ray workers on every node except the head (background; each joins after its own
-#    bootstrap). Looping matters: the original hardcoded node_2, so on a >2-node
-#    allocation the extra nodes sat idle while trainer.nnodes demanded their GPUs.
+#    bootstrap). Loop over all nodes: a hardcoded node_2 leaves >2-node allocations idle.
 for ((i = 1; i < ${#nodes_array[@]}; i++)); do
   srun --overlap --nodes=1 --ntasks=1 -w "${nodes_array[$i]}" \
     --container-image="$CONTAINER" --container-mounts="${WORKSPACE}:/workspace" \

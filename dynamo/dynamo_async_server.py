@@ -837,11 +837,6 @@ class DynamoHttpServer:
                 control_endpoint = f"tcp://{self._server_address}:{control_port}"
                 self._control_endpoints.append(control_endpoint)
 
-            # sglang publishes KV events through dynamo's own DynamoSglangPublisher
-            # (components/src/dynamo/sglang/publisher.py) rather than a vLLM-style
-            # --kv-events-config, so neither the port nor the JSON is needed.
-            kv_event_port = None if is_sglang else self._allocate_kv_event_port(spec_idx)
-            kv_events_config_json = None if is_sglang else self._build_kv_events_config_json(kv_event_port)
             vllm_port = None if is_sglang else self._allocate_vllm_tcpstore_port(spec_idx)
             # Allocate a registered (<32768, i16-safe) system-status port so this
             # worker exposes /metrics (on vllm incl. pass-through
@@ -896,6 +891,24 @@ class DynamoHttpServer:
                     "without it release_memory_occupation deregisters the worker but "
                     "frees no GPU memory). Set both true, or both false."
                 )
+            # KV events are what feed the KV router's index, on BOTH engines, and both
+            # take the same vLLM-style --kv-events-config JSON. On sglang the engine's
+            # own ZmqEventPublisher binds `endpoint` and dynamo's DynamoSglangPublisher
+            # (components/src/dynamo/sglang/publisher.py:298) subscribes to it and
+            # re-publishes on the event plane -- but ONLY when kv_events_config is set:
+            # dynamo.sglang/args.py derives use_kv_events=False otherwise and the router
+            # runs on its approximate (predict-on-route only, 120s TTL) index. Every
+            # sglang kv-router run before 2026-09-09 ran that way (worker logs:
+            # "Derived use_kv_events=False from kv_events_config=None"; over 100 steps
+            # the router estimated 0.865 prefix hit while the engines measured 0.627).
+            # Placed after the config validations so a bad sglang config fails
+            # before any port is allocated. Opt out with engine_kwargs.dynamo.enable_kv_events=false (e.g. for
+            # round-robin, where the events are pure overhead).
+            publish_kv_events = self._kv_events_enabled()
+            kv_event_port = self._allocate_kv_event_port(spec_idx) if publish_kv_events else None
+            kv_events_config_json = (
+                self._build_kv_events_config_json(kv_event_port) if publish_kv_events else None
+            )
             system_metrics_port = (
                 self._allocate_stable_node_port(_SYSTEM_METRICS_PORT_BASE, spec_idx, window=8)
                 if enable_worker_metrics
@@ -965,7 +978,12 @@ class DynamoHttpServer:
             env.setdefault("PYTHONHASHSEED", "0")
 
             if is_sglang:
-                cmd = self._build_sglang_cmd(served_model_name, tp, nccl_port=self._allocate_tcp_port())
+                cmd = self._build_sglang_cmd(
+                    served_model_name,
+                    tp,
+                    nccl_port=self._allocate_tcp_port(),
+                    kv_events_config_json=kv_events_config_json,
+                )
             else:
                 cmd = self._build_vllm_cmd(
                     served_model_name,
@@ -1089,8 +1107,14 @@ class DynamoHttpServer:
         """Pick a stable low port for vLLM's local TCPStore."""
         return self._allocate_stable_node_port(_VLLM_TCPSTORE_PORT_BASE, shard_idx)
 
+    def _kv_events_enabled(self) -> bool:
+        """``engine_kwargs.dynamo.enable_kv_events`` (default true): publish KV cache
+        events from every engine shard so the KV router indexes real block
+        residency instead of only its predict-on-route guesses."""
+        return self._dynamo_cfg_bool("enable_kv_events", True)
+
     def _allocate_kv_event_port(self, shard_idx: int) -> int:
-        """Pick a port for vLLM's ZMQ KV event publisher.
+        """Pick a port for the engine's ZMQ KV event publisher (vLLM and sglang).
 
         vLLM binds this port inside a child process after model loading. Fixed
         node-local ports are easy to collide with stale subprocesses from a
@@ -1187,7 +1211,13 @@ class DynamoHttpServer:
             cmd += [str(x) for x in extra]
         return cmd
 
-    def _build_sglang_cmd(self, served_model_name: str, tp: int, nccl_port: Optional[int] = None) -> list[str]:
+    def _build_sglang_cmd(
+        self,
+        served_model_name: str,
+        tp: int,
+        nccl_port: Optional[int] = None,
+        kv_events_config_json: Optional[str] = None,
+    ) -> list[str]:
         """Construct the ``dynamo.sglang`` CLI for one DP shard.
 
         Unlike the vLLM path this launches the stock entrypoint — no verl wrapper —
@@ -1259,6 +1289,13 @@ class DynamoHttpServer:
         if page_size is not None:
             cmd += ["--page-size", str(page_size)]
 
+        # KV events for the KV router: same JSON as the vLLM path. sglang's
+        # ZmqEventPublisher binds the endpoint (offset per DP rank by dynamo's
+        # publisher) and dynamo.sglang flips use_kv_events=True in the worker's
+        # runtime config from this flag alone -- there is no other switch.
+        if kv_events_config_json:
+            cmd += ["--kv-events-config", kv_events_config_json]
+
         # Token-in/token-out: skip detokenization so the trainer scores exactly the
         # ids the engine produced. NB dynamo's llm_engine.py force-disables this
         # when its metrics hook needs a tokenizer, so treat it as a request.
@@ -1266,8 +1303,24 @@ class DynamoHttpServer:
             cmd += ["--skip-tokenizer-init"]
 
         extra = self._sglang_cfg().get("extra_args") or self._dynamo_cfg().get("extra_args") or []
-        if isinstance(extra, list):
-            cmd += [str(x) for x in extra]
+        extra = [str(x) for x in extra] if isinstance(extra, list) else []
+
+        # Attention backend: default to flashinfer, mirroring verl's native sglang
+        # server (async_sglang_server.py). SGLang's own default on Hopper is fa3,
+        # and fa3 with the KV-router page size (16) decodes ~8% slower per step
+        # (Qwen2.5-0.5B, H100, 32x512 fixed-length: fa3/page16 8.09 ms/step vs
+        # flashinfer 7.44; native verl 7.47). That gap was the whole
+        # "dynamo generation is 9% slower" delta -- the frontend hop itself is <1%.
+        # verl also avoids fa3 because fa3 + cuda graph is broken on sglang>=0.5.12.
+        # Explicit engine_kwargs.dynamo.sglang.attention_backend or an
+        # --attention-backend in extra_args wins.
+        attention_backend = self._sglang_cfg().get("attention_backend")
+        if attention_backend is None and not any(x.startswith("--attention-backend") for x in extra):
+            attention_backend = "flashinfer"
+        if attention_backend:
+            cmd += ["--attention-backend", str(attention_backend)]
+
+        cmd += extra
         return cmd
 
     def _start_frontend(self):
@@ -1331,7 +1384,10 @@ class DynamoHttpServer:
         normalize out-of-range / sentinel values back to ``"None"`` (disabled).
         """
         if self._router_mode != "kv":
-            return self._frontend_extra_args()
+            # Session affinity is a plain router option (dynamo router_args.py), not
+            # a KV-router one: the frontend wraps its simple router in
+            # SessionAffinityPushRouter too, so emit it in every mode.
+            return self._session_affinity_args() + self._frontend_extra_args()
 
         cfg = self._dynamo_cfg()
         args: list[str] = []
@@ -1370,7 +1426,61 @@ class DynamoHttpServer:
             )
             if prefill_frac != "None":
                 args += ["--active-prefill-tokens-threshold-frac", prefill_frac]
-        return args + self._frontend_extra_args()
+        return args + self._session_affinity_args() + self._frontend_extra_args()
+
+    def _session_affinity_ttl_secs(self) -> Optional[int]:
+        """``engine_kwargs.dynamo.router_session_affinity_ttl_secs`` -> seconds, or None.
+
+        None / 0 / "None" leave affinity off (the frontend default). With a TTL the
+        frontend pins every request carrying the same ``x-dynamo-session-id`` to
+        the worker that served the first one, for TTL seconds after the last hit.
+        For verl that key is the trajectory's request_id (see _frontend_headers),
+        so the later turns of a multi-turn rollout land on the worker that already
+        holds their prefix regardless of what the KV index knows -- the index only
+        learns about blocks from KV events (see enable_kv_events) and from
+        predict-on-route entries that expire after router_predicted_ttl_secs.
+        The frontend accepts 1..=31_536_000 (dynamo router_args.py); reject other
+        values here so a typo fails at config time, not as a frontend that never
+        turns healthy.
+        """
+        value = self._dynamo_cfg().get("router_session_affinity_ttl_secs")
+        if self._is_disabled_threshold(value):
+            return None
+        try:
+            ttl = int(float(value))
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                "rollout.engine_kwargs.dynamo.router_session_affinity_ttl_secs must be a number "
+                f"of seconds in 1..31536000, or None, got {value!r}"
+            ) from e
+        if ttl <= 0:
+            return None
+        if ttl > 31_536_000:
+            raise ValueError(
+                f"rollout.engine_kwargs.dynamo.router_session_affinity_ttl_secs={value!r} exceeds the "
+                "frontend's maximum of 31536000 seconds"
+            )
+        return ttl
+
+    def _session_affinity_args(self) -> list[str]:
+        ttl = self._session_affinity_ttl_secs()
+        return ["--router-session-affinity-ttl-secs", str(ttl)] if ttl is not None else []
+
+    def _frontend_headers(self, request_id: str) -> dict[str, str]:
+        """Per-request headers for the frontend POST.
+
+        ``x-dynamo-session-id`` is the frontend's session-affinity key
+        (lib/llm/src/protocols/agents.rs). verl's tool agent loop mints ONE
+        request_id per trajectory and reuses it across turns
+        (tool_agent_loop.py), so the id we already send as X-Request-Id doubles as
+        the session key. Only sent when affinity is configured: the same header
+        also populates the frontend's agent_context, so keep the wire identical
+        to before for everyone who has not opted in.
+        """
+        headers = {"X-Request-Id": str(request_id)}
+        if self._session_affinity_ttl_secs() is not None:
+            headers["x-dynamo-session-id"] = str(request_id)
+        return headers
 
     @staticmethod
     def _is_disabled_threshold(value: Any) -> bool:
@@ -1590,7 +1700,7 @@ class DynamoHttpServer:
         async with session.post(
             self._frontend_completions_url(),
             json=payload,
-            headers={"X-Request-Id": str(request_id)},
+            headers=self._frontend_headers(request_id),
             timeout=timeout,
         ) as resp:
             return resp.status, await resp.text()
@@ -1831,6 +1941,7 @@ class DynamoHttpServer:
             raise RuntimeError("model_config.tokenizer is required for Dynamo frontend generation")
         self._log_engine_data_token_ids_status(choice, data)
         token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
+        engine_token_ids = token_ids is not None
         if token_ids is None:
             if self._request_completion_token_ids():
                 # Token ids were explicitly requested and the frontend still returned
@@ -1856,6 +1967,29 @@ class DynamoHttpServer:
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
         log_probs = self._extract_completion_log_probs(choice, len(token_ids), data) if include_log_probs else None
         finish_reason = choice.get("finish_reason")
+        # Guard against ai-dynamo/dynamo#14302: from 1.4.1 the sglang worker strips
+        # the matched stop token from completion_token_ids on finish_reason=stop
+        # while usage.completion_tokens still counts it. The trainer would then
+        # never see EOS -- the policy cannot learn to stop and response_length
+        # drifts to max_tokens -- with every other metric looking healthy. This
+        # checkout (1.3.0 @ 94accc7389) predates the regression (probe 2026-09-08:
+        # last id 151645, lengths equal on sglang direct and both dynamo modes);
+        # an upgrade that reintroduces it now fails on the first response, not
+        # fifty steps later. Aborted responses are exempt: their arrays are partial.
+        usage_tokens = (data.get("usage") or {}).get("completion_tokens")
+        if (
+            engine_token_ids
+            and finish_reason in ("stop", "length")
+            and isinstance(usage_tokens, int)
+            and usage_tokens != len(token_ids)
+        ):
+            raise RuntimeError(
+                f"Dynamo frontend returned {len(token_ids)} completion token ids but "
+                f"usage.completion_tokens={usage_tokens} (finish_reason={finish_reason!r}): the token "
+                "array is not the sampled sequence. Known cause: ai-dynamo/dynamo#14302 (stop token "
+                "stripped from completion_token_ids in dynamo>=1.4.1; fixed by #14317). Refusing to "
+                f"train on it. Response head: {str(data)[:300]}"
+            )
         if finish_reason == "stop" or finish_reason == "length":
             stop_reason = "completed"
         elif finish_reason == "abort":
