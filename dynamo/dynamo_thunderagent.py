@@ -120,6 +120,30 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             command.extend(["--block-size", block_size])
         return command
 
+    def _build_sglang_cmd(self, served_model_name: str, tp: int, nccl_port=None) -> list[str]:
+        """TA worker-side glue for the sglang engine, mirroring _build_vllm_cmd.
+
+        Rename the worker's served model so the frontend cannot route requests
+        (or session-final probes) directly to it — with ThunderAgent on, the
+        ONLY handler advertising the public model name must be the TA router,
+        otherwise generation silently bypasses program affinity. Page-size
+        alignment is handled by the base builder (it falls back to
+        thunderagent.router_block_size); an explicit sglang.page_size that
+        contradicts the router block size fails fast here, same as the vLLM
+        --block-size check.
+        """
+        if not self._thunderagent_enabled():
+            return super()._build_sglang_cmd(served_model_name, tp, nccl_port=nccl_port)
+        explicit_page_size = self._sglang_cfg().get("page_size")
+        router_block_size = self._thunderagent_router_block_size()
+        if explicit_page_size is not None and int(explicit_page_size) != int(router_block_size):
+            raise ValueError(
+                "Dynamo sglang and ThunderAgent router block sizes must match: "
+                f"sglang.page_size={explicit_page_size} != thunderagent.router_block_size={router_block_size}"
+            )
+        worker_model_name = f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
+        return super()._build_sglang_cmd(worker_model_name, tp, nccl_port=nccl_port)
+
     def _frontend_router_args(self) -> list[str]:
         args = super()._frontend_router_args()
         if self._thunderagent_enabled() and "--router-reset-states" not in args:
