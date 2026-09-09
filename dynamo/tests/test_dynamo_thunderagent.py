@@ -1100,3 +1100,41 @@ def test_control_actor_naming_standalone_override() -> None:
     pooled = {"dynamo": {"shared_pool_replica_rank": 2}}
     assert control_actor_name(pooled, 0) == "dynamo_server_2_0"
     assert control_actor_name(pooled, 0, replica_rank=5) == "dynamo_server_5_0"
+
+
+def test_thunderagent_sglang_workers_use_internal_model_name(monkeypatch) -> None:
+    # With ThunderAgent on, sglang workers must register under the suffixed
+    # name so the ONLY handler advertising the public model is the TA router —
+    # otherwise generation silently bypasses program affinity (the vLLM path
+    # has had this rename since PR #126; the sglang path was missing it).
+    server = _make_http_server()
+    base_calls = []
+
+    def build_base(_self, served_model_name, _tp, nccl_port=None):
+        base_calls.append(served_model_name)
+        return ["python", "-m", "dynamo.sglang", "--served-model-name", served_model_name]
+
+    monkeypatch.setattr(DynamoHttpServer, "_build_sglang_cmd", build_base)
+
+    command = server._build_sglang_cmd("test-model", 1)
+    assert base_calls == ["test-model--verl-thunderagent-backend"]
+    assert command[-1] == "test-model--verl-thunderagent-backend"
+
+    # Explicit page_size contradicting the router block size fails fast.
+    server.config = SimpleNamespace(
+        engine_kwargs={
+            "dynamo": {
+                "engine": "sglang",
+                "sglang": {"page_size": 32},
+                "thunderagent": {"enabled": True, "router_block_size": 16},
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="block sizes must match"):
+        server._build_sglang_cmd("test-model", 1)
+
+    # TA off: no rename, no check.
+    server.config = SimpleNamespace(engine_kwargs={"dynamo": {"engine": "sglang", "thunderagent": {"enabled": False}}})
+    base_calls.clear()
+    server._build_sglang_cmd("test-model", 1)
+    assert base_calls == ["test-model"]
