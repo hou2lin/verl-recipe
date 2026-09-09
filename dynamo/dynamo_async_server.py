@@ -72,7 +72,6 @@ _SUBPROCESS_REGISTRY: list[tuple[str, str, int]] = [
 # to the same node-local rank that the trainer side computes. Set for sglang
 # shards too, but unread there: DynamoSGLangRollout derives the same mapping
 # trainer-side from shard = local_rank // tp.
-_RANK_OFFSET_ENV = "VERL_DYNAMO_RANK_OFFSET"
 _REPLICA_RANK_ENV = "VERL_REPLICA_RANK"
 
 # Where an engine worker exposes its system HTTP (/metrics plus the /engine/*
@@ -179,6 +178,33 @@ class DynamoHttpServer:
 
         # Set by ServerAdapter.update_weights to tag generations.
         self.global_steps: Optional[int] = None
+
+        # Partial-rollout gate: abort_all_requests() clears it and pauses the
+        # engines; resume_generation() resumes the engines and sets it.
+        # generate() waits on it so new / client-retried requests queue here
+        # instead of reaching a paused engine (abort_all_requests pauses both engines).
+        self._generation_resumed = asyncio.Event()
+        self._generation_resumed.set()
+
+        # Sleep/wake around training follows verl's rollout.free_cache_engine.
+        # An explicit engine_kwargs.dynamo.free_engine_on_train may only
+        # restate it — a contradiction between the two switches used to no-op
+        # silently (OOM in colocate training); now it fails at startup.
+        verl_free_cache_engine = bool(getattr(self.config, "free_cache_engine", False))
+        explicit_free_engine = self._dynamo_cfg().get("free_engine_on_train")
+        if (
+            explicit_free_engine is not None
+            and self._dynamo_cfg_bool("free_engine_on_train", verl_free_cache_engine) != verl_free_cache_engine
+        ):
+            raise ValueError(
+                f"engine_kwargs.dynamo.free_engine_on_train={explicit_free_engine!r} contradicts "
+                f"rollout.free_cache_engine={verl_free_cache_engine}. This switch now mirrors "
+                "rollout.free_cache_engine and is no longer independently tunable. To keep engines "
+                "resident during training (the old free_engine_on_train=false behavior), set "
+                "rollout.free_cache_engine=false as well."
+            )
+        self._check_sleep_mode_pairing()
+        self._free_engine_on_train_flag = verl_free_cache_engine
 
         self._server_address = ray.util.get_node_ip_address().strip("[]")
         self._server_port: Optional[int] = None  # = frontend_port once ready
@@ -289,9 +315,7 @@ class DynamoHttpServer:
         """Which inference engine Dynamo fronts: ``vllm`` (default) or ``sglang``."""
         engine = str(self._dynamo_cfg().get("engine", ENGINE_VLLM)).lower()
         if engine not in _SUPPORTED_ENGINES:
-            raise ValueError(
-                f"rollout.engine_kwargs.dynamo.engine must be one of {_SUPPORTED_ENGINES}, got {engine!r}"
-            )
+            raise ValueError(f"rollout.engine_kwargs.dynamo.engine must be one of {_SUPPORTED_ENGINES}, got {engine!r}")
         return engine
 
     def _is_sglang(self) -> bool:
@@ -317,8 +341,7 @@ class DynamoHttpServer:
 
             timeout_s = float(self._dynamo_cfg().get("request_timeout_s", 600))
             self._sglang_clients = [
-                DynamoSGLangControlClient(url, timeout_s=timeout_s)
-                for url in self._engine_control_endpoints
+                DynamoSGLangControlClient(url, timeout_s=timeout_s) for url in self._engine_control_endpoints
             ]
         return self._sglang_clients
 
@@ -365,8 +388,11 @@ class DynamoHttpServer:
                 if wanted:
                     targets.append((idx, wanted))
             if not targets:
-                logger.info("[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
-                            list(tags), sorted(self._sglang_released_tags))
+                logger.info(
+                    "[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
+                    list(tags),
+                    sorted(self._sglang_released_tags),
+                )
                 return
             outcomes = await self._sglang_control_fanout(
                 "release_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
@@ -378,9 +404,13 @@ class DynamoHttpServer:
                 else:
                     per_shard[idx].update(wanted)
             self._refresh_node_released_view()
-            logger.info("[DynamoHttpServer] sglang released %s on %d/%d shard(s) (now released=%s)",
-                        sorted({t for _, w in targets for t in w}), len(targets) - len(errors), len(targets),
-                        sorted(self._sglang_released_tags))
+            logger.info(
+                "[DynamoHttpServer] sglang released %s on %d/%d shard(s) (now released=%s)",
+                sorted({t for _, w in targets for t in w}),
+                len(targets) - len(errors),
+                len(targets),
+                sorted(self._sglang_released_tags),
+            )
             if errors:
                 # Successful shards are already recorded above, so a retry only
                 # touches the ones that failed instead of double-releasing the rest.
@@ -402,8 +432,11 @@ class DynamoHttpServer:
             per_shard = self._sglang_shard_state()
             targets = [(idx, sorted(released)) for idx, released in enumerate(per_shard) if released]
             if not targets:
-                logger.info("[DynamoHttpServer] sglang resume%s skipped (released=%s)", list(tags),
-                            sorted(self._sglang_released_tags))
+                logger.info(
+                    "[DynamoHttpServer] sglang resume%s skipped (released=%s)",
+                    list(tags),
+                    sorted(self._sglang_released_tags),
+                )
                 return
             # Resume EVERY released tag, not just the requested one. Dynamo's sglang
             # handler re-registers the worker into discovery on the first resume, so a
@@ -421,8 +454,12 @@ class DynamoHttpServer:
             # contents are stale, and the weight sync's flush_cache drops them.
             widened = sorted({t for _, w in targets for t in w})
             if set(widened) != set(tags):
-                logger.info("[DynamoHttpServer] sglang resume%s widened to %s so the shard "
-                            "does not rejoin discovery half-restored", list(tags), widened)
+                logger.info(
+                    "[DynamoHttpServer] sglang resume%s widened to %s so the shard "
+                    "does not rejoin discovery half-restored",
+                    list(tags),
+                    widened,
+                )
             outcomes = await self._sglang_control_fanout(
                 "resume_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
             )
@@ -433,8 +470,13 @@ class DynamoHttpServer:
                 else:
                     per_shard[idx].difference_update(wanted)
             self._refresh_node_released_view()
-            logger.info("[DynamoHttpServer] sglang resumed %s on %d/%d shard(s) (now released=%s)",
-                        widened, len(targets) - len(errors), len(targets), sorted(self._sglang_released_tags))
+            logger.info(
+                "[DynamoHttpServer] sglang resumed %s on %d/%d shard(s) (now released=%s)",
+                widened,
+                len(targets) - len(errors),
+                len(targets),
+                sorted(self._sglang_released_tags),
+            )
             if errors:
                 raise RuntimeError(
                     f"dynamo.sglang resume_memory_occupation failed on shard(s) {errors}; "
@@ -485,9 +527,34 @@ class DynamoHttpServer:
             return default
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+    def _check_sleep_mode_pairing(self) -> None:
+        """rollout.free_cache_engine=true requires rollout.enable_sleep_mode=true, on both engines.
+
+        Without sleep mode neither engine actually frees anything: vLLM's sleep() is a
+        silent no-op, and sglang's release_memory_occupation deregisters the worker but
+        keeps the memory (its memory saver is armed by --enable-memory-saver, which
+        follows enable_sleep_mode). The trainer would believe memory was freed while
+        nothing happened, then OOM later with no log line naming the cause.
+        """
+        if bool(getattr(self.config, "free_cache_engine", False)) and not bool(
+            getattr(self.config, "enable_sleep_mode", True)
+        ):
+            raise ValueError(
+                "rollout.free_cache_engine=true requires rollout.enable_sleep_mode=true for the "
+                "dynamo backend: without sleep mode vLLM sleep() is a silent no-op and sglang "
+                "release_memory_occupation frees nothing (--enable-memory-saver follows "
+                "enable_sleep_mode), so training would OOM with no error at the sleep site. "
+                "Set both true, or both false."
+            )
+
     def _free_engine_on_train(self) -> bool:
-        """Opt-in sleep/wake of the colocated engine workers around training."""
-        return self._dynamo_cfg_bool("free_engine_on_train", False)
+        """Sleep/wake of the colocated engine workers around training.
+
+        Mirrors verl's rollout.free_cache_engine (validated in __init__), so
+        the trainer-side release/resume gating and the dynamo-side engine
+        sleep/wake can never silently diverge.
+        """
+        return self._free_engine_on_train_flag
 
     def _enable_rl_mode(self) -> bool:
         """Enable Dynamo's RL/TITO-friendly mode (DYN_ENABLE_RL, both engines).
@@ -785,8 +852,8 @@ class DynamoHttpServer:
         """Spawn N dynamo.vllm (or dynamo.sglang) subprocesses on this node.
 
         Each subprocess is one DP shard; gets a contiguous TP-slice of GPUs
-        from cuda_visible_devices. CUDA_VISIBLE_DEVICES + VERL_DYNAMO_RANK_OFFSET
-        are passed in env so the vLLM WorkerExtension's _get_zmq_handle picks the
+        from cuda_visible_devices. CUDA_VISIBLE_DEVICES + VERL_ZMQ_BASE_TRAINER_RANK
+        are passed in env so verl's vLLM WorkerExtension's _get_zmq_handle picks the
         correct global rank for ZMQ-IPC weight bucket transfer (see §11.3).
 
         Everything downstream of the GPU slicing is engine-dependent and gated on
@@ -875,22 +942,9 @@ class DynamoHttpServer:
                     "a vLLM-only channel, so generation silently trains on re-encoded "
                     "text). Set it to false explicitly if you really intend that."
                 )
-            # The two halves of memory release are gated on different verl flags:
-            # --enable-memory-saver (arms torch_memory_saver) follows
-            # rollout.enable_sleep_mode, while the adapter's release/resume calls
-            # follow rollout.free_cache_engine. With sleep_mode off and
-            # free_cache_engine on, release_memory_occupation still runs -- dynamo
-            # deregisters the worker from discovery -- but frees nothing, and the
-            # trainer OOMs with no log line naming the cause. Refuse the split.
-            if is_sglang and getattr(self.config, "free_cache_engine", True) and not getattr(
-                self.config, "enable_sleep_mode", True
-            ):
-                raise ValueError(
-                    "engine=sglang: rollout.free_cache_engine=true requires "
-                    "rollout.enable_sleep_mode=true (it adds --enable-memory-saver; "
-                    "without it release_memory_occupation deregisters the worker but "
-                    "frees no GPU memory). Set both true, or both false."
-                )
+            # Re-checked here (not only in __init__) so a server constructed without
+            # __init__ -- the CPU unit tests -- still refuses the split.
+            self._check_sleep_mode_pairing()
             # KV events are what feed the KV router's index, on BOTH engines, and both
             # take the same vLLM-style --kv-events-config JSON. On sglang the engine's
             # own ZmqEventPublisher binds `endpoint` and dynamo's DynamoSglangPublisher
@@ -918,7 +972,11 @@ class DynamoHttpServer:
             env = os.environ.copy()
             env.update(self._dynamo_env_vars())
             env["CUDA_VISIBLE_DEVICES"] = worker_cvd
-            env[_RANK_OFFSET_ENV] = str(spec.rank_offset)
+            # verl's base vLLMColocateWorkerExtension._get_zmq_handle consumes
+            # this natively (int(base) + dp-resolved local rank; dynamo shards
+            # run dp=1 so the resolver is the identity) — the recipe no longer
+            # overrides _get_zmq_handle.
+            env["VERL_ZMQ_BASE_TRAINER_RANK"] = str(spec.rank_offset)
             env[_REPLICA_RANK_ENV] = str(spec.replica_rank)
             # Match verl's native vLLM colocated path: both trainer-side
             # BucketedWeightSender and vLLM-side BucketedWeightReceiver include
@@ -1148,7 +1206,7 @@ class DynamoHttpServer:
         self,
         served_model_name: str,
         tp: int,
-        kv_events_config_json: str,
+        kv_events_config_json: Optional[str] = None,
     ) -> list[str]:
         """Construct the dynamo.vllm CLI for one DP shard.
 
@@ -1156,7 +1214,7 @@ class DynamoHttpServer:
         so we can:
           1. inject ``--worker-extension-cls
              recipe.dynamo.dynamo_worker_extension.vLLMDynamoColocateWorkerExtension``
-             so the WorkerExtension reads VERL_DYNAMO_RANK_OFFSET in
+             so the WorkerExtension reads VERL_ZMQ_BASE_TRAINER_RANK in
              _get_zmq_handle (§11.3 of design doc).
           2. start a control ZMQ listener for engine.collective_rpc bridge.
         """
@@ -1204,7 +1262,9 @@ class DynamoHttpServer:
         if not executor_backend:
             executor_backend = "uni" if tp == 1 else "mp"
         cmd += ["--distributed-executor-backend", str(executor_backend)]
-        cmd += ["--kv-events-config", kv_events_config_json]
+        # Same contract as the sglang builder: no config -> no flag (enable_kv_events=false).
+        if kv_events_config_json:
+            cmd += ["--kv-events-config", kv_events_config_json]
         # Pass through extra args from rollout.engine_kwargs.dynamo.extra_args.
         extra = self._dynamo_cfg().get("extra_args") or []
         if isinstance(extra, list):
@@ -1328,6 +1388,13 @@ class DynamoHttpServer:
             return
         env = os.environ.copy()
         env.update(self._dynamo_env_vars())
+        # In RL mode the frontend binds an extra "RL worker discovery" listener
+        # on DYN_RL_PORT (default 8001, dynamo service_v2.rs). With two pools
+        # on one node (separate_async: hybrid on trainer GPUs + standalone on
+        # rollout GPUs) the fixed default collides and the second frontend
+        # exits rc=1 — allocate a free port per pool.
+        if "DYN_RL_PORT" not in env:
+            env["DYN_RL_PORT"] = str(self._allocate_tcp_port(bind_wildcard=True))
 
         cmd = [
             sys.executable,
@@ -1617,23 +1684,41 @@ class DynamoHttpServer:
         image_data=None,
         video_data=None,
         priority: int = 0,
+        audio_data=None,
+        mm_processor_kwargs=None,
+        **kwargs,
     ):
         """Dispatch generation through the Dynamo frontend HTTP router.
 
         The actor only manages the subprocess stack; token generation goes
         through the OpenAI-style frontend so Dynamo can route across registered
-        workers. Engine-agnostic — the frontend hides which engine is behind it.
+        workers. Engine-agnostic: the frontend hides which engine is behind it.
+
+        Remaining kwargs from verl clients (e.g. priority scheduling hints)
+        are accepted and ignored; Dynamo's KV router owns request scheduling.
+        Multimodal inputs are rejected loudly: silently dropping them would
+        train on text-only prompts while reporting success.
         """
-        if image_data is not None or video_data is not None:
+        if image_data is not None or video_data is not None or audio_data is not None or mm_processor_kwargs:
             return self._build_token_output(
                 stop_reason="error: Dynamo frontend generate does not support multimodal inputs",
             )
+
+        # Partial rollout: while the engines are paused (abort_all_requests),
+        # answer immediately with an empty aborted output instead of parking
+        # the coroutine. FullyAsyncLLMServerClient polls with a 1s retry loop,
+        # so parked coroutines would only pin this actor's max_concurrency
+        # slots — with every in-flight trajectory parked, the control calls
+        # that eventually open the gate (resume_generation) could never be
+        # scheduled, deadlocking the first on_step_end.
+        include_log_probs = bool(sampling_params.get("logprobs", False))
+        if not self._generation_resumed.is_set():
+            return self._aborted_output(include_log_probs)
 
         if self._use_direct_generate():
             return await self._generate_direct(prompt_ids, sampling_params, request_id)
 
         try:
-            include_log_probs = bool(sampling_params.get("logprobs", False))
             request_id = request_id or f"dynamo-{time.time_ns()}"
             payload = self._build_frontend_completion_payload(prompt_ids, sampling_params, request_id)
             status, body_text = await self._frontend_post(payload, request_id)
@@ -1656,6 +1741,18 @@ class DynamoHttpServer:
                 )
             return self._completion_response_to_token_output(json.loads(body_text), include_log_probs=include_log_probs)
         except Exception:
+            if not self._generation_resumed.is_set():
+                # The engines are paused (abort_all_requests): an in-flight
+                # request whose frontend response errored out was almost
+                # certainly killed by the pause. Report it as aborted-empty so
+                # FullyAsyncLLMServerClient retries after resume instead of
+                # failing the trajectory. (A clean abort response still
+                # returns partial tokens via finish_reason="abort".)
+                logger.warning(
+                    "[generate] frontend dispatch failed while engines are paused; treating as aborted (request_id=%s)",
+                    request_id,
+                )
+                return self._aborted_output(include_log_probs)
             logger.exception("[generate] frontend dispatch failed (request_id=%s)", request_id)
             raise
 
@@ -1858,7 +1955,7 @@ class DynamoHttpServer:
             return self._build_token_output(
                 token_ids=token_ids,
                 log_probs=log_probs,
-                stop_reason="completed" if result.get("finish_reason") else None,
+                stop_reason=self._map_finish_reason(result.get("finish_reason")),
             )
         except Exception:
             logger.exception("[generate] direct sidecar request failed (request_id=%s)", request_id)
@@ -1940,8 +2037,13 @@ class DynamoHttpServer:
         if tokenizer is None:
             raise RuntimeError("model_config.tokenizer is required for Dynamo frontend generation")
         self._log_engine_data_token_ids_status(choice, data)
-        token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
-        engine_token_ids = token_ids is not None
+        finish_reason = choice.get("finish_reason")
+        is_aborted = self._map_finish_reason(finish_reason) == "aborted"
+
+        token_ids = self._extract_completion_token_ids(
+            choice, data, tokenizer, allow_text_mapping=not include_log_probs
+        )
+        used_text_fallback = token_ids is None
         if token_ids is None:
             if self._request_completion_token_ids():
                 # Token ids were explicitly requested and the frontend still returned
@@ -1964,9 +2066,9 @@ class DynamoHttpServer:
                 )
             token_ids = normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
         if not token_ids:
+            if is_aborted:
+                return self._aborted_output(include_log_probs)
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
-        log_probs = self._extract_completion_log_probs(choice, len(token_ids), data) if include_log_probs else None
-        finish_reason = choice.get("finish_reason")
         # Guard against ai-dynamo/dynamo#14302: from 1.4.1 the sglang worker strips
         # the matched stop token from completion_token_ids on finish_reason=stop
         # while usage.completion_tokens still counts it. The trainer would then
@@ -1978,7 +2080,7 @@ class DynamoHttpServer:
         # fifty steps later. Aborted responses are exempt: their arrays are partial.
         usage_tokens = (data.get("usage") or {}).get("completion_tokens")
         if (
-            engine_token_ids
+            not used_text_fallback
             and finish_reason in ("stop", "length")
             and isinstance(usage_tokens, int)
             and usage_tokens != len(token_ids)
@@ -1990,17 +2092,51 @@ class DynamoHttpServer:
                 "stripped from completion_token_ids in dynamo>=1.4.1; fixed by #14317). Refusing to "
                 f"train on it. Response head: {str(data)[:300]}"
             )
-        if finish_reason == "stop" or finish_reason == "length":
-            stop_reason = "completed"
-        elif finish_reason == "abort":
-            stop_reason = "aborted"
-        else:
-            stop_reason = finish_reason
 
+        log_probs = None
+        if include_log_probs:
+            if used_text_fallback:
+                if is_aborted:
+                    return self._aborted_output(include_log_probs)
+                # Re-encoded text token ids have no correspondence with the
+                # sampled tokens the frontend logprobs describe — aligning them
+                # would be silent data corruption. Point at the config instead.
+                raise RuntimeError(
+                    "calculate_log_probs=True requires a real token-id channel, but this response "
+                    "had no parseable token ids (text re-encode fallback). Enable "
+                    "engine_kwargs.dynamo.request_engine_data (or return_tokens_as_token_ids), "
+                    "or disable calculate_log_probs."
+                )
+            try:
+                # vLLM engine_data is exact -> strict; sglang is known to short
+                # one logprob (dynamo#11640 area) -> loud mean-pad until the
+                # patched channel is verified exact.
+                log_probs = self._extract_completion_log_probs(
+                    choice, len(token_ids), data, strict=not self._is_sglang()
+                )
+                if log_probs is None:
+                    # No trustworthy logprob source at all (no engine_data
+                    # channel, no frontend token_logprobs, or — sglang
+                    # non-strict path — zero usable values after padding).
+                    # Deferring this produces log_probs=None TokenOutputs that
+                    # starve or crash the training consumer far from the root
+                    # cause.
+                    raise RuntimeError(
+                        "calculate_log_probs is enabled but the response carries no usable logprob "
+                        "source (neither nvext.engine_data.completion_logprobs nor "
+                        "choice.logprobs.token_logprobs yielded values). Enable "
+                        "engine_kwargs.dynamo.request_engine_data or fix the frontend config."
+                    )
+            except RuntimeError:
+                if is_aborted:
+                    # Partial data from an aborted request with inconsistent
+                    # logprobs is untrusted — drop it and let the client retry.
+                    return self._aborted_output(include_log_probs)
+                raise
         return self._build_token_output(
             token_ids=token_ids,
             log_probs=log_probs,
-            stop_reason=stop_reason,
+            stop_reason=self._map_finish_reason(finish_reason),
         )
 
     def _log_engine_data_token_ids_status(self, choice: dict[str, Any], response: dict[str, Any]):
@@ -2029,26 +2165,69 @@ class DynamoHttpServer:
             )
             self._logged_missing_engine_data = True
 
+    def _aborted_output(self, include_log_probs: bool = False):
+        """Empty TokenOutput with stop_reason "aborted".
+
+        Returned when abort_all_requests cut a request short (partial rollout) and no
+        trustworthy partial data exists, so FullyAsyncLLMServerClient retries the same
+        prompt after resume. Never pad fallback tokens here. ``log_probs`` is an empty
+        list when the caller asked for logprobs so the (token_ids, log_probs) length
+        invariant holds.
+        """
+        return self._build_token_output(
+            token_ids=[],
+            log_probs=[] if include_log_probs else None,
+            stop_reason="aborted",
+            allow_empty=True,
+        )
+
+    @staticmethod
+    def _map_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
+        """OpenAI finish_reason -> verl stop_reason; one rule for both engines and both
+        dispatch paths (frontend and direct).
+
+        ai-dynamo's handlers normalize vLLM's "abort" to "cancelled"
+        (dynamo.common.utils.engine_response.normalize_finish_reason) before the Rust
+        frontend serializes the response; both mean the request was cut short, so
+        partial-rollout resume triggers instead of a truncated trajectory silently
+        entering training as completed. Unknown reasons pass through unchanged.
+        """
+        if finish_reason in ("stop", "length"):
+            return "completed"
+        if finish_reason in ("abort", "cancelled"):
+            return "aborted"
+        return finish_reason
+
     def _build_token_output(
         self,
         token_ids: Optional[list[int]] = None,
         log_probs: Optional[list[float]] = None,
         stop_reason: Optional[str] = None,
+        allow_empty: bool = False,
     ):
         """Build a verl TokenOutput while preserving AgentLoop shape invariants."""
         from verl.workers.rollout.replica import TokenOutput
 
-        token_ids = token_ids or self._fallback_token_ids()
-        if log_probs is not None:
-            if len(log_probs) < len(token_ids):
-                log_probs = log_probs + [0.0] * (len(token_ids) - len(log_probs))
-            elif len(log_probs) > len(token_ids):
-                log_probs = log_probs[: len(token_ids)]
+        if not allow_empty:
+            token_ids = token_ids or self._fallback_token_ids()
+        else:
+            token_ids = token_ids or []
+        if log_probs is not None and len(log_probs) != len(token_ids):
+            raise RuntimeError(
+                f"log_probs/token_ids length mismatch ({len(log_probs)} vs {len(token_ids)}); "
+                "refusing to pad/truncate (fake logprobs would corrupt training data)."
+            )
+        # Empty (aborted-before-first-token) outputs carry NO version tag:
+        # the client aggregates min/max_global_steps per attempt regardless of
+        # token count, so tagging a token-less attempt inflates trajectory
+        # version-span metrics. FullyAsyncLLMServerClient only registers
+        # non-None versions, so omitting the key skips the attempt cleanly.
+        extra_fields = {"global_steps": self.global_steps or 0} if token_ids else {}
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             stop_reason=stop_reason,
-            extra_fields={"global_steps": self.global_steps or 0},
+            extra_fields=extra_fields,
         )
 
     def _fallback_token_ids(self) -> list[int]:
@@ -2103,11 +2282,17 @@ class DynamoHttpServer:
         choice: dict[str, Any],
         response: Optional[dict[str, Any]] = None,
         tokenizer: Optional[Any] = None,
+        allow_text_mapping: bool = True,
     ) -> Optional[list[int]]:
         """Extract nvext / OpenAI-extension token ids when available.
 
         Covers both channels: ``engine_data`` (vllm) and the top-level
         ``completion_token_ids`` (the only one sglang populates).
+
+        ``allow_text_mapping=False`` disables the per-token text->id mapping
+        channel: it is CONTENT-dependent (tokens like "" don't round-trip),
+        so ids recovered through it cannot be trusted to align with logprobs.
+        The exact ``token_id:N`` string parse stays available either way.
         """
         from verl.utils.tokenizer import normalize_token_ids
 
@@ -2183,7 +2368,7 @@ class DynamoHttpServer:
             token_ids_from_strings = DynamoHttpServer._parse_token_id_strings(token_strings)
             if token_ids_from_strings is not None:
                 return token_ids_from_strings
-            if tokenizer is not None:
+            if tokenizer is not None and allow_text_mapping:
                 return DynamoHttpServer._encode_logprob_token_strings(token_strings, tokenizer)
         return None
 
@@ -2235,6 +2420,7 @@ class DynamoHttpServer:
         choice: dict[str, Any],
         token_count: int,
         response: Optional[dict[str, Any]] = None,
+        strict: bool = True,
     ) -> Optional[list[float]]:
         """Extract selected-token logprobs from OpenAI completions response."""
         for nvext in ((response or {}).get("nvext"), choice.get("nvext")):
@@ -2245,7 +2431,16 @@ class DynamoHttpServer:
                 continue
             values = engine_data.get("completion_logprobs")
             if isinstance(values, list):
-                return DynamoHttpServer._normalize_log_probs(values, token_count)
+                return DynamoHttpServer._normalize_log_probs(values, token_count, strict=strict)
+            if isinstance(engine_data.get("completion_token_ids"), list):
+                # dynamo's handler omits completion_logprobs when its own
+                # token/logprob accounting misaligned (documented degradation).
+                # The frontend-aggregated token_logprobs come from a different
+                # accumulator — even a length match would be untrustworthy.
+                raise RuntimeError(
+                    "dynamo omitted engine_data.completion_logprobs (server-side token/logprob "
+                    "misalignment, see worker log); refusing cross-provenance frontend logprobs."
+                )
 
         logprobs = choice.get("logprobs")
         if not isinstance(logprobs, dict):
@@ -2255,7 +2450,7 @@ class DynamoHttpServer:
             values = logprobs.get("logprobs")
         if values is None:
             return None
-        return DynamoHttpServer._normalize_log_probs(values, token_count)
+        return DynamoHttpServer._normalize_log_probs(values, token_count, strict=strict)
 
     # Count of responses whose logprobs had to be padded. Class-level because
     # _normalize_log_probs is a staticmethod shared by every replica in the process.
@@ -2284,14 +2479,37 @@ class DynamoHttpServer:
         return sum(observed) / len(observed)
 
     @staticmethod
-    def _normalize_log_probs(values: list[Any], token_count: int) -> Optional[list[float]]:
-        """Pad/truncate selected-token logprobs to match token ids.
+    def _normalize_log_probs(values: list[Any], token_count: int, strict: bool = True) -> Optional[list[float]]:
+        """Validate (strict) or loudly pad (non-strict) selected-token logprobs.
 
-        Padding is LOUD and non-catastrophic. See _logprob_fill_value for why the pad
-        value is the sequence mean and not 0.0. The padding itself is a symptom: the
-        engine returns one fewer logprob than token ids, and the real
-        fix belongs on the dynamo side.
+        Per-engine policy:
+        - strict=True (vLLM): fail fast on length mismatch or None entries. A
+          padded value is a fake logprob that silently poisons
+          rollout_log_probs -- under rollout_correction bypass_mode it feeds
+          the policy-loss ratio directly. The vLLM engine_data channel is
+          exact, so any mismatch is a real defect upstream.
+        - strict=False (sglang): the engine is known to return one fewer
+          logprob than token ids (dynamo#11640 area); pad LOUDLY with the
+          sequence mean (see _logprob_fill_value for why not 0.0) and report.
+          Returns None when nothing usable was observed. Tighten to strict
+          once the sglang channel is verified exact under the patched image.
         """
+        if strict:
+            if len(values) != token_count:
+                raise RuntimeError(
+                    f"Dynamo returned {len(values)} logprobs for {token_count} tokens; "
+                    "refusing to pad/truncate (fake logprobs would corrupt training data)."
+                )
+            checked: list[float] = []
+            for index, value in enumerate(values):
+                if value is None:
+                    raise RuntimeError(
+                        f"Dynamo returned a None logprob at position {index}/{token_count}; "
+                        "refusing to substitute 0.0 (probability 1.0) for a real value."
+                    )
+                checked.append(float(value))
+            return checked
+
         raw = list(values[:token_count])
         observed = [float(v) for v in raw if v is not None]
         fill = DynamoHttpServer._logprob_fill_value(observed)
@@ -2309,15 +2527,11 @@ class DynamoHttpServer:
         result.extend([fill] * n_pad)
 
         if n_none or n_pad:
-            DynamoHttpServer._report_logprob_padding(
-                token_count - n_none - n_pad, token_count, n_none, n_pad, fill
-            )
+            DynamoHttpServer._report_logprob_padding(token_count - n_none - n_pad, token_count, n_none, n_pad, fill)
         return result
 
     @staticmethod
-    def _report_logprob_padding(
-        usable: int, total: int, n_none: int, n_pad: int, fill: Optional[float]
-    ) -> None:
+    def _report_logprob_padding(usable: int, total: int, n_none: int, n_pad: int, fill: Optional[float]) -> None:
         cls = DynamoHttpServer
         cls._logprob_padding_events += 1
         n = cls._logprob_padding_events
@@ -2326,8 +2540,11 @@ class DynamoHttpServer:
                 "[logprobs] engine returned %d/%d usable logprobs (None=%d, missing=%d); "
                 "filling with %s. rollout_probs_diff_* / rollout_actor_probs_pearson_corr / "
                 "rollout_corr/k3_kl are NOT trustworthy for these samples. occurrence=%d",
-                usable, total, n_none, n_pad,
-                "sequence mean %.4f" % fill if fill is not None else "nothing (returning None)",
+                usable,
+                total,
+                n_none,
+                n_pad,
+                f"sequence mean {fill:.4f}" if fill is not None else "nothing (returning None)",
                 n,
             )
 
@@ -2424,8 +2641,9 @@ class DynamoHttpServer:
             logger.info("[DynamoHttpServer] wake_up: no control sidecar, skipping")
             return
         # bridge to engine.wake_up via control sidecar (engine method,
-        # not collective_rpc — handled in sidecar).
-        await self._engine_method_all("wake_up", kwargs=kwargs)
+        # not collective_rpc — handled in sidecar). Weight/KV re-onlining can
+        # exceed the default 120s on large models.
+        await self._engine_method_all("wake_up", kwargs=kwargs, timeout=600)
 
     async def sleep(self, **kwargs):
         # NB: no node_rank guard — each per-node server sleeps its OWN local
@@ -2458,7 +2676,7 @@ class DynamoHttpServer:
         # weights from CPU and a refit is not required to make the engine usable
         # again. Level 2 would discard them outright.
         kwargs.setdefault("level", 1)
-        await self._engine_method_all("sleep", kwargs=kwargs)
+        await self._engine_method_all("sleep", kwargs=kwargs, timeout=600)
 
     async def clear_kv_cache(self):
         if self._is_sglang():
@@ -2472,37 +2690,32 @@ class DynamoHttpServer:
         self.global_steps = global_steps
 
     async def release_kv_cache(self):
-        """Release only kv_cache GPU memory, keeping model weights intact.
+        """Pre-weight-sync hook, per engine.
 
-        Called by CheckpointEngineManager before backends like NCCL or NIXL
-        rebuild process groups. Dynamo's per-node sidecars route this through
-        the standard reset_prefix_cache path; the engine keeps weights
-        resident (sleep_level=1 from DynamoRollout) so the trainer can write
-        through to live tensors.
+        vLLM: parity no-op — the KV cache contents were already invalidated by
+        abort_all_requests (pause_generation with clear_cache=True) one step
+        earlier in the CheckpointEngineManager choreography, and the KV pool
+        GPU memory stays resident, same as upstream vLLM's stub (TODO
+        upstream: true KV release).
 
-        SGLang is the exception: it releases KV memory *for real* via
-        release_memory_occupation(tags=["kv_cache"]), so resume_kv_cache() below
-        has actual work to do on that path.
+        SGLang releases KV memory *for real* via
+        release_memory_occupation(tags=["kv_cache"]), so resume_kv_cache()
+        below has actual work to do on that path.
         """
         if self._is_sglang():
             await self.sglang_release(["kv_cache"])
-            return
-        if not self._control_endpoints:
-            return
-        await self._engine_method_all("reset_prefix_cache")
+        return None
 
     async def resume_kv_cache(self):
-        """Restore kv_cache GPU memory after a weight sync.
+        """Post-weight-sync counterpart to release_kv_cache.
 
-        Counterpart to release_kv_cache(). On the vLLM path Dynamo never truly
-        releases KV memory (sleep_level=1 keeps weights resident; reset_prefix_cache
-        only drops the cache contents), so there is nothing to resume. SGLang does
-        really release it, and also unregisters the worker from discovery, so the
-        resume is what puts the shard back into the routing pool.
+        vLLM: parity stub. SGLang really released the memory and also
+        unregistered the worker from discovery, so the resume is what puts
+        the shard back into the routing pool.
         """
         if self._is_sglang():
             await self.sglang_resume(["kv_cache"])
-        return
+        return None
 
     async def wait_for_requests_to_drain(self):
         # vllm only. dynamo.sglang's /engine/control/* surface has no drain
@@ -2543,20 +2756,121 @@ class DynamoHttpServer:
                 )
         logger.info("[DynamoHttpServer] sglang control plane OK on %s shard(s)", len(clients))
 
+    async def probe_logprob_channel(self):
+        """Startup probe: verify a trustworthy logprob source end-to-end.
+
+        With calculate_log_probs on, a missing token-id/logprob channel only
+        surfaces as per-request errors — the trainer then waits forever for
+        trajectories that never arrive (silent hang). One probe request at
+        launch turns that into an immediate, actionable startup failure.
+        """
+        probe_id = f"logprob-probe-{time.time_ns()}"
+        # Right after "workers registered" the frontend's model registration
+        # can still be propagating (observed: 404 with empty body ~16ms after
+        # the health check passes). Retry within a window; deterministic
+        # config errors just re-raise after the deadline — still fail-fast
+        # relative to a training-time hang. Each attempt is HARD-capped with
+        # asyncio.wait_for: without it, a connected-but-unresponsive frontend
+        # holds the probe for the full request_timeout_s (600s default,
+        # 1800s in the recommended config) and the deadline never fires.
+        window_s = float(self._dynamo_cfg().get("logprob_probe_timeout_s", 60))
+        deadline = time.monotonic() + window_s
+        last_error: Optional[BaseException] = None
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if isinstance(last_error, asyncio.TimeoutError):
+                    raise RuntimeError(
+                        f"logprob channel probe timed out after {window_s}s: the frontend accepted "
+                        "connections but never answered the probe request"
+                    ) from last_error
+                raise last_error if last_error is not None else RuntimeError("logprob probe never ran")
+            try:
+                output = await asyncio.wait_for(
+                    self.generate(
+                        prompt_ids=self._fallback_token_ids(),
+                        sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
+                        request_id=probe_id,
+                        thunderagent_session_id=probe_id,
+                    ),
+                    timeout=max(1.0, min(15.0, remaining)),
+                )
+                break
+            except (RuntimeError, asyncio.TimeoutError) as error:
+                last_error = error
+                await asyncio.sleep(min(2.0, max(0.0, deadline - time.monotonic())))
+        if output.log_probs is None or len(output.log_probs) != len(output.token_ids):
+            raise RuntimeError(
+                f"logprob channel probe failed: got log_probs={output.log_probs!r} for {len(output.token_ids)} tokens"
+            )
+        finalize = getattr(self, "finalize_program", None)
+        if finalize is not None:
+            await finalize(probe_id)
+        logger.info("[DynamoHttpServer] logprob channel probe OK")
+
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # dynamo exposes no global abort on the vllm path, so that one returns a
-        # no-op result rather than raising, keeping
-        # RolloutReplica.abort_all_requests's gather intact.
-        # sglang does have one: tokenizer_manager.abort_request(abort_all=True),
-        # which is what partial rollout needs before a non-naive weight sync.
+        """Abort every in-flight request on this node's engine shards and leave them paused.
+
+        sglang: native ``tokenizer_manager.pause_generation(mode="abort")`` over the
+        /engine/control plane. vLLM: ``AsyncLLM.pause_generation`` bridged through each
+        shard's control sidecar. On both engines the resume gate closes first, so new and
+        client-retried generate() calls answer aborted-empty until resume_generation().
+        """
+        # sglang: native pause for V1 partial rollout. The engine-agnostic
+        # resume gate closes FIRST (new and client-retried generate() calls
+        # answer aborted-empty at the actor, never park), then sglang's
+        # async tokenizer_manager.pause_generation(mode="abort") clears the
+        # in-flight requests and pauses intake — the same call verl's native
+        # V1 sglang server uses. NOT abort_request: that one is a sync method
+        # returning None and dynamo's passthrough awaits results
+        # unconditionally (HTTP 500 "can't await NoneType", first
+        # colocate_async run). flush_cache stays after the pause: sglang's
+        # flush no-ops while requests are running. resume_generation()
+        # reopens intake + the gate (choreography step 8 in V0 and V1 alike).
         if self._is_sglang():
-            await self._sglang_control_all("abort_request", rid="", abort_all=True)
+            self._generation_resumed.clear()
+            await self._sglang_control_all("pause_generation", mode="abort")
             if reset_prefix_cache:
                 await self._sglang_control_all("flush_cache")
-            return {"aborted_count": -1, "request_ids": []}
-        return {"aborted_count": 0, "request_ids": []}
+            return {"aborted_count": -1, "request_ids": [], "paused": True}
+        # vLLM: bridge AsyncLLM.pause_generation (vLLM >= 0.12) through each shard's
+        # control sidecar -- aborts in-flight requests (the frontend returns their
+        # partial tokens with finish_reason "abort"), drains, optionally clears
+        # caches, and leaves the engines paused.
+        if self._use_direct_generate():
+            # The debug direct-generate path holds the sidecar's single
+            # in-flight REP slot for the whole generation, so the pause
+            # request would queue behind every running generation and time
+            # out. Incompatible with abort semantics — fail fast.
+            raise RuntimeError(
+                "engine_kwargs.dynamo.direct_generate=true is incompatible with abort_all_requests "
+                "(V1 async trainers pause engines every step); disable direct_generate."
+            )
+        self._generation_resumed.clear()
+        if not self._control_endpoints:
+            logger.info("[DynamoHttpServer] abort_all_requests: no control sidecar, skipping")
+            return {"aborted_count": 0, "request_ids": [], "paused": False}
+        # Pause failures must raise: sleeping (weight-offloading) an engine
+        # that still has active requests is undefined behavior.
+        await self._engine_method_all(
+            "pause_generation",
+            kwargs={"wait_for_inflight_requests": False, "clear_cache": reset_prefix_cache},
+            timeout=600,
+        )
+        logger.info("[DynamoHttpServer] abort_all_requests: engines paused (node=%s)", self.node_rank)
+        return {"aborted_count": None, "request_ids": [], "paused": True}
 
     async def resume_generation(self):
+        """Resume request intake after abort_all_requests."""
+        if self._is_sglang():
+            # Counterpart to pause_generation(mode="abort"): without it the
+            # engine stays paused and every post-sync generation queues
+            # forever behind a closed intake.
+            await self._sglang_control_all("continue_generation")
+        if self._control_endpoints:
+            await self._engine_method_all("resume_generation", timeout=120)
+        self._generation_resumed.set()
+        logger.info("[DynamoHttpServer] resume_generation: gate open (node=%s)", self.node_rank)
         return None
 
     async def start_profile(self, **kwargs):
@@ -2569,10 +2883,15 @@ class DynamoHttpServer:
             await self._sglang_control_all("stop_profile")
         return None
 
-    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None):
+    async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None, timeout: float = 600):
         """Like collective_rpc but invokes a top-level AsyncLLM method
-        (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
-        not a worker-extension RPC. Distinguished by message kind.
+        (wake_up / sleep / pause_generation / resume_generation /
+        reset_prefix_cache / wait_for_requests_to_drain), not a
+        worker-extension RPC. Distinguished by message kind.
+
+        Raises RuntimeError when any shard reports failure — a silently
+        skipped sleep/pause leaves the engine in a state the trainer no
+        longer agrees with (e.g. sleeping an engine with active requests).
 
         vllm only, and a silent no-op elsewhere: with no control endpoints (the
         sglang path, or a slave before launch) it returns None, so every caller
@@ -2594,6 +2913,7 @@ class DynamoHttpServer:
             "kind": "engine_method",
             "method": method,
             "kwargs": kwargs or {},
+            "timeout": timeout,
         }
 
         async def _call_one(idx: int, ep: str) -> None:
@@ -2602,15 +2922,10 @@ class DynamoHttpServer:
             try:
                 sock.connect(ep)
                 await sock.send(pickle.dumps(req))
-                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=600)
+                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=timeout)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
-                    logger.warning(
-                        "[DynamoHttpServer] engine_method %s failed @ %s: %s",
-                        method,
-                        ep,
-                        reply.get("error"),
-                    )
+                    raise RuntimeError(f"engine_method {method} failed @ {ep}: {reply.get('error')}")
             finally:
                 sock.close()
 
@@ -2869,6 +3184,17 @@ class DynamoReplica(RolloutReplica):
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
 
+    async def sleep(self):
+        """Drain in-flight requests before the weight-offloading sleep.
+
+        Mirrors vLLMReplica.sleep: the base class would sleep immediately,
+        which is undefined behavior when requests are still active (e.g. the
+        colocated-reward-model validation path sleeps without an abort).
+        Unlike vLLM, dynamo servers are per-node — drain every one of them.
+        """
+        await asyncio.gather(*[server.wait_for_requests_to_drain.remote() for server in self.servers])
+        await asyncio.gather(*[server.sleep.remote() for server in self.servers])
+
     async def init_hybrid_worker_pool(self, worker_group):
         """Initialize Dynamo as worker pool for all rollout GPUs.
 
@@ -3001,6 +3327,62 @@ class DynamoReplica(RolloutReplica):
             actors.append(actor)
         return actors
 
+    async def init_standalone_pool(self):
+        """Standalone shared worker pool over rollout.nnodes × n_gpus_per_node.
+
+        Mirrors verl's RolloutReplica.init_standalone but at POOL granularity:
+        one resource pool + one CheckpointEngineWorker per rollout GPU (they
+        receive weights over the checkpoint-engine first hop and forward them
+        node-locally via CUDA-IPC), then the same shared master/slave dynamo
+        stack as hybrid — one etcd/nats/frontend for the whole pool.
+        """
+        from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
+        from verl.utils.device import get_device_name
+
+        self.rollout_mode = RolloutMode.STANDALONE
+        pool_nnodes = self.config.nnodes
+        pool_gpus_per_node = self.config.n_gpus_per_node
+        assert pool_nnodes > 0 and pool_gpus_per_node > 0, (
+            "standalone dynamo pool requires rollout.nnodes > 0 and rollout.n_gpus_per_node > 0"
+        )
+
+        resource_pool_name = f"dynamo_rollout_pool_{self.replica_rank}{self.name_suffix}"
+        resource_pool_manager = ResourcePoolManager(
+            resource_pool_spec={resource_pool_name: [pool_gpus_per_node] * pool_nnodes},
+            mapping=None,
+            max_colocate_count=2,
+        )
+        resource_pool_manager.create_resource_pool()
+        self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]
+
+        # Same actor class and init args as RolloutReplica.get_ray_class_with_init_args,
+        # plus a marker the adapters use to recognise the standalone pool. They cannot
+        # infer it from replica_rank: the hybrid path (_spawn_rollout_checkpoint_engine_
+        # workers) passes a per-logical-replica replica_rank to its workers as well.
+        ray_cls_with_init = RayClassWithInitArgs(
+            cls=ray.remote(CheckpointEngineWorker),
+            rollout_config=self.config,
+            model_config=self.model_config,
+            replica_rank=self.replica_rank,
+            dynamo_standalone_pool=True,
+        )
+        worker_group = RayWorkerGroup(
+            resource_pool=self.resource_pool,
+            ray_cls_with_init=ray_cls_with_init,
+            bin_pack=False,
+            name_prefix=f"dynamo_rollout_standalone_{self.replica_rank}{self.name_suffix}",
+            use_gpu=True,
+            device_name=get_device_name(),
+        )
+        self.workers = worker_group.workers
+
+        assert len(self.workers) % self.world_size == 0, (
+            f"standalone pool size {len(self.workers)} must be divisible by "
+            f"dynamo logical replica world_size {self.world_size}"
+        )
+        num_logical_replicas = len(self.workers) // self.world_size
+        await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
+
     async def _launch_shared_worker_pool(self, num_logical_replicas: int):
         """Launch a single frontend backed by all logical replica workers."""
         from verl.utils.device import get_resource_name
@@ -3057,12 +3439,20 @@ class DynamoReplica(RolloutReplica):
                 )
                 for shard_idx in range(len(gpu_ids) // tp):
                     shard_gpus = gpu_ids[shard_idx * tp : (shard_idx + 1) * tp]
+                    # POOL-global replica id (self.replica_rank carries the
+                    # LLMServerManager start_rank offset): the engine-side ZMQ
+                    # socket is named replica-{VERL_REPLICA_RANK}-rank-{...}
+                    # and must (a) match the CE-sender side, which derives the
+                    # same pool-global id, and (b) never collide with the other
+                    # pool's engines when hybrid + standalone share a node in
+                    # separate_async.
+                    global_replica_rank = self.replica_rank + logical_replica_rank
                     node_to_specs[node_id].append(
                         {
-                            "replica_rank": logical_replica_rank,
+                            "replica_rank": global_replica_rank,
                             "cuda_visible_devices": ",".join(shard_gpus),
                             "rank_offset": shard_idx * tp,
-                            "label": f"replica{logical_replica_rank}_shard{shard_idx}",
+                            "label": f"replica{global_replica_rank}_shard{shard_idx}",
                         }
                     )
 
@@ -3132,6 +3522,8 @@ class DynamoReplica(RolloutReplica):
 
         await master.wait_frontend_ready.remote(expected_workers=expected_workers)
         await master._self_test_refit_path.remote()
+        if bool(getattr(self.config, "calculate_log_probs", False)):
+            await master.probe_logprob_channel.remote()
         self._server_handle = master
         self._server_address = f"[{fe_host}]:{fe_port}" if is_valid_ipv6_address(fe_host) else f"{fe_host}:{fe_port}"
         logger.info(
@@ -3143,11 +3535,12 @@ class DynamoReplica(RolloutReplica):
         )
 
     async def launch_servers(self):
+        """Dynamo uses NeMo-style worker-pool entrypoints instead."""
         raise RuntimeError(
             "DynamoReplica.launch_servers() is disabled because the dynamo "
             "backend uses a single shared worker pool. Call "
-            "DynamoReplica.init_hybrid_worker_pool(worker_group) via "
-            "AgentLoopManager instead."
+            "DynamoReplica.init_hybrid_worker_pool(worker_group) or "
+            "init_standalone_pool() via DynamoLLMServerManager instead."
         )
 
 

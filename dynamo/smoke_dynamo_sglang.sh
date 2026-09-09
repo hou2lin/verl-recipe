@@ -100,13 +100,11 @@ export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 # dynamo_rollout.ServerAdapter dispatches on that key, so there is no sglang-specific
 # registry name, trainer yaml or entry point.
 #
-# Entry point is verl.trainer.main_ppo with trainer.use_v1=False. That flag is a
-# core-verl constraint, not an sglang one: at this checkout (6cbca9ce) the default
-# TaskRunnerV1 builds a TensorDict (ppo/v1/trainer_base.py:988) and hands it to
-# agent_loop.generate_sequences, which still does prompts.non_tensor_batch ->
-#   AttributeError: 'TensorDict' object has no attribute 'non_tensor_batch'
-# It breaks the vLLM dynamo path identically; the v0 TaskRunner still passes
-# DataProto. (recipe.dynamo.main_dynamo remains as a shim that pins the same.)
+# Entry point is verl.trainer.main_ppo with trainer.use_v1=False: this smoke exercises
+# the legacy V0 agent-loop path (dynamo_trainer preset, DynamoAgentLoopManager), the
+# same for both engines. The V1 unified trainer has its own sglang smokes
+# (smoke_dynamo_v1_colocate_sglang.sh, smoke_dynamo_v1_separate_sglang.sh) and
+# refuses DynamoAgentLoopManager.
 COMMON_ARGS=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False

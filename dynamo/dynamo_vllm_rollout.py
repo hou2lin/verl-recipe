@@ -30,15 +30,14 @@ from typing import Any, Optional
 
 import ray
 import torch
+from recipe.dynamo.dynamo_naming import control_actor_name
 
 from verl.workers.rollout.vllm_rollout.vllm_rollout import (
     ServerAdapter as _VllmServerAdapter,
 )
 
-from recipe.dynamo.dynamo_naming import control_actor_name
-
-
 logger = logging.getLogger(__name__)
+
 
 class VllmDynamoServerAdapter(_VllmServerAdapter):
     """Per-rank dynamo client for the vLLM engine.
@@ -49,11 +48,40 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
     """
 
     def __init__(self, *args, **kwargs):
+        # Set only by DynamoReplica.init_standalone_pool (V1 separate_async). Popped
+        # before super().__init__, which does not know the key.
+        standalone = bool(kwargs.pop("dynamo_standalone_pool", False))
         super().__init__(*args, **kwargs)
         rank = int(os.environ["RANK"])
         local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
         self._dynamo_node_rank = rank // local_world_size
         self._dynamo_node_local_rank = rank % local_world_size
+        # Standalone CheckpointEngineWorkers (V1 separate_async) are flagged by
+        # DynamoReplica.init_standalone_pool; hybrid workers are not. replica_rank
+        # alone cannot tell them apart -- the hybrid path passes a per-logical-
+        # replica replica_rank too. For the standalone pool the base class skips
+        # its per-logical-replica derivation, so the ZMQ pairing socket must be
+        # rebuilt on the shared contract both sides use: replica component = pool
+        # offset + pool-local logical replica index (matches the engine-side
+        # VERL_REPLICA_RANK injected in _launch_shared_worker_pool), rank component
+        # = the base formula (within-replica rank modulo node size, matching the
+        # engine-side VERL_ZMQ_BASE_TRAINER_RANK + tp-local rank).
+        self._dynamo_standalone = standalone
+        if self._dynamo_standalone:
+            rollout_world_size = (
+                self.config.tensor_model_parallel_size
+                * self.config.data_parallel_size
+                * self.config.pipeline_model_parallel_size
+            )
+            self._dynamo_pool_offset = self.replica_rank
+            logical_replica_rank = rank // rollout_world_size
+            self._dynamo_global_replica_rank = self._dynamo_pool_offset + logical_replica_rank
+            within_replica_local_rank = (rank % rollout_world_size) % local_world_size
+            job_id = ray.get_runtime_context().get_job_id()
+            self.zmq_handle = (
+                f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{self._dynamo_global_replica_rank}"
+                f"-rank-{within_replica_local_rank}.sock"
+            )
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
@@ -64,6 +92,7 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             self.config.engine_kwargs,
             self._dynamo_node_rank,
             prefix=self._get_server_name_prefix(),
+            replica_rank=self.replica_rank if self._dynamo_standalone else None,
         )
 
     def _is_node_control_rank(self) -> bool:
@@ -111,7 +140,13 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
         return future if non_block else await future
 
     @torch.no_grad()
-    async def update_weights(self, weights, global_steps=None, **kwargs):
+    async def update_weights(self, weights, global_steps=None, wire_format: str = "named_tensors", **kwargs):
+        # Consumed here (checkpoint-engine workers pass it unconditionally);
+        # never forward it into the update_weights_from_ipc RPC kwargs — the
+        # engine extension's signature would reject it.
+        assert wire_format == "named_tensors", (
+            f"dynamo vLLM rollout only consumes full named tensors; got wire_format={wire_format!r}"
+        )
         import asyncio
         import time as _time
 
@@ -137,8 +172,10 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             non_block=True,
             kwargs={**kwargs, "use_shm": self.use_shm},
         )
-        logger.debug(f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
-            f"future={'present' if future is not None else 'None (non-rank-0)'}")
+        logger.debug(
+            f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
+            f"future={'present' if future is not None else 'None (non-rank-0)'}"
+        )
 
         # Build sender (every rank has its own zmq_handle to its paired
         # engine worker; receiver setup on engine side is triggered by
@@ -182,8 +219,10 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
                     return_when=asyncio.ALL_COMPLETED,
                 )
                 if more_pending:
-                    logger.warning(f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
-                        f"after 600s +{_time.time() - t_enter:.2f}s")
+                    logger.warning(
+                        f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
+                        f"after 600s +{_time.time() - t_enter:.2f}s"
+                    )
                     for p in more_pending:
                         p.cancel()
                     raise RuntimeError("dynamo-vllm weight sync hung: tasks still pending after 660s total")

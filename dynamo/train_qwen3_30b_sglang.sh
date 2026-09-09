@@ -50,9 +50,10 @@
 #     0.5.x requires transformers 5.x). Do not add sglang with the ai_dynamo[sglang]
 #     extra: it drags vLLM's guided-decoding stack down with it. The Dynamo wheels are
 #     installed --no-deps below for the same reason.
-#   * Entry point is verl.trainer.main_ppo with trainer.use_v1=False; the V1 TaskRunner
-#     hands a TensorDict to agent_loop.generate_sequences and dies with AttributeError.
-#     hydra resolves --config-path relative to verl/trainer/, not to CWD.
+#   * Entry point is verl.trainer.main_ppo with trainer.use_v1=False: the legacy V0
+#     agent-loop path this run was validated on (the V1 path uses main_dynamo.py with
+#     the dynamo_trainer_v1_* presets). hydra resolves --config-path relative to
+#     verl/trainer/, not to CWD.
 #   * sglang.enable_rl=true registers call_tokenizer_manager, the only way to flush the
 #     radix cache on this path (control/flush_cache returns 404).
 #   * transformers 5.x stores Qwen3-MoE experts as one fused 3D tensor and picks

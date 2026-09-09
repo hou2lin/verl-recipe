@@ -20,7 +20,6 @@ its engine entrypoint at import time. These tests run in the vLLM container too.
 
 import asyncio
 import base64
-import importlib.metadata
 import json
 from types import SimpleNamespace
 
@@ -174,6 +173,17 @@ def test_sglang_cmd_publishes_kv_events_like_vllm():
     assert cmd[cmd.index("--kv-events-config") + 1] == js
     # no config -> no flag (the worker then registers use_kv_events=False)
     assert "--kv-events-config" not in server._build_sglang_cmd("test-model", 1)
+
+
+def test_vllm_cmd_kv_events_flag_follows_the_same_contract():
+    """enable_kv_events=false must reach the vLLM shard as *no* --kv-events-config, exactly
+    like the sglang builder; the launcher passes None in that case."""
+    server = _make_server({"engine": "vllm"})
+    js = DynamoHttpServer._build_kv_events_config_json(5557)
+    cmd = server._build_vllm_cmd("test-model", 1, kv_events_config_json=js)
+    assert cmd[cmd.index("--kv-events-config") + 1] == js
+    assert "--kv-events-config" not in server._build_vllm_cmd("test-model", 1)
+    assert "--kv-events-config" not in server._build_vllm_cmd("test-model", 1, kv_events_config_json=None)
 
 
 def _router_args(dynamo_cfg: dict, mode: str) -> list[str]:
@@ -470,7 +480,6 @@ def test_shard_and_tp_group_agree(local_world_size, tp):
         assert tp_group_src % local_world_size == shard * tp
 
 
-
 # --------------------------------------------------------------------------- #
 # engine dispatch lives in ONE place (rollout.name=dynamo + engine=...)
 # --------------------------------------------------------------------------- #
@@ -495,9 +504,9 @@ def test_engine_dispatch_reads_config_not_rollout_name():
 
 def test_registry_exposes_exactly_one_dynamo_name():
     """No second rollout name for the sglang engine."""
-    from verl.workers.rollout.base import _ROLLOUT_REGISTRY
-
     import recipe.dynamo.register  # noqa: F401  (registers on import)
+
+    from verl.workers.rollout.base import _ROLLOUT_REGISTRY
 
     dynamo_names = {name for (name, _mode) in _ROLLOUT_REGISTRY if name.startswith("dynamo")}
     assert dynamo_names == {"dynamo"}, f"unexpected dynamo rollout names: {dynamo_names}"
@@ -712,10 +721,10 @@ def test_release_and_resume_guards_are_symmetric():
     calls = server._sglang_clients[0].calls
 
     async def main():
-        await server.sglang_resume(["weights"])    # never released -> no call
+        await server.sglang_resume(["weights"])  # never released -> no call
         assert calls == []
         await server.sglang_release(["weights"])
-        await server.sglang_release(["weights"])   # already released -> no call
+        await server.sglang_release(["weights"])  # already released -> no call
 
     asyncio.run(main())
     assert [m for m, _ in calls] == ["release_memory_occupation"]
@@ -831,7 +840,7 @@ def test_facade_imports_without_vllm(monkeypatch):
     vllm_rollout/__init__.py raises PackageNotFoundError (not ImportError) when
     vLLM is absent. Job 16510923 died that way after a fully healthy bootstrap.
     """
-    import importlib
+    import importlib.metadata
     import sys
 
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__

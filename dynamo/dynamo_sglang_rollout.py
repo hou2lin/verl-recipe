@@ -50,13 +50,11 @@ from typing import Any, Generator, Optional
 
 import ray
 import torch
+from recipe.dynamo.dynamo_naming import control_actor_name
+from recipe.dynamo.dynamo_sglang_engine import DynamoSGLangControlClient
 
 from verl.workers.rollout.sglang_rollout.sglang_rollout import ServerAdapter as _SGLangServerAdapter
 from verl.workers.rollout.sglang_rollout.utils import get_named_tensor_buckets
-
-from recipe.dynamo.dynamo_naming import control_actor_name
-
-from recipe.dynamo.dynamo_sglang_engine import DynamoSGLangControlClient
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -87,6 +85,9 @@ class SGLangServerAdapter(_SGLangServerAdapter):
     """Per-rank client for the Dynamo × SGLang rollout backend."""
 
     def __init__(self, *args, **kwargs):
+        # Set only by DynamoReplica.init_standalone_pool (V1 separate_async). Popped
+        # before super().__init__, which does not know the key.
+        standalone = bool(kwargs.pop("dynamo_standalone_pool", False))
         super().__init__(*args, **kwargs)
 
         engine = str(((self.config.engine_kwargs or {}).get("dynamo", {}) or {}).get("engine", "vllm")).lower()
@@ -131,6 +132,13 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         # "Invalid device_uuid=..." — killing the scheduler process.
         self._node_rank_global = global_rank // self._local_world_size
 
+        # Standalone CheckpointEngineWorkers (V1 separate_async) are flagged by
+        # DynamoReplica.init_standalone_pool; hybrid workers are not (replica_rank
+        # alone cannot tell them apart -- the hybrid path passes one per logical
+        # replica too). sglang needs no ZMQ socket rebuild (weights travel over the
+        # HTTP control route), only the control-actor naming below.
+        self._dynamo_standalone = standalone
+
         self._shard_tp_group = None
         self._shard_tp_src_global_rank: Optional[int] = None
         self._control_client: Optional[DynamoSGLangControlClient] = None
@@ -150,8 +158,14 @@ class SGLangServerAdapter(_SGLangServerAdapter):
 
     def _get_control_actor_name(self) -> str:
         """Shared per-node Dynamo actor; the name format lives in ``dynamo_naming``."""
-        # _node_rank_global, not self.node_rank — see __init__.
-        return control_actor_name(self.config.engine_kwargs, self._node_rank_global)
+        # _node_rank_global, not self.node_rank — see __init__. Standalone
+        # pools name their servers by THIS pool's replica_rank (offset past
+        # the hybrid pool), mirroring VllmDynamoServerAdapter.
+        return control_actor_name(
+            self.config.engine_kwargs,
+            self._node_rank_global,
+            replica_rank=self.replica_rank if self._dynamo_standalone else None,
+        )
 
     def _build_shard_tp_group(self):
         """Create the contiguous TP-sized process group this rank belongs to.
@@ -458,7 +472,8 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         flat = _flatten_floats(values)[: len(expected)]
         if len(flat) != len(expected):
             logger.error(
-                "[dynamo-sglang] verification INCONCLUSIVE (nothing verified): engine returned %s values for %s, expected %s",
+                "[dynamo-sglang] verification INCONCLUSIVE (nothing verified): "
+                "engine returned %s values for %s, expected %s",
                 len(flat),
                 name,
                 len(expected),
